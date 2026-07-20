@@ -102,7 +102,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "train",
-            "description": "命令工厂生产单位，或命令建筑自我升级。action 是动作ID（生产形如 u_tank；升级取动作表 升级[...] 里的ID，如 upgradeT2），factory 是工厂/建筑单位id（来自快照我方单位列表）。",
+            "description": "命令工厂生产单位，或命令建筑自我升级。action 是动作ID（生产形如 u_tank；升级取动作表 升级[...] 里的ID，如 extractorT2_0 或 110），factory 是工厂/建筑单位id（来自快照我方单位列表）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -304,11 +304,12 @@ def pedia_production_table(pedia, cap=16):
             continue
         builds = u.get("builds", [])
         groups = []
+        # 分组：建造[b_] 生产[u_] 通用[c_]；其余（数字、目标_0、含upgrade）一律归升级/特殊
         for label, pred in (("建造", lambda b: b.startswith("b_")),
                             ("生产", lambda b: b.startswith("u_")),
-                            ("升级", lambda b: "upgrade" in b.lower()),
-                            ("通用", lambda b: b.startswith("c_"))):
-            ids = [b for b in builds if pred(b)][:cap]
+                            ("通用", lambda b: b.startswith("c_")),
+                            ("升级", lambda b: not b.startswith(("b_", "u_", "c_")))):
+            ids = list(dict.fromkeys(b for b in builds if pred(b)))[:cap]  # 去重（科技列表有重复）
             if ids:
                 groups.append(f"{label}[{','.join(ids)}]")
         if groups:
@@ -342,7 +343,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 
 【建筑百科（名称/价格/科技/移动类型/血量）】
 {pedia_brief(pedia)}
-动作ID规则：建造者施工=b_类型名（如 b_extractorT1）；工厂产兵=u_类型名（如 u_tank、u_builder）；建筑升级=动作表 升级[...] 里列出的ID（如 upgradeT2，对该建筑用 train）；c_ 系列=通用动作。注意：s_ 是"选中同类单位"的本地动作，禁止用作生产/建造指令。
+动作ID规则：建造者施工=b_类型名（如 b_extractorT1）；工厂产兵=u_类型名（如 u_tank、u_builder）；建筑升级=动作表 升级[...] 里列出的ID（如 extractorT2_0=采集器升T2、110=工厂升T2，对该建筑用 train）；c_ 系列=通用动作。注意：s_ 是"选中同类单位"的本地动作，禁止用作生产/建造指令。
 
 【生产/建造动作表（生产者: 合法动作ID）】
 {pedia_production_table(pedia)}
@@ -356,7 +357,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 - 硬性规则：小队正在承受攻击时，必须当机立断——要么还击要么撤退，禁止连续分析而不行动。
 - 建造前先确认资金充足（百科有价格；资金不足时先等钱或造便宜的），采集器必须建在资源点上。
 - 发展顺序（重要）：①先让建造者在最近的空闲陆地资源点建采集器（摘要"空闲资源点(陆地)"列表**从第一个开始建，它是离家最近的，不许跳过近的去远的**）；②指挥中心保持生产 builder（总数3~4个即可，不要无限造）；③有了工厂就让工厂持续产战斗单位（生产[u_]列表里的坦克/机甲/飞机），不要闲置；④战斗单位成群后再侦察/骚扰，不要开局就把所有单位派往地图中心。
-- 经济纪律（重要）：每个工厂排队最多2~3个任务（看摘要里[队列N]），堆满了就**扩建新工厂**而不是继续堆；有钱不等于要花，留钱用于扩张（更多采集器/工厂/炮塔）；主基地周围适时建炮塔防御；采集器富余后可升级——对该建筑用 train，action 取动作表 升级[...] 里的ID（如 extractorT1 的 upgradeT2）；工厂同理可升级解锁更强单位。
+- 经济纪律（重要）：每个工厂排队最多2~3个任务（看摘要里[队列N]），堆满了就**扩建新工厂**而不是继续堆；有钱不等于要花，留钱用于扩张（更多采集器/工厂/炮塔）；主基地周围适时建炮塔防御；采集器富余后可升级——对该建筑用 train，action 取动作表 升级[...] 里的ID（如 extractorT1 的 extractorT2_0）；工厂同理用其升级ID（如 110）解锁更强单位。
 - 兵种搭配（重要）：不要只生产单一兵种——看摘要里"我方其他部队"的构成，保持混合（如主战坦克/机甲 + 防空 + 远程/炮兵），敌方空军多就补防空，敌方龟缩就补远程。
 - 分开操作：move/attack_move/stop 都支持 ids 参数（逗号分隔的单位id），需要让不同单位去不同地方时，给每个单位单独下一条带 ids 的指令，不要对整队下一锅端指令。例：move(1000,500,222) 派 #222 去(1000,500)，move(3000,1000,323) 派 #323 去(3000,1000)。
 - 建造是有时间的：建筑出现≠完工（快照 prog<1 是建造中），完工前工厂不能生产、建筑没作用。**build 的坐标可以省略——系统会在主基地附近自动选址（采集器自动选最近的空闲资源点），除非你明确知道该建在哪，否则一律省略坐标。**
