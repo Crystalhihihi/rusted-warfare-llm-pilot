@@ -1,0 +1,14 @@
+# rw-pilot 配置：OpenAI 兼容 API（DeepSeek）
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"      # 从环境变量读 key，不写进文件
+model = "deepseek-chat"
+
+interval_sec = 4.0        # 基础节拍（秒）；自适应模式下为无威胁时的参考值
+fast_interval_sec = 2.5   # 有警报/敌人贴近(<1200)时的节拍
+mid_interval_sec = 6.0    # 视野内有敌人但距离远
+calm_interval_sec = 12.0  # 无敌情时
+max_commands_per_cycle = 3
+apm_cap = 40              # 每分钟指令上限（拟人）
+map_downsample = 3        # ASCII 地图降采样倍数（230x230 -> 77x77，省 token 降延迟）
+history_turns = 4         # 滚动上下文长度
+timeout_sec = 45          # API 超时

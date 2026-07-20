@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""rw-pilot: LLM 分队指挥官。
+连接 rw-agent (localhost:41234)，周期性把战场摘要交给 LLM，
+把 LLM 的工具调用翻译成游戏指令。
+- 委托：bridge/delegation.json {"groups":[9]} 指定 AI 指挥的编队（热更新）
+- 游戏内面板：每周期向 agent 推送 AI 状态行
+- 建造：build/train/rally 工具
+公平性：只转发本队视野内信息；指令走游戏正常队列；限速+拟人间隔。
+"""
+import json
+import os
+import random
+import socket
+import sys
+import textwrap
+import threading
+import time
+import tomllib
+from collections import deque
+
+import llm
+import summarize
+
+HOST, PORT = "127.0.0.1", 41234
+DELEGATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delegation.json")
+CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control.json")
+ACTIVITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity.jsonl")
+
+
+def log_activity(kind: str, text: str) -> None:
+    """供仪表盘窗口消费的活动流（note/cmd/alert/status/error）。"""
+    try:
+        with open(ACTIVITY_FILE, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps({"ts": time.strftime("%H:%M:%S"), "kind": kind, "text": text},
+                                ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "move",
+            "description": "命令小队移动到世界坐标 (x,y)。用于侦察、撤退、转移。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "ids": {"type": "string", "description": "可选：只指挥这些单位（逗号分隔id，来自小队#id）；省略=整个委托小队"},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attack_move",
+            "description": "攻击移动到 (x,y)：沿途遭遇敌人自动交战。用于进攻、骚扰。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "ids": {"type": "string", "description": "可选：只指挥这些单位（逗号分隔id）；省略=整个委托小队"},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attack_unit",
+            "description": "集火攻击一个当前可见的敌单位（id 必须来自最新快照的可见敌人列表）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "build",
+            "description": "命令建造者建造建筑。action 是建造动作ID（形如 b_extractorT1）。坐标可省略——省略时系统在主基地附近自动选址（推荐：采集器/工厂都省略坐标）。采集器自动选最近的空闲资源点。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "建造动作ID，如 b_extractorT1"},
+                    "x": {"type": "number", "description": "可选：选址锚点x，省略=主基地"},
+                    "y": {"type": "number", "description": "可选：选址锚点y，省略=主基地"},
+                    "builder": {"type": "integer", "description": "可选：指定建造者id（来自建造者状态#id）；省略=自动选空闲的"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "train",
+            "description": "命令工厂生产单位，或命令建筑自我升级。action 是动作ID（生产形如 s_tank，升级见动作表的 c_ 类ID），factory 是工厂/建筑单位id（来自快照我方单位列表）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "factory": {"type": "integer"},
+                },
+                "required": ["action", "factory"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rally",
+            "description": "设置工厂的集结点到世界坐标 (x,y)。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "factory": {"type": "integer"},
+                },
+                "required": ["x", "y", "factory"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop",
+            "description": "停止小队当前动作，原地驻防。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {"type": "string", "description": "可选：只停这些单位（逗号分隔id）；省略=整个委托小队"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "note",
+            "description": "记录你的分析/意图（不执行任何游戏操作，玩家可见）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+]
+
+
+class AgentLink:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest_snap = None
+        self.map_msg = None
+        self.map_version = 0  # 新对局（新地图消息）递增，pilot 据此重置上下文
+        self.pedia = None
+        self.ai_control = {}
+        self.cmd_results = deque(maxlen=20)
+        self.sock = None
+        self.connected = threading.Event()
+        threading.Thread(target=self._run, daemon=True, name="pilot-link").start()
+
+    def _run(self):
+        failures = 0
+        while True:
+            try:
+                s = socket.create_connection((HOST, PORT), timeout=5)
+                failures = 0
+                s.settimeout(None)
+                with self.lock:
+                    self.sock = s
+                self.connected.set()
+                print("[link] 已连接 rw-agent")
+                buf = b""
+                while True:
+                    chunk = s.recv(524288)
+                    if not chunk:
+                        raise ConnectionError("closed")
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        t = msg.get("type")
+                        with self.lock:
+                            if t == "snapshot":
+                                self.latest_snap = msg
+                            elif t == "map":
+                                rows_hash = hash(tuple(msg.get("rows", [])))
+                                if rows_hash != getattr(self, "_map_hash", None):
+                                    self._map_hash = rows_hash
+                                    self.map_msg = msg
+                                    self.map_version += 1
+                            elif t == "pedia":
+                                self.pedia = msg
+                                print(f"[link] 百科已载入 ({len(msg.get('units', []))} 类)")
+                            elif t == "aiControl":
+                                self.ai_control = msg
+                                print(f"[aiControl] enabled={msg.get('enabled')} interval={msg.get('interval')} groups={msg.get('groups')}")
+                                log_activity("status", f"AI控制: {'运行' if msg.get('enabled') else '停止'}"
+                                                       f" 节拍={msg.get('interval') or '自动'} 委托={msg.get('groups')}")
+                            elif t == "cmdResult":
+                                self.cmd_results.append(msg)
+                                mark = "✓" if msg.get("ok") else "✗"
+                                print(f"[cmdResult] {mark} {msg.get('cmd')}: {msg.get('msg')}")
+                                log_activity("cmd" if msg.get("ok") else "error",
+                                             f"{mark} {msg.get('cmd')}: {msg.get('msg')}")
+            except (ConnectionError, socket.timeout, OSError) as e:
+                failures += 1
+                self.connected.clear()
+                with self.lock:
+                    self.sock = None
+                if failures > 45:
+                    print("[link] 游戏已关闭超过90秒，pilot 自动退出")
+                    os._exit(0)
+                print(f"[link] 断开 ({e})，2s 后重连")
+                time.sleep(2)
+
+    def snapshot(self):
+        with self.lock:
+            return self.latest_snap
+
+    def ai_control_state(self):
+        with self.lock:
+            return dict(self.ai_control)
+
+    def map_message(self):
+        with self.lock:
+            return self.map_msg
+
+    def pedia_message(self):
+        with self.lock:
+            return self.pedia
+
+    def drain_cmd_results(self):
+        with self.lock:
+            out = list(self.cmd_results)
+            self.cmd_results.clear()
+            return out
+
+    def send(self, obj: dict):
+        with self.lock:
+            s = self.sock
+            if s is None:
+                return False
+            try:
+                s.sendall((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+                return True
+            except OSError:
+                return False
+
+
+def downsample(rows, f):
+    if f <= 1:
+        return rows
+    return [row[::f] for row in rows[::f]]
+
+
+def pedia_brief(pedia, cap=48):
+    """从百科里挑建筑条目做价格表（建造决策用）。"""
+    if not pedia:
+        return "（百科未载入）"
+    rows = []
+    for u in pedia.get("units", []):
+        if u.get("building"):
+            rows.append(f"{u['name']}(${u.get('price', '?')},T{u.get('tech', '?')},{u.get('move', '?')},hp{u.get('hp', '?')})")
+        if len(rows) >= cap:
+            break
+    return "\n".join(rows) if rows else "（无建筑条目）"
+
+
+PRODUCERS = [
+    "commandCenter", "builder", "fabricatorT1", "fabricatorT2", "fabricatorT3",
+    "landFactory", "airFactory", "mechFactory", "mechFactoryT2", "seaFactory",
+    "experimentalLandFactory", "outpostT1", "outpostT2",
+]
+
+
+def pedia_production_table(pedia, cap=16):
+    """生产者 -> 动作ID，按语义分组：建造[b_] 生产[u_] 升级[数字] 通用[c_]。"""
+    if not pedia:
+        return "（百科未载入）"
+    by_name = {u["name"]: u for u in pedia.get("units", [])}
+    rows = []
+    for name in PRODUCERS:
+        u = by_name.get(name)
+        if not u:
+            continue
+        builds = u.get("builds", [])
+        groups = []
+        for label, pred in (("建造", lambda b: b.startswith("b_")),
+                            ("生产", lambda b: b.startswith("u_")),
+                            ("升级", lambda b: b[:1].isdigit()),
+                            ("通用", lambda b: b.startswith("c_"))):
+            ids = [b for b in builds if pred(b)][:cap]
+            if ids:
+                groups.append(f"{label}[{','.join(ids)}]")
+        if groups:
+            rows.append(f"{name} {' '.join(groups)}")
+    return "\n".join(rows) or "（无生产选项）"
+
+
+def build_system_prompt(map_msg, pedia, cfg, user_groups):
+    tw = map_msg["tilesW"] * map_msg["tileW"]
+    th = map_msg["tilesH"] * map_msg["tileH"]
+    rows = downsample(map_msg.get("rows", []), int(cfg["map_downsample"]))
+    f = int(cfg["map_downsample"])
+    tile = map_msg["tileW"] * f
+    res = map_msg.get("resources", [])[:60]
+    res_txt = ",".join(f"({p['x']},{p['y']})" for p in res)
+    map_txt = "\n".join(rows)
+    groups_txt = ",".join(str(g) for g in sorted(user_groups)) or "9"
+    return f"""你在即时战略游戏《Rusted Warfare》中担任指挥官。玩家把若干编队（当前：{groups_txt} 队）的单位委托给你指挥，你通过工具下达指令。未委托给你的单位由玩家自己负责。
+
+【公平规则】你只收到玩家本队视野内的信息（战争迷雾已过滤）。迷雾中的敌情你不知道，不要臆测。敌人离开视野后快照中即消失。
+
+【坐标系】世界坐标为像素，y 向下为正（北=-y）。地图大小 {tw:.0f} x {th:.0f}。单位位置、指令目标都用世界坐标。
+
+【地形图】下面是降采样地图，每个字符 = {tile:.0f} 像素见方：
+. = 陆地（陆军可行）   ~ = 水域（仅海军/悬浮/空军）   = = 桥梁（陆军可过）
+L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲可攀爬）   # = 高崖（仅空军可飞越）
+
+{map_txt}
+
+【资源点（世界坐标）】{res_txt}
+
+【建筑百科（名称/价格/科技/移动类型/血量）】
+{pedia_brief(pedia)}
+动作ID规则：建造者施工=b_类型名（如 b_extractorT1）；工厂产兵=u_类型名（如 u_tank、u_builder）；建筑升级=纯数字ID（如 102/110，对该建筑用 train）；c_ 系列=通用动作（c_1集结点/c_2回收/c_3修理）。注意：s_ 是"选中同类单位"的本地动作，禁止用作生产/建造指令。
+
+【生产/建造动作表（生产者: 合法动作ID）】
+{pedia_production_table(pedia)}
+用法：建造者用 build(action,x,y) 盖建筑，action 必须用建造[b_]列表里的 ID；工厂用 train(action,factory) 生产，action 必须用生产[s_]列表里的 ID，factory 取"我方工厂"列表里的 id（带 # 的数字）；rally(x,y,factory) 设集结点。ID 区分大小写，不要自己编造。
+
+【规则】
+- 指令通过工具下达，进入游戏正常指令队列，与玩家鼠标点击同级（约0.2s排队延迟）。
+- 你只指挥快照中"你的小队"（委托单位）。attack_unit 的目标 id 必须来自最新快照的可见敌人列表；train/rally 的 factory 必须是我方单位 id。
+- 每个用户消息是最新战场态势。你的回复必须包含至少一个工具调用——分析用 note 工具写（一两句话，不要长篇），content 留空或极短，重点是把决策变成工具调用。
+- 动作 ID 必须原样取自动作表（含 b_/u_/数字前缀）。如果某个 ID 被回执拒绝，严禁再次尝试同一个 ID——从回执附带的可用列表中另选一个。回执里的失败信息用于纠正，不要道歉，直接给下一步行动。
+- 硬性规则：小队正在承受攻击时，必须当机立断——要么还击要么撤退，禁止连续分析而不行动。
+- 建造前先确认资金充足（百科有价格；资金不足时先等钱或造便宜的），采集器必须建在资源点上。
+- 发展顺序（重要）：①先让建造者在最近的空闲陆地资源点建采集器（摘要"空闲资源点(陆地)"列表**从第一个开始建，它是离家最近的，不许跳过近的去远的**）；②指挥中心保持生产 builder（总数3~4个即可，不要无限造）；③有了工厂就让工厂持续产战斗单位（生产[u_]列表里的坦克/机甲/飞机），不要闲置；④战斗单位成群后再侦察/骚扰，不要开局就把所有单位派往地图中心。
+- 经济纪律（重要）：每个工厂排队最多2~3个任务（看摘要里[队列N]），堆满了就**扩建新工厂**而不是继续堆；有钱不等于要花，留钱用于扩张（更多采集器/工厂/炮塔）；主基地周围适时建炮塔（c_turret_t1 等）防御；采集器富余后可升级（对该建筑 train "102"/"103"），工厂可升T2（train "110"）解锁更强单位。
+- 兵种搭配（重要）：不要只生产单一兵种——看摘要里"我方其他部队"的构成，保持混合（如主战坦克/机甲 + 防空 + 远程/炮兵），敌方空军多就补防空，敌方龟缩就补远程。
+- 分开操作：move/attack_move/stop 都支持 ids 参数（逗号分隔的单位id），需要让不同单位去不同地方时，给每个单位单独下一条带 ids 的指令，不要对整队下一锅端指令。例：move(1000,500,222) 派 #222 去(1000,500)，move(3000,1000,323) 派 #323 去(3000,1000)。
+- 建造是有时间的：建筑出现≠完工（快照 prog<1 是建造中），完工前工厂不能生产、建筑没作用。**build 的坐标可以省略——系统会在主基地附近自动选址（采集器自动选最近的空闲资源点），除非你明确知道该建在哪，否则一律省略坐标。**
+- 资金纪律：资金<700 时只能建采集器（系统会拦截其他建造）；同类工厂最多 3 座（先满产/升级再扩）；每个工厂排队最多2~3个任务。
+- 建造者纪律（重要）：摘要"建造者状态"里显示施工中(build@)的建造者**正在赶路或施工，绝对禁止再派任何新指令**——它会自己走到工地盖好，你要等它变回 idle（空闲）再派下一个活。重复派活会取消它原来的施工，导致什么都盖不成。一次只给一个建造者派一个活。想并行施工就用 builder 参数分别指定：build(b_extractorT1,x1,y1,builder=222) 和 build(b_landFactory,x2,y2,builder=530) 各干各的。
+- 建造者数量纪律（重要）：建造者总数没有硬性上限，但**只要有≥2个在闲置（状态行"空闲可派活"），系统就禁止再生产新的**——先把闲置的派去建采集器/工厂/炮塔，全部用起来后才能继续产。建筑选址在主基地一侧，不许派建造者深入敌方区域。
+- 小队空闲（没有进行中的任务）时，给出下一个任务目标，不要让它原地待命。
+- 典型任务循环：侦察摸清敌情 → 用 build 在资源点建采集器发展经济 → 用 train 补充兵力 → 骚扰 → 劣势时撤退。
+- 注意兵种与地形匹配：陆军不能下水，机甲可爬 '^'，只有空军能过 'L' 和 '#'；采集器必须建在资源点上；水上资源点可以让陆军 builder 在岸边造（建造距离有限），太远的水域要用海上建造者(Builder Ship, 海军)。"""
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def group_to_slot(g: int) -> int:
+    """用户编队号(1-9,0) → agent 槽位(0-8,9)。"""
+    return (g - 1) % 10 if g != 0 else 9
+
+
+def pick_interval(cfg, alerts, snap, manual_override):
+    """自适应节拍：手动覆盖 > 警报/敌近 > 有敌情 > 太平。"""
+    if manual_override > 0:
+        return manual_override
+    if alerts:
+        return float(cfg["fast_interval_sec"])
+    enemies = snap.get("enemy", [])
+    if not enemies:
+        return float(cfg["calm_interval_sec"])
+    squad_ids = set(snap.get("delegated", []))
+    squad = [u for u in snap.get("own", []) if u["id"] in squad_ids]
+    if squad:
+        c = summarize.centroid(squad)
+        if any(summarize.dist(e, c) < 1200 for e in enemies):
+            return float(cfg["fast_interval_sec"])
+    return float(cfg["mid_interval_sec"])
+
+
+def main():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml"), "rb") as fp:
+        cfg = tomllib.load(fp)
+    api_key = os.environ.get(cfg["api_key_env"], "")
+    if not api_key:
+        secret_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret.toml")
+        if os.path.exists(secret_path):
+            with open(secret_path, "rb") as fp:
+                api_key = tomllib.load(fp).get("api_key", "")
+    if not api_key:
+        print(f"缺少 API key：请设置环境变量 {cfg['api_key_env']} 或填写 bridge/secret.toml")
+        return 1
+
+    link = AgentLink()
+    open(ACTIVITY_FILE, "w", encoding="utf-8").close()  # 清空上轮活动流
+    print("[pilot] 等待游戏地图数据（请先开一局遭遇战）...")
+    while link.map_message() is None:
+        time.sleep(1)
+    map_msg = link.map_message()
+    # 百科与地图几乎同时到，最多等 5s
+    t0 = time.time()
+    while link.pedia_message() is None and time.time() - t0 < 5:
+        time.sleep(0.5)
+    pedia = link.pedia_message()
+    world_w = map_msg["tilesW"] * map_msg["tileW"]
+    world_h = map_msg["tilesH"] * map_msg["tileH"]
+
+    # 委托编队（热更新）
+    user_groups = {9}
+    deleg_mtime = None
+    if os.path.exists(DELEGATION_FILE):
+        try:
+            with open(DELEGATION_FILE, encoding="utf-8") as fp:
+                user_groups = {int(g) for g in json.load(fp).get("groups", [9]) if 0 <= int(g) <= 9}
+            deleg_mtime = os.path.getmtime(DELEGATION_FILE)
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            print(f"[delegate] delegation.json 解析失败，用默认[9]: {e}")
+            user_groups = {9}
+    else:
+        with open(DELEGATION_FILE, "w", encoding="utf-8") as fp:
+            json.dump({"groups": [9]}, fp)
+        print("[delegate] 已创建 delegation.json（默认委托 9 队，可编辑热更新）")
+
+    system = {"role": "system", "content": build_system_prompt(map_msg, pedia, cfg, user_groups)}
+    print(f"[pilot] 地图 {map_msg['tilesW']}x{map_msg['tilesH']} 已载入，LLM={cfg['model']}，委托编队={sorted(user_groups)}")
+    if user_groups != {9}:  # 默认 9 队由 agent 侧兜底，不强行覆盖游戏内 /ai groups 设置
+        link.send({"cmd": "delegate", "groups": ",".join(str(group_to_slot(g)) for g in sorted(user_groups))})
+
+    smz = summarize.Summarizer(map_msg.get("resources", []))
+    history = []
+    failed_calls = set()      # 被拒过的指令（agent 回执失败 + pilot 拦截），重复者不再发送
+    sent_keys = deque(maxlen=30)  # (cmd名, call_key) 用于把 agent 失败回执归因到具体调用
+    pending_notes = []        # 下一轮要塞进上下文的系统提示（拦截/拒绝记录）
+    seen_map_version = getattr(link, "map_version", 0)
+    cmd_times = deque()
+    tok_history = deque()  # (ts, prompt, cache_hit, completion)
+    manual_interval = 0.0  # >0 时覆盖自适应节拍（control.json）
+    control_mtime = None
+    if os.path.exists(CONTROL_FILE):
+        try:
+            with open(CONTROL_FILE, encoding="utf-8") as fp:
+                manual_interval = float(json.load(fp).get("interval_sec", 0))
+            control_mtime = os.path.getmtime(CONTROL_FILE)
+        except (json.JSONDecodeError, ValueError, OSError):
+            manual_interval = 0.0
+    else:
+        with open(CONTROL_FILE, "w", encoding="utf-8") as fp:
+            json.dump({"interval_sec": 0}, fp)  # 0 = 自适应
+    last_cycle = 0.0
+    last_hint = 0.0
+    interval = float(cfg["interval_sec"])
+    max_cmds = int(cfg["max_commands_per_cycle"])
+    apm_cap = int(cfg["apm_cap"])
+
+    while True:
+        # 新对局检测：地图消息版本变化 → 清空 LLM 上下文与摘要器状态
+        mv = getattr(link, "map_version", 0)
+        if mv != seen_map_version:
+            seen_map_version = mv
+            history.clear()
+            failed_calls.clear()
+            new_map = link.map_message()
+            smz = summarize.Summarizer((new_map or {}).get("resources", []))
+            print("[pilot] 检测到新对局，上下文已重置")
+            log_activity("status", "新对局开始，AI 上下文已重置")
+            continue
+
+        # delegation.json 热更新
+        try:
+            m = os.path.getmtime(DELEGATION_FILE)
+            if deleg_mtime is not None and m != deleg_mtime:
+                deleg_mtime = m
+                with open(DELEGATION_FILE, encoding="utf-8") as fp:
+                    new_groups = {int(g) for g in json.load(fp).get("groups", [9]) if 0 <= int(g) <= 9}
+                if new_groups != user_groups:
+                    user_groups = new_groups
+                    print(f"[delegate] 委托编队更新 -> {sorted(user_groups)}")
+                    link.send({"cmd": "delegate",
+                               "groups": ",".join(str(group_to_slot(g)) for g in sorted(user_groups))})
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+        # control.json 热更新（仪表盘滑块）
+        try:
+            cm = os.path.getmtime(CONTROL_FILE)
+            if control_mtime is not None and cm != control_mtime:
+                control_mtime = cm
+                with open(CONTROL_FILE, encoding="utf-8") as fp:
+                    manual_interval = max(0.0, min(60.0, float(json.load(fp).get("interval_sec", 0))))
+                print(f"[control] 节拍手动设定 -> {manual_interval}s (0=自动)")
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+        snap = link.snapshot()
+        if snap is None or not snap.get("team") or snap["team"].get("ai"):
+            time.sleep(1)
+            continue
+        ac = link.ai_control_state()
+        if ac and not ac.get("enabled", True):
+            if time.time() - last_hint > 15:
+                print("[pilot] AI 已停止（游戏内 /ai on 或按钮恢复）")
+                last_hint = time.time()
+            time.sleep(1)
+            continue
+        if not snap.get("delegated"):
+            if time.time() - last_hint > 15:
+                print("[pilot] 等待委托：框选单位后点游戏内[委托选中]按钮，或 /ai groups 指定编队")
+                last_hint = time.time()
+            time.sleep(1)
+            continue
+
+        text, alerts = smz.summarize(snap)
+        results = link.drain_cmd_results()
+        if results:
+            text += "\n\n指令回执（你上一条指令的执行结果，失败原因必须据此纠正）:\n" + "\n".join(
+                ("✓ " if r.get("ok") else "✗ ") + f"{r.get('cmd')}: {r.get('msg')}" for r in results[-8:])
+            for r in results:
+                if not r.get("ok"):
+                    for sc, skey in reversed(sent_keys):
+                        if sc == r.get("cmd"):
+                            failed_calls.add(skey)
+                            break
+        if pending_notes:
+            text += "\n\n" + "\n".join(pending_notes)
+            pending_notes.clear()
+        text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
+        interval_override = (ac.get("interval") or 0) if ac else 0
+        if not interval_override:
+            interval_override = manual_interval
+        target_interval = pick_interval(cfg, alerts, snap, interval_override)
+        if time.time() - last_cycle < target_interval:
+            time.sleep(0.25)
+            continue
+        last_cycle = time.time()
+
+        messages = [system]
+        for u, a in history:
+            messages.append({"role": "user", "content": u})
+            messages.append({"role": "assistant", "content": a})
+        messages.append({"role": "user", "content": text})
+
+        t_start = time.time()
+        try:
+            msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, TOOLS,
+                           timeout=int(cfg["timeout_sec"]))
+        except llm.LlmError as e:
+            print(f"[llm] 调用失败: {e}")
+            time.sleep(interval)
+            continue
+        api_ms = (time.time() - t_start) * 1000
+
+        note = (msg.get("content") or "").strip()
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            # DeepSeek 有时会只写分析不调工具——追问一次，强制工具调用
+            print("[llm] 未调用工具，追问重试")
+            messages.append({"role": "assistant", "content": note or "（空）"})
+            messages.append({"role": "user", "content":
+                             "刚才的回复没有任何工具调用。请直接用一个工具给出下一步指令（move/attack_move/attack_unit/build/train/stop 之一），或用 note 一句话说明等待原因。无需解释。"})
+            try:
+                msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, TOOLS,
+                               timeout=int(cfg["timeout_sec"]))
+                note = (msg.get("content") or "").strip()
+                calls = msg.get("tool_calls") or []
+            except llm.LlmError as e:
+                print(f"[llm] 追问失败: {e}")
+        if not note and not calls:
+            print(f"[llm-debug] 空响应 finish={msg.get('_finish_reason')}")
+        executed = []
+        note_parts = []
+        blocked = []
+        visible_enemy_ids = {u["id"] for u in snap.get("enemy", [])}
+        own_ids = {u["id"] for u in snap.get("own", [])}
+
+        for tc in calls:
+            if len(executed) >= max_cmds:
+                break
+            fn = tc.get("function") or {}
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if name == "note":
+                t = str(args.get("text", "")).strip()
+                if t:
+                    note_parts.append(t)
+                continue
+            # 重复拦截：之前被（pilot 或 agent）拒绝过的同一指令不再发送
+            call_key = name + ":" + json.dumps(args, sort_keys=True)
+            if call_key in failed_calls:
+                blocked.append(f"{name}({','.join(str(v) for v in args.values())})")
+                continue
+            now = time.time()
+            while cmd_times and now - cmd_times[0] > 60:
+                cmd_times.popleft()
+            if len(cmd_times) >= apm_cap:
+                print("[pilot] APM 限速，跳过本轮剩余指令")
+                break
+            cmd = None
+            if name == "move":
+                cmd = {"cmd": "move",
+                       "x": clamp(float(args.get("x", 0)), 0, world_w),
+                       "y": clamp(float(args.get("y", 0)), 0, world_h)}
+            elif name == "attack_move":
+                cmd = {"cmd": "attackmove",
+                       "x": clamp(float(args.get("x", 0)), 0, world_w),
+                       "y": clamp(float(args.get("y", 0)), 0, world_h)}
+            elif name == "attack_unit":
+                uid = int(args.get("id", -1))
+                if uid not in visible_enemy_ids:
+                    print(f"[pilot] 拒绝 attack_unit：id {uid} 不在可见敌人中")
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ attack_unit({uid}): 目标不在可见敌人中，不要再试同一个")
+                    continue
+                cmd = {"cmd": "attack", "id": uid}
+            elif name == "build":
+                act = str(args.get("action", ""))
+                if not (act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
+                    print(f"[pilot] 拒绝 build：非法 action {act}（应为 b_/u_/数字 ID）")
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ build action={act}: 非法ID（必须原样取自动作表），不要再试同一个")
+                    continue
+                # 系统守卫：资金储备（穷时不许乱花，先留钱建采集器）
+                funds_now = (snap.get("team") or {}).get("funds", 0)
+                if funds_now < 700 and "extractor" not in act:
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ build {act}: 资金仅{funds_now:.0f}<700，先留钱建采集器恢复经济，别的不许盖")
+                    print(f"[pilot] 守卫：资金 {funds_now:.0f}，拒绝非采集器建造 {act}")
+                    continue
+                # 系统守卫：同类工厂上限（防工厂刷屏）
+                if "actory" in act or "Factory" in act:
+                    fac_type = act.split("_", 1)[1] if "_" in act else act
+                    same = sum(1 for u in snap.get("own", []) if u.get("bld") and u["t"] == fac_type)
+                    if same >= 3:
+                        failed_calls.add(call_key)
+                        pending_notes.append(f"✗ build {act}: 已有{same}座{fac_type}，先让它们满产/升级，不许再建同类")
+                        print(f"[pilot] 守卫：{fac_type} 已有 {same} 座，拒绝刷屏")
+                        continue
+                cmd = {"cmd": "build", "action": act}
+                if args.get("x") is not None and args.get("y") is not None:
+                    cmd["x"] = clamp(float(args["x"]), 0, world_w)
+                    cmd["y"] = clamp(float(args["y"]), 0, world_h)
+                if args.get("builder") is not None:
+                    cmd["builder"] = int(args["builder"])
+            elif name == "train":
+                act = str(args.get("action", ""))
+                fid = int(args.get("factory", -1))
+                if not (act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
+                    print(f"[pilot] 拒绝 train：非法 action {act}（应为 b_/u_/数字 ID）")
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ train action={act}: 非法ID（必须原样取自动作表），不要再试同一个")
+                    continue
+                if fid not in own_ids:
+                    print(f"[pilot] 拒绝 train：factory {fid} 不是我方单位")
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ train factory={fid}: 不是我方单位id，factory 必须取快照里的#id，不要再试同一个")
+                    continue
+                # 系统守卫：闲置建造者≥2 时禁止再生产（不卡总数，卡闲置）
+                if act in ("u_builder", "u_fabricator"):
+                    idle_b = sum(
+                        1 for u in snap.get("own", [])
+                        if ("uilder" in u["t"] or "abricator" in u["t"])
+                        and not u.get("bld")
+                        and (u.get("act") in (None, "", "idle")))
+                    if idle_b >= 2:
+                        failed_calls.add(call_key)
+                        pending_notes.append(
+                            f"✗ train {act}: 有{idle_b}个建造者正在闲置！先给他们派建筑活（采集器/工厂/炮塔），都用上了再产新的")
+                        print(f"[pilot] 守卫：{idle_b} 个 builder 闲置，拒绝再产")
+                        continue
+                # 系统守卫：工厂队列上限（防单厂堆货）
+                fac_u = next((u for u in snap.get("own", []) if u["id"] == fid), None)
+                if fac_u is not None and (fac_u.get("q") or 0) >= 3:
+                    failed_calls.add(call_key)
+                    pending_notes.append(
+                        f"✗ train {act}: 该工厂队列已满(3)，不要再堆！请扩建新工厂或等队列消化")
+                    print(f"[pilot] 守卫：factory {fid} 队列满，拒绝堆货")
+                    continue
+                cmd = {"cmd": "train", "action": act, "factory": fid}
+            elif name == "rally":
+                fid = int(args.get("factory", -1))
+                if fid not in own_ids:
+                    print(f"[pilot] 拒绝 rally：factory {fid} 不是我方单位")
+                    failed_calls.add(call_key)
+                    pending_notes.append(f"✗ rally factory={fid}: 不是我方单位id，不要再试同一个")
+                    continue
+                cmd = {"cmd": "rally", "factory": fid,
+                       "x": clamp(float(args.get("x", 0)), 0, world_w),
+                       "y": clamp(float(args.get("y", 0)), 0, world_h)}
+            elif name == "stop":
+                cmd = {"cmd": "stop"}
+            else:
+                print(f"[pilot] 未知工具: {name}")
+                continue
+            ids_txt = str(args.get("ids", "")).strip()
+            if ids_txt and name in ("move", "attack_move", "stop", "attack_unit"):
+                cmd["units"] = ids_txt
+            if link.send(cmd):
+                sent_keys.append((cmd["cmd"], call_key))
+                cmd_times.append(time.time())
+                args_txt = ",".join(str(v) for v in args.values())
+                executed.append(f"{name}({args_txt})")
+                time.sleep(random.uniform(0.3, 0.5))  # 拟人操作间隔
+            else:
+                print("[pilot] 发送失败（连接断开）")
+                break
+
+        if blocked:
+            msg_blocked = "系统拦截了你的重复无效指令（之前已被拒绝，不要再试）: " + ", ".join(blocked)
+            print("[pilot] " + msg_blocked)
+            pending_notes.append(msg_blocked)
+
+        tick = snap.get("tick", 0)
+        full_note = " ".join(p for p in [note] + note_parts if p).strip()
+        usage = msg.get("_usage") or {}
+        tok = ""
+        if usage:
+            tok_history.append((time.time(), usage.get("prompt_tokens", 0),
+                                usage.get("prompt_cache_hit_tokens", 0),
+                                usage.get("completion_tokens", 0)))
+            while tok_history and time.time() - tok_history[0][0] > 300:
+                tok_history.popleft()
+            tok = (f" tok={usage.get('prompt_tokens', '?')}"
+                   f"(hit{usage.get('prompt_cache_hit_tokens', '?')})/{usage.get('completion_tokens', '?')}")
+        tpm_txt = ""
+        if tok_history:
+            span = max(1.0, time.time() - tok_history[0][0])
+            tpm = sum(t[1] for t in tok_history) / span * 60
+            hitm = sum(t[2] for t in tok_history) / span * 60
+            tpm_txt = f" {tpm/1000:.0f}k tok/min(hit{hitm/1000:.0f}k)"
+        summary_line = full_note[:120] if full_note else "(无备注)"
+        ts = time.strftime("%H:%M:%S")
+        print(f"[cycle] {ts} tick={tick} api={api_ms:.0f}ms{tok} 节拍={target_interval}s{tpm_txt} 小队={len(snap.get('delegated', []))}"
+              f" 敌={len(snap.get('enemy', []))} 警报={len(alerts)} | {summary_line} | 执行: {', '.join(executed) or '无'}")
+
+        # 活动流（仪表盘窗口消费）
+        team = snap.get("team") or {}
+        log_activity("status", f"AI指挥[{cfg['model']}] 编队{sorted(user_groups)} 小队{len(snap.get('delegated', []))}"
+                               f" 资金{team.get('funds', 0):.0f} tick={tick} api={api_ms:.0f}ms{tok}{tpm_txt}")
+        if full_note:
+            log_activity("note", full_note)
+        for ex in executed:
+            log_activity("cmd", "→ " + ex)
+        for al in alerts:
+            log_activity("alert", "⚠ " + al)
+
+        # 游戏内面板
+        ov = [f"AI指挥[{cfg['model']}] 编队{sorted(user_groups)} 小队{len(snap.get('delegated', []))} 资金{team.get('funds', 0):.0f}"]
+        if full_note:
+            ov.extend(textwrap.wrap(full_note.replace("\n", " "), 44)[:3])
+        if executed:
+            ov.append("指令: " + ", ".join(executed)[:60])
+        if alerts:
+            ov.append("警报: " + " | ".join(alerts)[:60])
+        link.send({"cmd": "overlay", "text": "|||".join(ov)})
+
+        record = full_note or "（无备注）"
+        if executed:
+            record += "（系统记录：已下发 " + ", ".join(executed) + "）"
+        history.append((text, record))
+        history = history[-int(cfg["history_turns"]):]
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        sys.exit(0)

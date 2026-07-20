@@ -1,0 +1,23 @@
+# 密钥（绝不入库）
+bridge/secret.toml
+
+# 反编译产物与日志（体积及版权原因不入库）
+decompiled/
+decompile.log
+
+# 编译产物
+agent/classes/
+agent/dist/
+agent/sources.txt
+agent/manifest.txt
+tools/*.class
+tools/vineflower.jar
+
+# 运行产物
+agent/logs/
+bridge/__pycache__/
+bridge/activity.jsonl
+bridge/control.json
+bridge/delegation.json
+bridge/map.txt
+bridge/pilot.log
