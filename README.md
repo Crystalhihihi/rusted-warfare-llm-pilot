@@ -1,5 +1,7 @@
 # Rusted Warfare LLM Pilot
 
+中文 | **[English](README.en.md)**
+
 > ## ⚠️ 严重警告
 >
 > **本项目处于实验早期阶段，AI 对游戏的操控存在大量已知缺陷，包括但不限于：**
