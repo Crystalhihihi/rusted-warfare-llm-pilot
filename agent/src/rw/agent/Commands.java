@@ -73,14 +73,19 @@ public final class Commands {
                     reply(false, cmd, "missing x/y");
                     return;
                 }
-                // 逐单位过滤：不可达的排除；整队指令自动跳过施工中的单位（除非 ids 显式点名）
+                // 逐单位过滤：不可达的排除；整队指令自动跳过施工中的单位和建筑（除非 ids 显式点名）
                 ArrayList<am> targets = filterByIds(delegatedUnits(team), line);
                 ArrayList<am> reach = new ArrayList<am>();
                 int excluded = 0;
                 int busy = 0;
+                int bldSkip = 0;
                 boolean hasIds = strVal(line, "units") != null;
                 for (am u : targets) {
                     if (!hasIds) {
+                        if (isBuilding(u)) {
+                            bldSkip++;
+                            continue;
+                        }
                         String act = Activity.describe(u);
                         if (act != null && act.startsWith("build")) {
                             busy++;
@@ -116,7 +121,8 @@ public final class Commands {
                 }
                 reply(true, cmd, n0 + " units @(" + x.intValue() + "," + yv.intValue() + ")"
                     + (excluded > 0 ? "（" + excluded + "个无法到达已排除）" : "")
-                    + (busy > 0 ? "（" + busy + "个施工中已跳过）" : ""));
+                    + (busy > 0 ? "（" + busy + "个施工中已跳过）" : "")
+                    + (bldSkip > 0 ? "（" + bldSkip + "个建筑已跳过）" : ""));
             } else if ("stop".equals(cmd)) {
                 e c = engine.cf.b(team);
                 int n0 = addDelegated(c, team, line);
@@ -312,7 +318,17 @@ public final class Commands {
         StringBuilder spotReason = new StringBuilder();
         float[] spot = findBuildSpot(engine, team, type, ax, ay, spotReason);
         if (spot == null) {
-            reply(false, cmd, "找不到合法建造位置：" + spotReason);
+            String extra = "";
+            try {
+                if (type.p()) {
+                    String fp = freePoolsText(engine, ax, ay, 5);
+                    if (!fp.isEmpty()) {
+                        extra = "；空闲池(近→远): " + fp;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            reply(false, cmd, "找不到合法建造位置：" + spotReason + extra);
             return;
         }
         x = spot[0];
@@ -606,6 +622,34 @@ public final class Commands {
         {0, 0}, {10, 0}, {-10, 0}, {0, 10}, {0, -10}, {10, 10}, {-10, -10}, {10, -10}, {-10, 10}
     };
 
+    /** 池点"被占"判定半径：只要池心附近有建筑即视为已占用（100 误伤太大，曾致无池可建）。 */
+    private static final float POOL_BLOCK_RADIUS = 40f;
+
+    /** 离锚点最近的前 cap 个空闲池坐标，用于失败回执引导换点。 */
+    private static String freePoolsText(l engine, float ax, float ay, int cap) {
+        try {
+            java.util.ArrayList<float[]> pools = resourcePoints(engine);
+            pools.sort((a, b) -> Float.compare(dist2(a, ax, ay), dist2(b, ax, ay)));
+            StringBuilder sb = new StringBuilder();
+            int n = 0;
+            for (float[] p : pools) {
+                if (blockedByBuilding(p[0], p[1], POOL_BLOCK_RADIUS)) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append('(').append((int) p[0]).append(',').append((int) p[1]).append(')');
+                if (++n >= cap) {
+                    break;
+                }
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     private static float[] findBuildSpot(l engine, n team, as type, float ax, float ay, StringBuilder reason) {
         try {
             if (type.p()) {
@@ -616,7 +660,7 @@ public final class Commands {
                 String firstErr = null;
                 float[] firstPool = pools.isEmpty() ? null : pools.get(0);
                 for (float[] p : pools) {
-                    if (blockedByBuilding(p[0], p[1], 100f)) {
+                    if (blockedByBuilding(p[0], p[1], POOL_BLOCK_RADIUS)) {
                         blocked++;
                         continue;
                     }
@@ -739,8 +783,9 @@ public final class Commands {
         }
     }
 
-    /** 找我方指挥中心（选址默认锚点）。 */
+    /** 选址默认锚点：优先指挥中心；无指挥中心（部分开局）回退到首个建造者。 */
     private static am findCommandCenter(n team) {
+        am firstBuilder = null;
         try {
             com.corrodinggames.rts.gameFramework.utility.o units = am.bF();
             Object[] arr = units.b();
@@ -749,14 +794,24 @@ public final class Commands {
                 Object obj = arr[i];
                 if (obj instanceof am) {
                     am u = (am) obj;
-                    if (!u.bV && !u.ej && u.bX == team && "commandCenter".equals(u.r().i())) {
-                        return u;
+                    if (!u.bV && !u.ej && u.bX == team) {
+                        if ("commandCenter".equals(u.r().i())) {
+                            return u;
+                        }
+                        if (firstBuilder == null) {
+                            try {
+                                if (u.r().l()) {
+                                    firstBuilder = u;
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
                     }
                 }
             }
         } catch (Throwable ignored) {
         }
-        return null;
+        return firstBuilder;
     }
     private static float[] snapToResource(l engine, float x, float y) {
         try {
@@ -844,14 +899,27 @@ public final class Commands {
 
     private static int addDelegated(e c, n team, String line) {
         int count = 0;
+        boolean hasIds = strVal(line, "units") != null;
         ArrayList<am> units = filterByIds(delegatedUnits(team), line);
         for (am u : units) {
+            if (!hasIds && isBuilding(u)) {
+                continue; // stop/attack 默认不带建筑（除非 ids 显式点名）
+            }
             if (u instanceof y) {
                 c.a((y) u);
                 count++;
             }
         }
         return count;
+    }
+
+    /** 是否建筑（type.j()）；判定失败按非建筑处理，不挡指令。 */
+    private static boolean isBuilding(am u) {
+        try {
+            return u.r().j();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** 委托单位：全队模式 → 全部我方单位；否则 id 池 ∪ 委托编队槽。Game thread only. */

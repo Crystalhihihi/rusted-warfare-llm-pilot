@@ -102,7 +102,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "train",
-            "description": "命令工厂生产单位，或命令建筑自我升级。action 是动作ID（生产形如 s_tank，升级见动作表的 c_ 类ID），factory 是工厂/建筑单位id（来自快照我方单位列表）。",
+            "description": "命令工厂生产单位，或命令建筑自我升级。action 是动作ID（生产形如 u_tank；升级取动作表 升级[...] 里的ID，如 upgradeT2），factory 是工厂/建筑单位id（来自快照我方单位列表）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -287,11 +287,13 @@ PRODUCERS = [
     "commandCenter", "builder", "fabricatorT1", "fabricatorT2", "fabricatorT3",
     "landFactory", "airFactory", "mechFactory", "mechFactoryT2", "seaFactory",
     "experimentalLandFactory", "outpostT1", "outpostT2",
+    # 可自我升级的建筑（升级动作在其动作表里，用 train 触发）
+    "extractorT1", "extractorT2", "extractorT3",
 ]
 
 
 def pedia_production_table(pedia, cap=16):
-    """生产者 -> 动作ID，按语义分组：建造[b_] 生产[u_] 升级[数字] 通用[c_]。"""
+    """生产者 -> 动作ID，按语义分组：建造[b_] 生产[u_] 升级[含upgrade] 通用[c_]。"""
     if not pedia:
         return "（百科未载入）"
     by_name = {u["name"]: u for u in pedia.get("units", [])}
@@ -304,7 +306,7 @@ def pedia_production_table(pedia, cap=16):
         groups = []
         for label, pred in (("建造", lambda b: b.startswith("b_")),
                             ("生产", lambda b: b.startswith("u_")),
-                            ("升级", lambda b: b[:1].isdigit()),
+                            ("升级", lambda b: "upgrade" in b.lower()),
                             ("通用", lambda b: b.startswith("c_"))):
             ids = [b for b in builds if pred(b)][:cap]
             if ids:
@@ -340,7 +342,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 
 【建筑百科（名称/价格/科技/移动类型/血量）】
 {pedia_brief(pedia)}
-动作ID规则：建造者施工=b_类型名（如 b_extractorT1）；工厂产兵=u_类型名（如 u_tank、u_builder）；建筑升级=纯数字ID（如 102/110，对该建筑用 train）；c_ 系列=通用动作（c_1集结点/c_2回收/c_3修理）。注意：s_ 是"选中同类单位"的本地动作，禁止用作生产/建造指令。
+动作ID规则：建造者施工=b_类型名（如 b_extractorT1）；工厂产兵=u_类型名（如 u_tank、u_builder）；建筑升级=动作表 升级[...] 里列出的ID（如 upgradeT2，对该建筑用 train）；c_ 系列=通用动作。注意：s_ 是"选中同类单位"的本地动作，禁止用作生产/建造指令。
 
 【生产/建造动作表（生产者: 合法动作ID）】
 {pedia_production_table(pedia)}
@@ -354,7 +356,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 - 硬性规则：小队正在承受攻击时，必须当机立断——要么还击要么撤退，禁止连续分析而不行动。
 - 建造前先确认资金充足（百科有价格；资金不足时先等钱或造便宜的），采集器必须建在资源点上。
 - 发展顺序（重要）：①先让建造者在最近的空闲陆地资源点建采集器（摘要"空闲资源点(陆地)"列表**从第一个开始建，它是离家最近的，不许跳过近的去远的**）；②指挥中心保持生产 builder（总数3~4个即可，不要无限造）；③有了工厂就让工厂持续产战斗单位（生产[u_]列表里的坦克/机甲/飞机），不要闲置；④战斗单位成群后再侦察/骚扰，不要开局就把所有单位派往地图中心。
-- 经济纪律（重要）：每个工厂排队最多2~3个任务（看摘要里[队列N]），堆满了就**扩建新工厂**而不是继续堆；有钱不等于要花，留钱用于扩张（更多采集器/工厂/炮塔）；主基地周围适时建炮塔（c_turret_t1 等）防御；采集器富余后可升级（对该建筑 train "102"/"103"），工厂可升T2（train "110"）解锁更强单位。
+- 经济纪律（重要）：每个工厂排队最多2~3个任务（看摘要里[队列N]），堆满了就**扩建新工厂**而不是继续堆；有钱不等于要花，留钱用于扩张（更多采集器/工厂/炮塔）；主基地周围适时建炮塔防御；采集器富余后可升级——对该建筑用 train，action 取动作表 升级[...] 里的ID（如 extractorT1 的 upgradeT2）；工厂同理可升级解锁更强单位。
 - 兵种搭配（重要）：不要只生产单一兵种——看摘要里"我方其他部队"的构成，保持混合（如主战坦克/机甲 + 防空 + 远程/炮兵），敌方空军多就补防空，敌方龟缩就补远程。
 - 分开操作：move/attack_move/stop 都支持 ids 参数（逗号分隔的单位id），需要让不同单位去不同地方时，给每个单位单独下一条带 ids 的指令，不要对整队下一锅端指令。例：move(1000,500,222) 派 #222 去(1000,500)，move(3000,1000,323) 派 #323 去(3000,1000)。
 - 建造是有时间的：建筑出现≠完工（快照 prog<1 是建造中），完工前工厂不能生产、建筑没作用。**build 的坐标可以省略——系统会在主基地附近自动选址（采集器自动选最近的空闲资源点），除非你明确知道该建在哪，否则一律省略坐标。**
@@ -417,6 +419,10 @@ def main():
     while link.pedia_message() is None and time.time() - t0 < 5:
         time.sleep(0.5)
     pedia = link.pedia_message()
+    # 百科动作 ID 全集（含 upgradeT2 等无前缀动作），用于合法性校验
+    known_actions = set()
+    for pu in (pedia or {}).get("units", []):
+        known_actions.update(pu.get("builds", []))
     world_w = map_msg["tilesW"] * map_msg["tileW"]
     world_h = map_msg["tilesH"] * map_msg["tileH"]
 
@@ -443,7 +449,42 @@ def main():
 
     smz = summarize.Summarizer(map_msg.get("resources", []))
     history = []
-    failed_calls = set()      # 被拒过的指令（agent 回执失败 + pilot 拦截），重复者不再发送
+    # 失败封禁双轨：永封=非法/编造ID、死目标（本对局内）；临封=资金/施工/队列/科技等条件性失败，TTL 后可重试
+    FAILED_TTL = 90.0
+    failed_perm = set()       # call_key，永久封禁
+    failed_temp = {}          # call_key -> 解封时间戳
+
+    def is_blocked(key):
+        if key in failed_perm:
+            return True
+        exp = failed_temp.get(key)
+        if exp is None:
+            return False
+        if time.time() >= exp:
+            failed_temp.pop(key, None)
+            return False
+        return True
+
+    def block_perm(key):
+        failed_perm.add(key)
+
+    def block_temp(key, ttl=FAILED_TTL):
+        failed_temp[key] = time.time() + ttl
+
+    def unblock_cmd(cmd_name):
+        """某类指令后来成功了 = 条件已恢复，清掉它的临时封禁。"""
+        for k in [k for k in failed_temp if k.startswith(cmd_name + ":")]:
+            failed_temp.pop(k, None)
+
+    def classify_agent_fail(cmd_name, msg, key):
+        """按 agent 回执内容决定永封还是临封。"""
+        if "；可用：" in msg:            # 附可用列表 = 该 ID 对此单位无效（编造/前缀错）
+            block_perm(key)
+        elif "target not found" in msg or "not found/not ours" in msg:
+            block_perm(key)              # 目标死了或单位不存在
+        else:                            # funds/正在施工/尚未完工/找不到位置/不可达/no delegated 等
+            block_temp(key)
+
     sent_keys = deque(maxlen=30)  # (cmd名, call_key) 用于把 agent 失败回执归因到具体调用
     pending_notes = []        # 下一轮要塞进上下文的系统提示（拦截/拒绝记录）
     seen_map_version = getattr(link, "map_version", 0)
@@ -473,7 +514,8 @@ def main():
         if mv != seen_map_version:
             seen_map_version = mv
             history.clear()
-            failed_calls.clear()
+            failed_perm.clear()
+            failed_temp.clear()
             new_map = link.map_message()
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
             print("[pilot] 检测到新对局，上下文已重置")
@@ -530,11 +572,13 @@ def main():
             text += "\n\n指令回执（你上一条指令的执行结果，失败原因必须据此纠正）:\n" + "\n".join(
                 ("✓ " if r.get("ok") else "✗ ") + f"{r.get('cmd')}: {r.get('msg')}" for r in results[-8:])
             for r in results:
-                if not r.get("ok"):
-                    for sc, skey in reversed(sent_keys):
-                        if sc == r.get("cmd"):
-                            failed_calls.add(skey)
-                            break
+                if r.get("ok"):
+                    unblock_cmd(r.get("cmd", ""))  # 同类指令已成功 = 条件恢复，解除临时封禁
+                    continue
+                for sc, skey in reversed(sent_keys):
+                    if sc == r.get("cmd"):
+                        classify_agent_fail(sc, r.get("msg") or "", skey)
+                        break
         if pending_notes:
             text += "\n\n" + "\n".join(pending_notes)
             pending_notes.clear()
@@ -601,9 +645,9 @@ def main():
                 if t:
                     note_parts.append(t)
                 continue
-            # 重复拦截：之前被（pilot 或 agent）拒绝过的同一指令不再发送
+            # 重复拦截：永封或临封（TTL 内）的同一指令不再发送
             call_key = name + ":" + json.dumps(args, sort_keys=True)
-            if call_key in failed_calls:
+            if is_blocked(call_key):
                 blocked.append(f"{name}({','.join(str(v) for v in args.values())})")
                 continue
             now = time.time()
@@ -625,21 +669,21 @@ def main():
                 uid = int(args.get("id", -1))
                 if uid not in visible_enemy_ids:
                     print(f"[pilot] 拒绝 attack_unit：id {uid} 不在可见敌人中")
-                    failed_calls.add(call_key)
-                    pending_notes.append(f"✗ attack_unit({uid}): 目标不在可见敌人中，不要再试同一个")
+                    block_temp(call_key)
+                    pending_notes.append(f"✗ attack_unit({uid}): 目标暂不可见，90s内不要再试同一个")
                     continue
                 cmd = {"cmd": "attack", "id": uid}
             elif name == "build":
                 act = str(args.get("action", ""))
-                if not (act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
+                if not (act in known_actions or act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
                     print(f"[pilot] 拒绝 build：非法 action {act}（应为 b_/u_/数字 ID）")
-                    failed_calls.add(call_key)
-                    pending_notes.append(f"✗ build action={act}: 非法ID（必须原样取自动作表），不要再试同一个")
+                    block_perm(call_key)
+                    pending_notes.append(f"✗ build action={act}: 非法ID（必须原样取自动作表），本局不要再试")
                     continue
                 # 系统守卫：资金储备（穷时不许乱花，先留钱建采集器）
                 funds_now = (snap.get("team") or {}).get("funds", 0)
                 if funds_now < 700 and "extractor" not in act:
-                    failed_calls.add(call_key)
+                    block_temp(call_key)
                     pending_notes.append(f"✗ build {act}: 资金仅{funds_now:.0f}<700，先留钱建采集器恢复经济，别的不许盖")
                     print(f"[pilot] 守卫：资金 {funds_now:.0f}，拒绝非采集器建造 {act}")
                     continue
@@ -648,7 +692,7 @@ def main():
                     fac_type = act.split("_", 1)[1] if "_" in act else act
                     same = sum(1 for u in snap.get("own", []) if u.get("bld") and u["t"] == fac_type)
                     if same >= 3:
-                        failed_calls.add(call_key)
+                        block_temp(call_key)
                         pending_notes.append(f"✗ build {act}: 已有{same}座{fac_type}，先让它们满产/升级，不许再建同类")
                         print(f"[pilot] 守卫：{fac_type} 已有 {same} 座，拒绝刷屏")
                         continue
@@ -661,15 +705,15 @@ def main():
             elif name == "train":
                 act = str(args.get("action", ""))
                 fid = int(args.get("factory", -1))
-                if not (act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
+                if not (act in known_actions or act.startswith(("b_", "u_", "c_")) or act[:1].isdigit()):
                     print(f"[pilot] 拒绝 train：非法 action {act}（应为 b_/u_/数字 ID）")
-                    failed_calls.add(call_key)
-                    pending_notes.append(f"✗ train action={act}: 非法ID（必须原样取自动作表），不要再试同一个")
+                    block_perm(call_key)
+                    pending_notes.append(f"✗ train action={act}: 非法ID（必须原样取自动作表），本局不要再试")
                     continue
                 if fid not in own_ids:
                     print(f"[pilot] 拒绝 train：factory {fid} 不是我方单位")
-                    failed_calls.add(call_key)
-                    pending_notes.append(f"✗ train factory={fid}: 不是我方单位id，factory 必须取快照里的#id，不要再试同一个")
+                    block_perm(call_key)
+                    pending_notes.append(f"✗ train factory={fid}: 不是我方单位id，factory 必须取快照里的#id，本局不要再试")
                     continue
                 # 系统守卫：闲置建造者≥2 时禁止再生产（不卡总数，卡闲置）
                 if act in ("u_builder", "u_fabricator"):
@@ -679,7 +723,7 @@ def main():
                         and not u.get("bld")
                         and (u.get("act") in (None, "", "idle")))
                     if idle_b >= 2:
-                        failed_calls.add(call_key)
+                        block_temp(call_key)
                         pending_notes.append(
                             f"✗ train {act}: 有{idle_b}个建造者正在闲置！先给他们派建筑活（采集器/工厂/炮塔），都用上了再产新的")
                         print(f"[pilot] 守卫：{idle_b} 个 builder 闲置，拒绝再产")
@@ -687,7 +731,7 @@ def main():
                 # 系统守卫：工厂队列上限（防单厂堆货）
                 fac_u = next((u for u in snap.get("own", []) if u["id"] == fid), None)
                 if fac_u is not None and (fac_u.get("q") or 0) >= 3:
-                    failed_calls.add(call_key)
+                    block_temp(call_key)
                     pending_notes.append(
                         f"✗ train {act}: 该工厂队列已满(3)，不要再堆！请扩建新工厂或等队列消化")
                     print(f"[pilot] 守卫：factory {fid} 队列满，拒绝堆货")
@@ -697,8 +741,8 @@ def main():
                 fid = int(args.get("factory", -1))
                 if fid not in own_ids:
                     print(f"[pilot] 拒绝 rally：factory {fid} 不是我方单位")
-                    failed_calls.add(call_key)
-                    pending_notes.append(f"✗ rally factory={fid}: 不是我方单位id，不要再试同一个")
+                    block_perm(call_key)
+                    pending_notes.append(f"✗ rally factory={fid}: 不是我方单位id，本局不要再试")
                     continue
                 cmd = {"cmd": "rally", "factory": fid,
                        "x": clamp(float(args.get("x", 0)), 0, world_w),

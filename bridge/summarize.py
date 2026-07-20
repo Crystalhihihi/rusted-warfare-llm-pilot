@@ -69,7 +69,7 @@ class Summarizer:
         enemies = snap.get("enemy", [])
         free_land, free_water, taken, hostile = [], [], 0, []
         for p in self.resources:
-            if any(abs(u["x"] - p["x"]) < 100 and abs(u["y"] - p["y"]) < 100 for u in buildings):
+            if any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40 for u in buildings):
                 taken += 1
             elif any(abs(u["x"] - p["x"]) < 200 and abs(u["y"] - p["y"]) < 200 for u in enemies):
                 hostile.append(p)
@@ -113,7 +113,7 @@ class Summarizer:
         squad_ids = {u["id"] for u in squad}
         c = centroid(squad)
 
-        # 主基地锚点：我方第一个 commandCenter，否则第一个建筑
+        # 主基地锚点：指挥中心 → 第一个建筑 → 首个建造者（无 CC 开局也能定位"家"）
         home = None
         for u in own:
             if u["t"] == "commandCenter":
@@ -121,6 +121,8 @@ class Summarizer:
                 break
         if home is None:
             home = next((u for u in own if u.get("bld")), None)
+        if home is None:
+            home = next((u for u in own if "uilder" in u["t"] or "abricator" in u["t"]), None)
         self.home = home
 
         # ---- alerts from diffs ----
