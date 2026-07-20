@@ -3,6 +3,8 @@ base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"      # 从环境变量读 key，不写进文件
 model = "deepseek-chat"
 
+use_executor = true        # 执行层托管经济/生产/升级（false 回退纯 LLM 微操）；LLM_OFF=1 环境变量可跳过 LLM 纯跑执行层
+
 interval_sec = 4.0        # 基础节拍（秒）；自适应模式下为无威胁时的参考值
 fast_interval_sec = 2.5   # 有警报/敌人贴近(<1200)时的节拍
 mid_interval_sec = 6.0    # 视野内有敌人但距离远

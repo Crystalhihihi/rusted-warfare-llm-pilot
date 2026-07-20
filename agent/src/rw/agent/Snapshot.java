@@ -43,13 +43,6 @@ public final class Snapshot {
         int ownCount = 0;
         int enemyCount = 0;
         int allyCount = 0;
-        java.util.HashSet<Long> delIds = new java.util.HashSet<Long>();
-        if (team != null) {
-            java.util.ArrayList<am> del0 = Commands.delegatedUnits(team);
-            for (am d0 : del0) {
-                delIds.add(d0.eh);
-            }
-        }
         StringBuilder own = new StringBuilder(2048);
         StringBuilder enemy = new StringBuilder(2048);
         StringBuilder ally = new StringBuilder(2048);
@@ -73,7 +66,8 @@ public final class Snapshot {
                     if (ownCount++ > 0) {
                         own.append(',');
                     }
-                    appendUnit(own, u, false, delIds.contains(u.eh) ? Activity.describe(u) : null);
+                    // act 覆盖全部我方单位（执行层需要全体建造者的忙闲，而非仅委托单位）
+                    appendUnit(own, u, false, Activity.describe(u));
                 } else if (team.c(u.bX)) {
                     if (!u.d(team)) {
                         continue; // enemy in fog — not included, no wallhack

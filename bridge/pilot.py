@@ -20,6 +20,7 @@ from collections import deque
 
 import llm
 import summarize
+import executor as exec_mod
 
 HOST, PORT = "127.0.0.1", 41234
 DELEGATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delegation.json")
@@ -155,6 +156,9 @@ TOOLS = [
         },
     },
 ]
+
+# 执行层托管时，LLM 只保留小队指挥类工具（build/train/rally 由 executor 自动完成）
+LLM_TOOLS = [t for t in TOOLS if t["function"]["name"] not in ("build", "train", "rally")]
 
 
 class AgentLink:
@@ -399,13 +403,15 @@ def pick_interval(cfg, alerts, snap, manual_override):
 def main():
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml"), "rb") as fp:
         cfg = tomllib.load(fp)
+    # LLM_OFF=1：纯执行层模式（离线验证经济/生产调度，不调用任何 LLM）
+    llm_off = os.environ.get("LLM_OFF") == "1"
     api_key = os.environ.get(cfg["api_key_env"], "")
     if not api_key:
         secret_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret.toml")
         if os.path.exists(secret_path):
             with open(secret_path, "rb") as fp:
                 api_key = tomllib.load(fp).get("api_key", "")
-    if not api_key:
+    if not api_key and not llm_off:
         print(f"缺少 API key：请设置环境变量 {cfg['api_key_env']} 或填写 bridge/secret.toml")
         return 1
 
@@ -449,6 +455,13 @@ def main():
         link.send({"cmd": "delegate", "groups": ",".join(str(group_to_slot(g)) for g in sorted(user_groups))})
 
     smz = summarize.Summarizer(map_msg.get("resources", []))
+    # 执行层：经济/生产/升级自动调度（use_executor=false 可回退到纯 LLM 微操）
+    executor = None
+    if cfg.get("use_executor", True):
+        executor = exec_mod.Executor(map_msg, pedia, log_activity)
+        system["content"] += ("\n\n【系统托管】经济建设（采集器/工厂建造、工厂生产、建筑升级、集结点）"
+                              "已由执行层自动完成，build/train/rally 已从你的工具表移除——"
+                              "禁止再尝试它们，你专注于委托小队的移动/交战/撤退与战术判断。")
     history = []
     # 失败封禁双轨：永封=非法/编造ID、死目标（本对局内）；临封=资金/施工/队列/科技等条件性失败，TTL 后可重试
     FAILED_TTL = 90.0
@@ -519,6 +532,8 @@ def main():
             failed_temp.clear()
             new_map = link.map_message()
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
+            if cfg.get("use_executor", True):
+                executor = exec_mod.Executor(new_map, pedia, log_activity)
             print("[pilot] 检测到新对局，上下文已重置")
             log_activity("status", "新对局开始，AI 上下文已重置")
             continue
@@ -583,6 +598,20 @@ def main():
         if pending_notes:
             text += "\n\n" + "\n".join(pending_notes)
             pending_notes.clear()
+        # 执行层：经济/生产自动调度（不受 LLM 节拍限制，每个循环都跑）
+        if executor is not None:
+            executor.on_cmd_results(results)
+            for ec in executor.tick(snap):
+                if not link.send(ec):
+                    break
+                cmd_times.append(time.time())
+                log_activity("cmd", "⚙ " + json.dumps(ec, ensure_ascii=False))
+        if llm_off:  # 纯执行层模式：跳过 LLM 调用，只报执行层状态
+            if time.time() - last_hint > 10:
+                last_hint = time.time()
+                print("[llm_off] " + (executor.status_line(snap) if executor else "执行层未启用"))
+            time.sleep(0.5)
+            continue
         text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
         interval_override = (ac.get("interval") or 0) if ac else 0
         if not interval_override:
@@ -593,6 +622,7 @@ def main():
             continue
         last_cycle = time.time()
 
+        active_tools = LLM_TOOLS if executor is not None else TOOLS
         messages = [system]
         for u, a in history:
             messages.append({"role": "user", "content": u})
@@ -601,7 +631,7 @@ def main():
 
         t_start = time.time()
         try:
-            msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, TOOLS,
+            msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, active_tools,
                            timeout=int(cfg["timeout_sec"]))
         except llm.LlmError as e:
             print(f"[llm] 调用失败: {e}")
@@ -618,7 +648,7 @@ def main():
             messages.append({"role": "user", "content":
                              "刚才的回复没有任何工具调用。请直接用一个工具给出下一步指令（move/attack_move/attack_unit/build/train/stop 之一），或用 note 一句话说明等待原因。无需解释。"})
             try:
-                msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, TOOLS,
+                msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, active_tools,
                                timeout=int(cfg["timeout_sec"]))
                 note = (msg.get("content") or "").strip()
                 calls = msg.get("tool_calls") or []
@@ -645,6 +675,10 @@ def main():
                 t = str(args.get("text", "")).strip()
                 if t:
                     note_parts.append(t)
+                continue
+            # 执行层托管期间拦截幻觉调用的经济指令（工具表已移除，双保险）
+            if executor is not None and name in ("build", "train", "rally"):
+                blocked.append(f"{name}(经济已由系统托管)")
                 continue
             # 重复拦截：永封或临封（TTL 内）的同一指令不再发送
             call_key = name + ":" + json.dumps(args, sort_keys=True)
