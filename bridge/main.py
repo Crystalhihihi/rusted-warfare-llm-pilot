@@ -8,6 +8,11 @@ import sys
 import time
 from collections import Counter
 
+try:  # Windows GBK 控制台兼容
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HOST, PORT = "127.0.0.1", 41234
 
 

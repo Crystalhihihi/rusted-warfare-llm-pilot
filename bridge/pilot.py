@@ -22,6 +22,11 @@ import llm
 import summarize
 import executor as exec_mod
 
+try:  # Windows GBK 控制台打印 ✓/✗/⚙ 等字符会崩线程，统一改 UTF-8+替换
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HOST, PORT = "127.0.0.1", 41234
 DELEGATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delegation.json")
 CONTROL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "control.json")

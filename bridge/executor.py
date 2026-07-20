@@ -52,7 +52,8 @@ def _busy(u):
 
 
 def _constructing(u):
-    return 0 < u.get("prog", 1) < 1
+    # prog 仅在未完成时下发且 0=刚放置：小于 1 即未完成（0 不能排除，否则新厂被当成完工）
+    return u.get("prog", 1) < 1
 
 
 class Executor:
@@ -77,6 +78,7 @@ class Executor:
         self.action_bad = set()        # (单位类型, 动作)：本局已被拒
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
+        self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
         self.start_ts = time.time()
 
     # ---------- LLM 目标接口 ----------
@@ -111,6 +113,7 @@ class Executor:
     # ---------- 主循环 ----------
     def tick(self, snap):
         now = time.time()
+        self.issued_builds = [e for e in self.issued_builds if e[1] > now]
         cmds = []
         own = snap.get("own", [])
         funds = (snap.get("team") or {}).get("funds", 0)
@@ -132,6 +135,10 @@ class Executor:
                 return False
             self.cool[cool_key] = now + cooldown
             cmds.append(cmd)
+            if cmd["cmd"] == "build":
+                act = cmd.get("action", "")
+                btype = act[2:] if act.startswith("b_") else act
+                self.issued_builds.append((btype, now + 45.0))  # 施工窗口期，防重复下单
             return True
 
         # 1) 建造者数量
@@ -143,7 +150,8 @@ class Executor:
 
         # 2) 采集器扩建（最高优先；agent 自动选最近空闲池）
         ext_target = self.econ_goal["extractors"]
-        ext_inflight = busy_cnt + sum(1 for u in constructing if u["t"].startswith("extractor"))
+        ext_inflight = (sum(1 for u in constructing if u["t"].startswith("extractor"))
+                        + sum(1 for t, _ in self.issued_builds if t.startswith("extractor")))
         if (len(ext_done) + ext_inflight < ext_target + 2  # 允许少量并行
                 and funds >= EXTRACTOR_PRICE and idle_builders):
             b = idle_builders[0]
@@ -153,7 +161,8 @@ class Executor:
 
         # 3) 第一座陆工厂（2 池后）
         land_factories = [u for u in fac_producers if u["t"] == "landFactory"]
-        lf_inflight = sum(1 for u in constructing if u["t"] == "landFactory")
+        lf_inflight = (sum(1 for u in constructing if u["t"] == "landFactory")
+                       + sum(1 for t, _ in self.issued_builds if t == "landFactory"))
         if (len(ext_done) >= 2 and len(land_factories) + lf_inflight < 1
                 and funds >= max(FUNDS_RESERVE, 700) and idle_builders):
             b = idle_builders[0]
