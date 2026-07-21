@@ -194,7 +194,7 @@ STRAT_TOOLS = [
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
     {"type": "function", "function": {
         "name": "query",
-        "description": "查参考资料（本地数据即时回答，不占指令名额）。topic 选: unit(单位详情,arg=单位名) / building(建筑详情,arg=名称) / prices(生产者价格与产能表) / map_overview(全图地形粗览) / map_zone(区域详图,arg=\"x,y\"世界坐标) / bases(视野内已知主基地位置)。拿不准先查再决策，每轮最多2次。",
+        "description": "查参考资料（本地数据即时回答，不占指令名额）。topic 选: roster(全单位花名册,分组+科技) / unit(单位详情,arg=单位名) / building(建筑详情,arg=名称) / prices(生产者价格与产能表) / map_overview(全图地形粗览) / map_zone(区域详图,arg=\"x,y\"世界坐标) / bases(视野内已知主基地位置)。拿不准先查再决策，每轮最多2次。",
         "parameters": {"type": "object", "properties": {"topic": {"type": "string"}, "arg": {"type": "string"}}, "required": ["topic"]}}},
 ]
 
@@ -215,6 +215,19 @@ def answer_query(topic, arg, map_msg, pedia, snap):
                 f"hp={u.get('hp', '?')} 动作[{','.join(builds[:24])}]")
     if topic == "prices":
         return _capability_brief(pedia)
+    if topic == "roster":
+        # 全单位花名册（分组+科技等级标注），供 LLM 发现"原来还有这种东西"
+        groups = {"建筑": [], "陆军": [], "空军": [], "海军": [], "建造者": [], "其他": []}
+        for name, u in units.items():
+            if u.get("builder"):
+                g = "建造者"
+            elif u.get("building"):
+                g = "建筑"
+            else:
+                mv = (u.get("move") or "").upper()
+                g = "空军" if "AIR" in mv else ("海军" if ("SEA" in mv or "WATER" in mv) else "陆军")
+            groups[g].append(f"{name}(${u.get('price', '?')},T{u.get('tech', '?')})")
+        return "\n".join(f"{k}({len(v)}): " + ",".join(v[:40]) for k, v in groups.items() if v)
     if topic == "map_overview":
         rows = map_msg.get("rows", [])
         if not rows:
@@ -284,18 +297,23 @@ def strategic_grid(map_msg, snap, n=12):
 
 
 def _capability_brief(pedia):
-    """紧凑的单位能力清单：主要生产者可产兵种与升级路径（防止 LLM 不知道有什么可造）。"""
+    """紧凑的单位能力清单：主要生产者可产兵种（带科技标注）与升级路径。"""
     by_name = {u["name"]: u for u in (pedia or {}).get("units", [])}
+
+    def with_tech(action):
+        ut = by_name.get(action[2:]) if action.startswith("u_") else None
+        return f"{action}(T{ut['tech']})" if ut else action
+
     rows = []
     for name in ("commandCenter", "builder", "landFactory", "airFactory", "seaFactory", "mechFactory"):
         u = by_name.get(name)
         if not u:
             continue
-        prods = list(dict.fromkeys(b for b in u.get("builds", []) if b.startswith("u_")))[:8]
+        prods = list(dict.fromkeys(b for b in u.get("builds", []) if b.startswith("u_")))[:10]
         ups = list(dict.fromkeys(b for b in u.get("builds", []) if not b.startswith(("b_", "u_", "c_"))))[:3]
         s = f"{name}(${u.get('price', '?')})"
         if prods:
-            s += " 产[" + ",".join(prods) + "]"
+            s += " 产[" + ",".join(with_tech(a) for a in prods) + "]"
         if ups:
             s += " 升[" + ",".join(ups) + "]"
         rows.append(s)
@@ -316,7 +334,8 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
 【规则】
 - 每次回复必须调用工具，且**尽量给一揽子动作**：1~2 个军事动作(attack/harass/defend_home) + 1 个经济动作(expand/build_army)，不要一轮只做一件事。工具：attack / harass / defend_home / expand / build_army / note / query(查资料)。
-- 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名。
+- 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名；query(roster) 是全单位花名册。
+- 工厂升级后必须 query 该厂看新解锁兵种并换产：T2 单位全面强于 T1，继续造 T1 是浪费。
 - expand 采集器目标上限为 12，超过会被系统拒绝；经济够用就把资源转向军力和升级。
 - 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
 - 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
@@ -895,7 +914,8 @@ def main():
                 except json.JSONDecodeError:
                     qa = {}
                 ans = answer_query(qa.get("topic", ""), qa.get("arg", ""), map_msg, pedia, snap)
-                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": ans[:1500]})
+                cap = 2600 if qa.get("topic") == "roster" else 1500
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": ans[:cap]})
                 log_activity("note", f"🔍 查{qa.get('topic')}:{qa.get('arg', '')}")
             calls = [tc for tc in calls if (tc.get("function") or {}).get("name") != "query"]
             try:
