@@ -77,7 +77,7 @@ class Executor:
         self.econ_goal = dict(DEFAULT_ECON)
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
         self.stance = "expand"
-        self.action_bad = set()        # (单位类型, 动作)：本局已被拒
+        self.action_bad = {}           # 动作 -> 解封时间（None=永久：ID不存在；限时=科技未达，120s重试）
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
@@ -93,7 +93,14 @@ class Executor:
 
     def set_army_goal(self, composition=None, rally=None):
         if composition is not None:
-            self.army_goal["composition"] = {str(k): int(v) for k, v in composition.items()}
+            # 归一化键名：LLM 常省略 u_ 前缀（'c_tank' -> 'u_c_tank'）
+            norm = {}
+            for k, v in composition.items():
+                key = str(k)
+                if not key.startswith(("u_", "b_", "c_")):
+                    key = "u_" + key
+                norm[key] = int(v)
+            self.army_goal["composition"] = norm
         if rally is not None:
             self.army_goal["rally"] = (float(rally[0]), float(rally[1]))
             self.rallied.clear()
@@ -101,17 +108,28 @@ class Executor:
     def set_stance(self, stance):
         self.stance = str(stance)
 
+    def _bad(self, act, now):
+        """动作当前是否不可用（None=永久；限时项到期自动解封重试）。"""
+        if act not in self.action_bad:
+            return False
+        exp = self.action_bad[act]
+        return exp is None or now < exp
+
     # ---------- 失败回执学习 ----------
     def on_cmd_results(self, results):
         for r in results or []:
             if r.get("ok"):
                 continue
             msg = r.get("msg") or ""
-            m = (re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", msg)
-                 or re.search(r"不可用（科技/条件不满足）[:：]\s*([A-Za-z0-9_]+)", msg))
+            m = re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", msg)
             if m:
-                self.action_bad.add(m.group(1))
-                self.log("status", f"⚙ 动作不可用已记录: {m.group(1)}")
+                self.action_bad[m.group(1)] = None  # ID 不存在：永久封
+                self.log("status", f"⚙ 动作不存在已永封: {m.group(1)}")
+                continue
+            m = re.search(r"不可用（科技/条件不满足）[:：]\s*([A-Za-z0-9_]+)", msg)
+            if m:
+                self.action_bad[m.group(1)] = time.time() + 120  # 科技未达：120s 后重试
+                self.log("status", f"⚙ 动作科技未达，120s后重试: {m.group(1)}")
 
     # ---------- 主循环 ----------
     def tick(self, snap):
@@ -164,11 +182,11 @@ class Executor:
             if funds >= 250:
                 emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
 
-        # 2) 采集器扩建（最高优先；agent 自动选最近空闲池）
+        # 2) 采集器扩建（最高优先；agent 自动选最近空闲池；完工数达标即停）
         ext_target = self.econ_goal["extractors"]
         ext_inflight = (sum(1 for u in constructing if u["t"].startswith("extractor"))
                         + sum(1 for t, _ in self.issued_builds if t.startswith("extractor")))
-        if (len(ext_done) + ext_inflight < ext_target + 2  # 允许少量并行
+        if (len(ext_done) < ext_target and ext_inflight < 2
                 and funds >= EXTRACTOR_PRICE and idle_builders):
             b = idle_builders[0]
             emit({"cmd": "build", "action": "b_extractorT1", "builder": b["id"]},
@@ -186,16 +204,37 @@ class Executor:
                  f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 4) 第二座工厂（队列持续饱和时）
-        if (len(land_factories) >= 1 and len(fac_producers) + lf_inflight < self.econ_goal["max_factories"]
-                and all((u.get("q") or 0) >= QUEUE_MAX for u in land_factories)
-                and funds >= FUNDS_RESERVE + 700 and idle_builders):
+        # 4) 工厂扩建：军队目标大或资金富余时扩厂（此前只在队列塞满时扩，钱再多也不动）
+        army_total = sum((self.army_goal["composition"] or {}).values())
+        fac_want = max(2, min(4, 1 + army_total // 10))
+        saturated = bool(land_factories) and all((u.get("q") or 0) >= 1 for u in land_factories)
+        if (len(land_factories) >= 1 and len(fac_producers) + lf_inflight < fac_want
+                and (saturated or funds >= 2200) and funds >= 1400 and idle_builders):
             b = idle_builders[0]
             emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"]},
                  f"build:lf2:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 5) 生产调度：按构成目标或默认优先级补队列
+        # 4.5) 防御：有工厂且资金富余时，补最多2座炮塔（动作不可用时静默跳过）
+        turrets = [u for u in own if "turret" in u["t"].lower() and u.get("bld")]
+        t_inflight = sum(1 for t, _ in self.issued_builds if "turret" in t.lower())
+        if (land_factories and funds >= 1600 and len(turrets) + t_inflight < 2
+                and idle_builders and not self._bad("b_c_turret_t1", now)):
+            b = idle_builders[0]
+            emit({"cmd": "build", "action": "b_c_turret_t1", "builder": b["id"]},
+                 f"build:tur:{b['id']}", 6.0)
+            idle_builders = idle_builders[1:]
+
+        # 5) 采集器升级（≥3池且资金富余即可；优先于常规补兵，否则永远排不上）
+        if funds >= 3200 and len(ext_done) >= 3:
+            for u in ext_done:
+                up = self.upgrade_action.get(u["t"])
+                if up and not self._bad(up, now) and now >= self.cool.get(f"up:{u['id']}", 0):
+                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                    emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                    break
+
+        # 6) 生产调度：按构成目标或默认优先级补队列
         #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"
         econ_pending = (len(ext_done) + ext_inflight < ext_target) or (not land_factories)
         for fac in fac_producers:
@@ -207,7 +246,7 @@ class Executor:
             if act:
                 emit({"cmd": "train", "action": act, "factory": fac["id"]}, f"train:{fac['id']}")
 
-        # 6) 集结点（army_goal 指定时，每厂设一次）
+        # 7) 集结点（army_goal 指定时，每厂设一次）
         if self.army_goal["rally"]:
             rx, ry = self.army_goal["rally"]
             for fac in fac_producers:
@@ -216,19 +255,11 @@ class Executor:
                     emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
                          f"rally:{fac['id']}", 5.0)
 
-        # 7) 采集器升级（达标且有钱；冷却逐建筑）
-        if funds >= UPGRADE_FUNDS and len(ext_done) >= self.econ_goal["extractors"]:
-            for u in ext_done:
-                up = self.upgrade_action.get(u["t"])
-                if up and up not in self.action_bad and now >= self.cool.get(f"up:{u['id']}", 0):
-                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                    emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                    break
-
         return cmds
 
     # ---------- 生产决策 ----------
     def _next_production(self, fac, own):
+        now = time.time()
         ftype = fac["t"]
         avail = self.factory_actions.get(ftype)
         # 构成目标模式：按缺口最大者优先
@@ -240,7 +271,7 @@ class Executor:
                     counts[u["t"]] += 1
             best, best_deficit = None, 0
             for action, target in comp.items():
-                if action in self.action_bad:
+                if self._bad(action, now):
                     continue
                 if avail is not None and action not in avail:
                     continue
@@ -251,7 +282,7 @@ class Executor:
             return best
         # 默认优先级模式
         for act in DEFAULT_PROD.get(ftype, []):
-            if act in self.action_bad:
+            if self._bad(act, now):
                 continue
             if avail is not None and act not in avail:
                 continue
@@ -259,7 +290,7 @@ class Executor:
         # 静态表没有时退回百科里第一个可用的
         if avail:
             for act in sorted(avail):
-                if act not in self.action_bad:
+                if not self._bad(act, now):
                     return act
         return None
 
