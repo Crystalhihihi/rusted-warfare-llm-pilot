@@ -353,7 +353,8 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 - 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名；query(roster) 是全单位花名册。
 - 工厂升级后必须 query 该厂看新解锁兵种并换产：T2 单位全面强于 T1，继续造 T1 是浪费。
 - expand 采集器目标上限为 12，超过会被系统拒绝；经济够用就把资源转向军力和升级。
-- 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
+- 生产与建造的日常不要插手，军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
+- build_building 可让建造者建任何战略建筑：b_airFactory(空军)/b_mechFactory(机甲可爬崖)/b_seaFactory(海军)/b_repairbay(维修)/b_laserDefence(拦导弹)/b_experimentalLandFactory(实验重单位)/b_fabricatorT1(资源制造仪,僵局经济)。按地图与战局选择，别只会陆厂。
 - 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
 - build_army 可带集结点坐标(x,y)：出厂单位会自动向集结点汇聚。把集结点设在主基地靠前/交火方向，别默认让部队蹲在厂里。
 - 小队残血或被围就用 defend_home，别硬拼；扩张与进攻二选一，不要同时。
