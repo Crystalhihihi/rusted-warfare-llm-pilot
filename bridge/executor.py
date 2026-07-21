@@ -82,6 +82,8 @@ class Executor:
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
+        self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
+        self.auto_military_cd = 0.0
         self.start_ts = time.time()
 
     # ---------- LLM 目标接口 ----------
@@ -271,6 +273,27 @@ class Executor:
                     self.rallied.add(fac["id"])
                     emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
                          f"rally:{fac['id']}", 5.0)
+
+        # 8) LLM 沉默时的默认军事行为：军队成型且 90s 无指令 → 自动推进一步
+        army = [u for u in own if not u.get("bld") and not _is_builder(u)]
+        if (len(army) >= 6 and now - max(self.last_military_order, self.start_ts) > 90
+                and now >= self.auto_military_cd and self.stance != "defend"):
+            self.auto_military_cd = now + 60
+            enemies = snap.get("enemy", [])
+            if enemies and army:
+                # 打最近可见敌人
+                cx = sum(u["x"] for u in army) / len(army)
+                cy = sum(u["y"] for u in army) / len(army)
+                tgt = min(enemies, key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)
+                emit({"cmd": "attackmove", "x": float(tgt["x"]), "y": float(tgt["y"])}, "auto:atk", 5.0)
+                self.log("status", "⚙ LLM沉默，自动进攻最近可见敌人")
+            else:
+                # 无敌情：向地图中心推进侦察
+                mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
+                mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
+                if mw and mh:
+                    emit({"cmd": "attackmove", "x": mw / 2, "y": mh / 2}, "auto:scout", 5.0)
+                    self.log("status", "⚙ LLM沉默，自动向地图中心推进侦察")
 
         return cmds
 

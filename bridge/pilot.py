@@ -806,10 +806,12 @@ def main():
                 continue
             # 战略动词映射（执行层托管时）
             if executor is not None and name in ("attack", "harass"):
+                executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
                        "x": clamp(float(args.get("x", 0)), 0, world_w),
                        "y": clamp(float(args.get("y", 0)), 0, world_h)}
             elif executor is not None and name == "defend_home":
+                executor.last_military_order = time.time()
                 if getattr(smz, "home", None):
                     cmd = {"cmd": "move", "x": float(smz.home["x"]), "y": float(smz.home["y"])}
                 else:
