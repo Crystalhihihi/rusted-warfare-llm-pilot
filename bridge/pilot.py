@@ -577,6 +577,20 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+# 只能对空的单位：地面进攻时从编队中剔除（留家防空，不拉去送死）
+AA_ONLY = {"missileTank", "mechMissile", "mechHeavyMissile",
+           "interceptor", "c_interceptor", "heavyInterceptor",
+           "aaBeamGunship", "aaBeamGunship_afterburn"}
+
+
+def ground_combat_ids(snap, squad_ids):
+    """地面攻击应包含的单位 id：非建筑、非建造者、非纯防空。"""
+    return ",".join(str(u["id"]) for u in snap.get("own", [])
+                    if u["id"] in squad_ids and not u.get("bld")
+                    and "uilder" not in u["t"] and "abricator" not in u["t"]
+                    and u["t"] not in AA_ONLY)
+
+
 def executor_worker(link, holder, cmd_times):
     """执行层独立线程：每 2s 跑一拍，不再被 LLM 调用阻塞（指令饿死的根治）。"""
     while True:
@@ -991,11 +1005,17 @@ def main():
                     cmd = {"cmd": "attackmove", "x": float(tgt["x"]), "y": float(tgt["y"])}
                 else:
                     cmd = {"cmd": "attackmove", "x": world_w / 2, "y": world_h / 2}  # 无敌情就向图中心推进
+                gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
+                if gids:
+                    cmd["units"] = gids  # 地面进攻只带能打地面的，防空兵留家
             elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
                        "x": clamp(float(args.get("x", 0)), 0, world_w),
                        "y": clamp(float(args.get("y", 0)), 0, world_h)}
+                gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
+                if gids:
+                    cmd["units"] = gids
             elif executor is not None and name == "defend_home":
                 executor.last_military_order = time.time()
                 if getattr(smz, "home", None):
