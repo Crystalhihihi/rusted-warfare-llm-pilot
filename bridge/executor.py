@@ -204,24 +204,36 @@ class Executor:
                  f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 4) 工厂扩建：军队目标大或资金富余时扩厂（此前只在队列塞满时扩，钱再多也不动）
+        # 4) 工厂扩建：军力目标+资金双驱动（此前太保守导致资金爆表）；厂型跟随军队构成
         army_total = sum((self.army_goal["composition"] or {}).values())
-        fac_want = max(2, min(4, 1 + army_total // 10))
-        saturated = bool(land_factories) and all((u.get("q") or 0) >= 1 for u in land_factories)
-        if (len(land_factories) >= 1 and len(fac_producers) + lf_inflight < fac_want
-                and (saturated or funds >= 2200) and funds >= 1400 and idle_builders):
+        fac_want = max(2, 1 + army_total // 10)
+        if funds > 8000:
+            fac_want += 1
+        if funds > 30000:
+            fac_want += 2
+        fac_want = min(6, fac_want)
+        comp = self.army_goal["composition"] or {}
+        air_acts = {"u_lightGunship", "u_c_interceptor", "u_gunShip", "u_c_helicopter", "u_bomber"}
+        fac_action = "b_airFactory" if any(a in comp for a in air_acts) else "b_landFactory"
+        fac_inflight = sum(1 for t, _ in self.issued_builds if "actory" in t)
+        if (len(ext_done) >= 2 and len(fac_producers) + fac_inflight < fac_want
+                and funds >= 1400 and idle_builders and not self._bad(fac_action, now)):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"]},
-                 f"build:lf2:{b['id']}", 4.0)
+            emit({"cmd": "build", "action": fac_action, "builder": b["id"]},
+                 f"build:fac:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 4.5) 防御：有工厂且资金富余时，补最多2座炮塔（动作不可用时静默跳过）
+        # 4.5) 防御：炮塔数量随资金增长（2→6），敌方有空军时穿插防空炮塔
         turrets = [u for u in own if "turret" in u["t"].lower() and u.get("bld")]
         t_inflight = sum(1 for t, _ in self.issued_builds if "turret" in t.lower())
-        if (land_factories and funds >= 1600 and len(turrets) + t_inflight < 2
-                and idle_builders and not self._bad("b_c_turret_t1", now)):
+        enemy_air = any(k in e["t"].lower() for e in snap.get("enemy", [])
+                        for k in ("gunship", "jet", "bomber", "interceptor", "airship", "helicopter", "drone"))
+        tur_action = "b_c_antiAirTurret" if (enemy_air and len(turrets) % 2 == 1) else "b_c_turret_t1"
+        t_cap = min(6, 2 + int(funds // 20000))
+        if (land_factories and funds >= 1600 and len(turrets) + t_inflight < t_cap
+                and idle_builders and not self._bad(tur_action, now)):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_c_turret_t1", "builder": b["id"]},
+            emit({"cmd": "build", "action": tur_action, "builder": b["id"]},
                  f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
