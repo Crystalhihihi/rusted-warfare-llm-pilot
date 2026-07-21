@@ -9,6 +9,7 @@ LLM 只能通过三个 goal 接口影响它；设 LLM_OFF=1 时可完全独立�
 - 动作可用性自学习：被 agent 回执拒绝的 (单位类型, 动作) 本局标记不再尝试。
 - 建造者真并行：每个空闲建造者独立派活，施工中不打扰（agent 侧也有施工保护）。
 """
+import math
 import re
 import time
 from collections import Counter
@@ -222,8 +223,11 @@ class Executor:
         if (len(ext_done) >= 2 and len(fac_producers) + fac_inflight < fac_want
                 and funds >= 1400 and idle_builders and not self._bad(fac_action, now)):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": fac_action, "builder": b["id"]},
-                 f"build:fac:{b['id']}", 4.0)
+            fcmd = {"cmd": "build", "action": fac_action, "builder": b["id"]}
+            if land_factories:  # 向首厂聚拢，形成厂区而非散点
+                fcmd["x"] = float(land_factories[0]["x"]) + 120
+                fcmd["y"] = float(land_factories[0]["y"]) + 120
+            emit(fcmd, f"build:fac:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
         # 4.5) 防御：炮塔数量随资金增长（2→6），敌方有空军时穿插防空炮塔
@@ -236,23 +240,32 @@ class Executor:
         if (land_factories and funds >= 1600 and len(turrets) + t_inflight < t_cap
                 and idle_builders and not self._bad(tur_action, now)):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": tur_action, "builder": b["id"]},
-                 f"build:tur:{b['id']}", 6.0)
+            tcmd = {"cmd": "build", "action": tur_action, "builder": b["id"]}
+            mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
+            mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
+            if cc and mw and mh:  # 朝地图中心（前线方向）前移一段落位
+                dx, dy = mw / 2 - cc["x"], mh / 2 - cc["y"]
+                d = max(1.0, math.hypot(dx, dy))
+                tcmd["x"] = float(cc["x"] + dx / d * 260)
+                tcmd["y"] = float(cc["y"] + dy / d * 260)
+            emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
-        # 5) 建筑升级（资金富余即可；所有可升级建筑轮换，工厂升级需更多余钱；优先于常规补兵）
+        # 5) 建筑升级：工厂优先（T2军力>一切），采集器只在高盈余时升；优先于常规补兵
         if funds >= 3200:
-            for u in own:
-                if not u.get("bld") or _constructing(u):
+            fac_up = [u for u in own if u.get("bld") and not _constructing(u) and "actory" in u["t"].lower()]
+            upgraded = False
+            for group, need in ((fac_up, 4000), (ext_done, 5000)):
+                if upgraded or funds < need:
                     continue
-                up = self.upgrade_action.get(u["t"])
-                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
-                    continue
-                if "actory" in u["t"].lower() and funds < 4500:
-                    continue
-                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                break
+                for u in group:
+                    up = self.upgrade_action.get(u["t"])
+                    if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
+                        continue
+                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                    emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                    upgraded = True
+                    break
 
         # 6) 生产调度：按构成目标或默认优先级补队列
         #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"

@@ -315,7 +315,7 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
 【规则】
-- 每次回复必须调用一个工具：attack(进攻坐标) / harass(骚扰坐标) / defend_home(回撤守家) / expand(提高采集器目标) / build_army(改军队构成与集结点) / note(一句分析)。另有 query(查资料) 随时可用。
+- 每次回复必须调用工具，且**尽量给一揽子动作**：1~2 个军事动作(attack/harass/defend_home) + 1 个经济动作(expand/build_army)，不要一轮只做一件事。工具：attack / harass / defend_home / expand / build_army / note / query(查资料)。
 - 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名。
 - 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
 - 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
