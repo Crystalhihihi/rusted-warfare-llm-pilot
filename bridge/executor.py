@@ -349,7 +349,9 @@ class Executor:
                     self.last_upgrade = (u["id"], up, now)
                 return
 
-        try_upgrade(ext_done, 3200)   # 轨A：采集器绝对优先
+        try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                     and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))],
+                    3200)             # 轨A：经济建筑绝对优先（采集器+资源制造仪）
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
                      and "actory" in u["t"].lower()], 4500)  # 轨B：工厂并行
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
@@ -393,25 +395,17 @@ class Executor:
         return cmds
 
     # ---------- 生产决策 ----------
-    def _fac_tier(self, ftype):
-        if ftype.endswith("T3"):
-            return 3
-        if ftype.endswith("T2"):
-            return 2
-        return 1
-
-    def _tech_ok(self, action, tier):
-        """T2+ 工厂不产低于其等级的单位（同价 T2 更强）。"""
-        if tier <= 1:
-            return True
-        t = self.action_tech.get(action)
-        return t is None or t >= tier
-
     def _next_production(self, fac, own):
         now = time.time()
         ftype = fac["t"]
-        tier = self._fac_tier(ftype)
         avail = self.factory_actions.get(ftype)
+        # 有 T2+ 可产就不产 T1（按可产列表最高科技算，不看厂名——空军/改名厂同样生效）
+        max_tech = max((self.action_tech.get(a, 1) for a in (avail or []) if not self._bad(a, now)),
+                       default=1)
+
+        def tech_ok(action):
+            return max_tech <= 1 or self.action_tech.get(action, 1) >= 2
+
         # 构成目标模式：按缺口最大者优先；全部达标/被过滤时回落默认优先级（防工厂空转）
         comp = self.army_goal["composition"]
         if comp:
@@ -425,7 +419,7 @@ class Executor:
                     continue
                 if avail is not None and action not in avail:
                     continue
-                if not self._tech_ok(action, tier):
+                if not tech_ok(action):
                     continue
                 unit_type = action[2:] if action.startswith("u_") else action
                 deficit = target - counts.get(unit_type, 0)
@@ -439,13 +433,13 @@ class Executor:
                 continue
             if avail is not None and act not in avail:
                 continue
-            if not self._tech_ok(act, tier):
+            if not tech_ok(act):
                 continue
             return act
         # 静态表没有时退回百科里第一个可用的
         if avail:
             for act in sorted(avail):
-                if not self._bad(act, now) and self._tech_ok(act, tier):
+                if not self._bad(act, now) and tech_ok(act):
                     return act
         return None
 
