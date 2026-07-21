@@ -967,6 +967,7 @@ def main():
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 continue
+            cmd = None
             if name == "note":
                 t = str(args.get("text", "")).strip()
                 if t:
@@ -1036,7 +1037,6 @@ def main():
             if len(cmd_times) >= apm_cap:
                 print("[pilot] APM 限速，跳过本轮剩余指令")
                 break
-            cmd = None
             if name == "move":
                 cmd = {"cmd": "move",
                        "x": clamp(float(args.get("x", 0)), 0, world_w),
@@ -1130,7 +1130,9 @@ def main():
             elif name == "stop":
                 cmd = {"cmd": "stop"}
             else:
-                print(f"[pilot] 未知工具: {name}")
+                if cmd is None:
+                    print(f"[pilot] 未知工具: {name}")
+            if cmd is None:
                 continue
             ids_txt = str(args.get("ids", "")).strip()
             if ids_txt and name in ("move", "attack_move", "stop", "attack_unit"):
