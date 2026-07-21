@@ -338,7 +338,8 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
 【规则】
-- 每次回复必须调用工具，且**尽量给一揽子动作**：1~2 个军事动作(attack/harass/defend_home) + 1 个经济动作(expand/build_army)，不要一轮只做一件事。工具：attack / harass / defend_home / expand / build_army / note / query(查资料)。
+- 每次回复必须包含至少一个**实质动作**（attack/harass/defend_home/expand/build_army 之一）；query 和 note 只是辅助，单独使用等于空过。尽量一揽子：1~2 个军事动作 + 1 个经济动作。
+- **交战铁律**：态势里有警报（遭袭/敌近）时，本回合必须包含 attack/harass/defend_home 之一——先活下来再谈发展，基地快没了还在发展就是输。
 - 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名；query(roster) 是全单位花名册。
 - 工厂升级后必须 query 该厂看新解锁兵种并换产：T2 单位全面强于 T1，继续造 T1 是浪费。
 - expand 采集器目标上限为 12，超过会被系统拒绝；经济够用就把资源转向军力和升级。
@@ -839,7 +840,9 @@ def main():
         if executor is not None:
             text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
                      + "\n【执行层】 " + executor.status_line(snap)
-                     + "\n[系统提示] 本回合必须调用一个战略工具（attack/harass/defend_home/expand/build_army/note/query）。")
+                     + "\n[系统提示] 本回合必须包含一个实质动作（attack/harass/defend_home/expand/build_army）。")
+            if alerts:
+                text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/harass/defend_home），只查资料或只发展视为失误。"
             # 委托队无战斗单位时明确提示（attack/harass 会失败）
             squad_ids = set(snap.get("delegated", []))
             combat = [u for u in snap.get("own", [])
