@@ -572,6 +572,7 @@ def main():
     executor = None
     if use_exec:
         executor = exec_mod.Executor(map_msg, pedia, log_activity)
+        executor.auto_military = bool(cfg.get("auto_military", False))
     # 反射层：受击撤退/基地回防（纯规则，始终启用）
     import reflex as reflex_mod
     reflex = reflex_mod.Reflex(log_activity)

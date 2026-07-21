@@ -84,6 +84,7 @@ class Executor:
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
+        self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
         self.start_ts = time.time()
 
     # ---------- LLM 目标接口 ----------
@@ -274,9 +275,10 @@ class Executor:
                     emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
                          f"rally:{fac['id']}", 5.0)
 
-        # 8) LLM 沉默时的默认军事行为：军队成型且 90s 无指令 → 自动推进一步
+        # 8) LLM 沉默时的默认军事行为（默认关闭，config auto_military=true 才启用）
         army = [u for u in own if not u.get("bld") and not _is_builder(u)]
-        if (len(army) >= 6 and now - max(self.last_military_order, self.start_ts) > 90
+        if (self.auto_military and len(army) >= 6
+                and now - max(self.last_military_order, self.start_ts) > 90
                 and now >= self.auto_military_cd and self.stance != "defend"):
             self.auto_military_cd = now + 60
             enemies = snap.get("enemy", [])
