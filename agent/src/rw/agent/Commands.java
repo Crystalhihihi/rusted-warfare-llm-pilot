@@ -86,6 +86,14 @@ public final class Commands {
                             bldSkip++;
                             continue;
                         }
+                        // 战斗指令不拖建造者上火线（空闲的也算，除非 ids 显式点名）
+                        try {
+                            if (u.r().l()) {
+                                busy++;
+                                continue;
+                            }
+                        } catch (Throwable ignored) {
+                        }
                         String act = Activity.describe(u);
                         if (act != null && (act.startsWith("build") || act.startsWith("repair"))) {
                             busy++; // 施工走路(build@)与盖着(repair→)都算施工中
@@ -874,6 +882,14 @@ public final class Commands {
         for (am u : units) {
             if (!hasIds && isBuilding(u)) {
                 continue; // stop/attack 默认不带建筑（除非 ids 显式点名）
+            }
+            if (!hasIds) {
+                try {
+                    if (u.r().l()) {
+                        continue; // 战斗指令不拖建造者上火线
+                    }
+                } catch (Throwable ignored) {
+                }
             }
             if (u instanceof y) {
                 c.a((y) u);

@@ -224,11 +224,12 @@ class Executor:
                  f"build:ext:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 3) 第一座陆工厂（2 池后）
+        # 3) 第一座工厂（2 池后；只认"没有任何生产型工厂"，LLM 先建空厂/机甲厂就不重复塞陆厂）
         land_factories = [u for u in fac_producers if u["t"] == "landFactory"]
         lf_inflight = (sum(1 for u in constructing if u["t"] == "landFactory")
                        + sum(1 for t, _ in self.issued_builds if t == "landFactory"))
-        if (len(ext_done) >= 2 and len(land_factories) + lf_inflight < 1
+        any_fac_inflight = sum(1 for t, _ in self.issued_builds if "actory" in t)
+        if (len(ext_done) >= 2 and len(fac_producers) + any_fac_inflight < 1
                 and funds >= max(FUNDS_RESERVE, 700) and idle_builders):
             b = idle_builders[0]
             emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"]},
