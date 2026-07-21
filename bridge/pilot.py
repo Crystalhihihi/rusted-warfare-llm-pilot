@@ -597,7 +597,7 @@ def executor_worker(link, holder, cmd_times):
         for ec in cmds:
             if not link.send(ec):
                 break
-            cmd_times.append(time.time())
+            # 执行层不计入 LLM 的 APM 额度（内部冷却自控，否则会挤掉军事指令）
             log_activity("cmd", "⚙ " + json.dumps(ec, ensure_ascii=False))
 
 
@@ -932,22 +932,27 @@ def main():
                     pending_notes.append("[系统强制] 正在交战而你没下军事指令：本次经济动作被拒绝执行。先 attack/harass/defend_home，再谈发展。")
 
         # 资料查询预处理：本地即时回答→回填→追问（最多2轮），随后进入正常指令执行
+        # 注意：assistant 消息里每个 tool_call 都必须有应答（含非 query 的），否则 API 400
         for _qr in range(2):
             q_calls = [tc for tc in calls if (tc.get("function") or {}).get("name") == "query"]
             if not q_calls:
                 break
             messages.append({"role": "assistant", "content": msg.get("content"),
                              "tool_calls": msg.get("tool_calls")})
-            for tc in q_calls:
+            for tc in calls:
                 fn = tc.get("function") or {}
-                try:
-                    qa = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    qa = {}
-                ans = answer_query(qa.get("topic", ""), qa.get("arg", ""), map_msg, pedia, snap)
-                cap = 2600 if qa.get("topic") == "roster" else 1500
-                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": ans[:cap]})
-                log_activity("note", f"🔍 查{qa.get('topic')}:{qa.get('arg', '')}")
+                if fn.get("name") == "query":
+                    try:
+                        qa = json.loads(fn.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        qa = {}
+                    ans = answer_query(qa.get("topic", ""), qa.get("arg", ""), map_msg, pedia, snap)
+                    cap = 2600 if qa.get("topic") == "roster" else 1500
+                    messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": ans[:cap]})
+                    log_activity("note", f"🔍 查{qa.get('topic')}:{qa.get('arg', '')}")
+                else:
+                    messages.append({"role": "tool", "tool_call_id": tc.get("id"),
+                                     "content": "已收到，将在本回合处理。"})
             calls = [tc for tc in calls if (tc.get("function") or {}).get("name") != "query"]
             try:
                 msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, active_tools,
