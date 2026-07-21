@@ -795,11 +795,6 @@ def main():
             if squad_ids and not combat:
                 text += ("\n⚠ 委托小队里没有战斗单位（attack/harass 会失败）——"
                          "请玩家把战斗单位也编入委托编队，或点全队接管。")
-            # 军事空转压力：90s 无军事指令且军队成型 → 硬性催战
-            silent = time.time() - max(executor.last_military_order, executor.start_ts)
-            if silent > 90 and combat:
-                text += (f"\n[系统提示] 已 {int(silent)} 秒无任何军事行动，军队已在闲置。"
-                         "除非正在挨打需要 defend_home，本回合必须 attack 或 harass，禁止只发展。")
         else:
             text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
         interval_override = (ac.get("interval") or 0) if ac else 0
