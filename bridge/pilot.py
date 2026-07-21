@@ -317,6 +317,7 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【规则】
 - 每次回复必须调用工具，且**尽量给一揽子动作**：1~2 个军事动作(attack/harass/defend_home) + 1 个经济动作(expand/build_army)，不要一轮只做一件事。工具：attack / harass / defend_home / expand / build_army / note / query(查资料)。
 - 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名。
+- expand 采集器目标上限为 12，超过会被系统拒绝；经济够用就把资源转向军力和升级。
 - 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
 - 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
 - build_army 可带集结点坐标(x,y)：出厂单位会自动向集结点汇聚。把集结点设在主基地靠前/交火方向，别默认让部队蹲在厂里。
@@ -794,6 +795,11 @@ def main():
             if squad_ids and not combat:
                 text += ("\n⚠ 委托小队里没有战斗单位（attack/harass 会失败）——"
                          "请玩家把战斗单位也编入委托编队，或点全队接管。")
+            # 军事空转压力：90s 无军事指令且军队成型 → 硬性催战
+            silent = time.time() - max(executor.last_military_order, executor.start_ts)
+            if silent > 90 and combat:
+                text += (f"\n[系统提示] 已 {int(silent)} 秒无任何军事行动，军队已在闲置。"
+                         "除非正在挨打需要 defend_home，本回合必须 attack 或 harass，禁止只发展。")
         else:
             text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
         interval_override = (ac.get("interval") or 0) if ac else 0

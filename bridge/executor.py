@@ -83,6 +83,8 @@ class Executor:
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
+        self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
+        self.last_upgrade = None
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
@@ -91,9 +93,10 @@ class Executor:
     # ---------- LLM 目标接口 ----------
     def set_economy_goal(self, extractors=None, builders=None):
         if extractors is not None:
-            self.econ_goal["extractors"] = max(0, int(extractors))
+            # 硬上限12：防 LLM 把扩张目标抬到天上去（8→10→22）拖垮全局
+            self.econ_goal["extractors"] = max(0, min(12, int(extractors)))
         if builders is not None:
-            self.econ_goal["builders"] = max(1, int(builders))
+            self.econ_goal["builders"] = max(1, min(6, int(builders)))
 
     def set_army_goal(self, composition=None, rally=None):
         if composition is not None:
@@ -127,8 +130,13 @@ class Executor:
             msg = r.get("msg") or ""
             m = re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", msg)
             if m:
-                self.action_bad[m.group(1)] = None  # ID 不存在：永久封
-                self.log("status", f"⚙ 动作不存在已永封: {m.group(1)}")
+                # 不再全局永封：该动作对其他工厂可能合法（如 110 只存在于部分工厂）
+                self.action_bad[m.group(1)] = time.time() + 300
+                self.log("status", f"⚙ 动作此处不可用，300s后重试: {m.group(1)}")
+                # 若能归因到最近的升级尝试，按建筑级冷却（防同一建筑反复失败）
+                if self.last_upgrade and self.last_upgrade[1] == m.group(1) \
+                        and time.time() - self.last_upgrade[2] < 6:
+                    self.upgrade_bad[(self.last_upgrade[0], m.group(1))] = time.time() + 300
                 continue
             m = re.search(r"不可用（科技/条件不满足）[:：]\s*([A-Za-z0-9_]+)", msg)
             if m:
@@ -252,24 +260,25 @@ class Executor:
             idle_builders = idle_builders[1:]
 
         # 5) 建筑升级双轨：采集器绝对优先（经济是根本），工厂并行不挤占；优先于常规补兵
-        if funds >= 3200:
-            for u in ext_done:  # 轨A：采集器
+        def try_upgrade(units, need):
+            if funds < need:
+                return
+            for u in units:
                 up = self.upgrade_action.get(u["t"])
-                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
+                if not up or self._bad(up, now):
+                    continue
+                if (u["id"], up) in self.upgrade_bad and now < self.upgrade_bad[(u["id"], up)]:
+                    continue
+                if now < self.cool.get(f"up:{u['id']}", 0):
                     continue
                 self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                self.last_upgrade = (u["id"], up, now)
                 emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                break
-        if funds >= 4500:
-            for u in own:  # 轨B：工厂（更高盈余才动，不与采集器抢）
-                if not u.get("bld") or _constructing(u) or "actory" not in u["t"].lower():
-                    continue
-                up = self.upgrade_action.get(u["t"])
-                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
-                    continue
-                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                break
+                return
+
+        try_upgrade(ext_done, 3200)   # 轨A：采集器绝对优先
+        try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                     and "actory" in u["t"].lower()], 4500)  # 轨B：工厂并行
 
         # 6) 生产调度：按构成目标或默认优先级补队列
         #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"
