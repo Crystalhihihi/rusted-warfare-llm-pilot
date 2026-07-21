@@ -73,10 +73,11 @@ class Executor:
             prod = [b for b in builds if b.startswith("u_")]
             if prod:
                 self.factory_actions[u["name"]] = set(prod)
-            # 升级动作候选：排除 b_/u_/c_/s_ 前缀与垃圾 id（如自动生成的 "_0"）
+            # 升级动作候选：排除 b_/u_/c_/s_ 前缀、垃圾 id（如 "_0"）、以及取消类动作（_1 结尾=回退，会扣钱）
             ups = [b for b in builds
                    if not b.startswith(("b_", "u_", "c_", "s_"))
-                   and len(b) >= 3 and not b.startswith("_")]
+                   and len(b) >= 3 and not b.startswith("_")
+                   and not b.endswith("_1")]
             if ups:
                 self.upgrade_action[u["name"]] = ups[0]
         self.known_prod = set()        # 全部已知生产动作ID（构成键归一化用）
@@ -350,8 +351,9 @@ class Executor:
                 return
 
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
-                     and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))],
-                    3200)             # 轨A：经济建筑绝对优先（采集器+资源制造仪）
+                     and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))
+                     and "overclocked" not in u["t"] and "reinforced" not in u["t"]],
+                    3200)             # 轨A：经济建筑绝对优先（T3加强版是终态，其动作是取消，排除防来回烧钱）
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
                      and "actory" in u["t"].lower()], 4500)  # 轨B：工厂并行
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
