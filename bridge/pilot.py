@@ -165,6 +165,89 @@ TOOLS = [
 # 执行层托管时，LLM 只保留小队指挥类工具（build/train/rally 由 executor 自动完成）
 LLM_TOOLS = [t for t in TOOLS if t["function"]["name"] not in ("build", "train", "rally")]
 
+# ---------- 战略层工具（执行层托管时启用：只做选择题，不碰微观） ----------
+STRAT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "attack",
+        "description": "指挥委托小队攻击移动到坐标 (x,y)，沿途自动交战。用于进攻/压制/抢资源点。",
+        "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}},
+    {"type": "function", "function": {
+        "name": "harass",
+        "description": "指挥小队骚扰坐标 (x,y)（攻击移动，意图为牵制/打了就走）。",
+        "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}},
+    {"type": "function", "function": {
+        "name": "defend_home",
+        "description": "把小队撤回主基地防守（被压制、基地告急或需要休整时用）。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "expand",
+        "description": "提高采集器目标数量（经济扩张）。extractors 为目标总数，省略=当前目标+1。",
+        "parameters": {"type": "object", "properties": {"extractors": {"type": "integer"}}}}},
+    {"type": "function", "function": {
+        "name": "build_army",
+        "description": "设定军队构成（动作ID:目标数量，如 {\"u_c_tank\":8,\"u_missileTank\":4}）与可选集结点。生产由执行层自动完成。",
+        "parameters": {"type": "object", "properties": {
+            "composition": {"type": "object"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["composition"]}}},
+    {"type": "function", "function": {
+        "name": "note",
+        "description": "一句话记录你的战略分析（不执行操作，玩家可见）。",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
+]
+
+
+def strategic_grid(map_msg, snap, n=12):
+    """nxn 战略格：数字=可见敌数量，o=我方，X=敌我皆有，否则地形字符。"""
+    rows = map_msg.get("rows", [])
+    th = len(rows)
+    tw = len(rows[0]) if th else 0
+    if not tw:
+        return "(无地图)"
+    tile_w = map_msg["tileW"]
+    world_w = tw * tile_w
+    world_h = th * map_msg["tileH"]
+    enemy_cells = {}
+    own_cells = set()
+    for u in snap.get("enemy", []):
+        key = (min(n - 1, int(u["x"] / world_w * n)), min(n - 1, int(u["y"] / world_h * n)))
+        enemy_cells[key] = enemy_cells.get(key, 0) + 1
+    for u in snap.get("own", []):
+        own_cells.add((min(n - 1, int(u["x"] / world_w * n)), min(n - 1, int(u["y"] / world_h * n))))
+    out = []
+    for gy in range(n):
+        line = ""
+        for gx in range(n):
+            key = (gx, gy)
+            if key in enemy_cells and key in own_cells:
+                line += "X"
+            elif key in enemy_cells:
+                c = enemy_cells[key]
+                line += "9" if c > 9 else str(c)
+            elif key in own_cells:
+                line += "o"
+            else:
+                line += rows[min(th - 1, gy * th // n)][min(tw - 1, gx * tw // n)]
+        out.append(line)
+    return "\n".join(out)
+
+
+def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
+    """战略层系统提示（静态）：职责、地图基础信息、图例。token 预算 ~1.5K。"""
+    tw = map_msg["tilesW"] * map_msg["tileW"]
+    th = map_msg["tilesH"] * map_msg["tileH"]
+    res = map_msg.get("resources", [])[:40]
+    res_txt = ",".join(f"({p['x']},{p['y']})" for p in res)
+    groups_txt = ",".join(str(g) for g in sorted(user_groups)) or "9"
+    return f"""你是《Rusted Warfare》的战略指挥官。玩家把编队({groups_txt}队)委托给你。经济建设（采集器/工厂建造、工厂生产排队、建筑升级、集结点）由系统执行层自动完成——你只决定战略：扩张、憋兵、进攻还是防守。
+
+【公平】你只看得见本队视野内的信息，迷雾中的敌情未知，不要臆测。
+【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
+【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
+【规则】
+- 每次回复必须调用一个工具：attack(进攻坐标) / harass(骚扰坐标) / defend_home(回撤守家) / expand(提高采集器目标) / build_army(改军队构成与集结点) / note(一句分析)。
+- 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整。
+- 小队残血或被围就用 defend_home，别硬拼；扩张与进攻二选一，不要同时。
+- 你只给战略方向，微观走位/集火由系统和游戏AI完成。"""
+
 
 class AgentLink:
     def __init__(self):
@@ -454,7 +537,9 @@ def main():
             json.dump({"groups": [9]}, fp)
         print("[delegate] 已创建 delegation.json（默认委托 9 队，可编辑热更新）")
 
-    system = {"role": "system", "content": build_system_prompt(map_msg, pedia, cfg, user_groups)}
+    use_exec = cfg.get("use_executor", True)
+    system = {"role": "system", "content": (build_strategy_prompt(map_msg, pedia, cfg, user_groups)
+                                            if use_exec else build_system_prompt(map_msg, pedia, cfg, user_groups))}
     print(f"[pilot] 地图 {map_msg['tilesW']}x{map_msg['tilesH']} 已载入，LLM={cfg['model']}，委托编队={sorted(user_groups)}")
     if user_groups != {9}:  # 默认 9 队由 agent 侧兜底，不强行覆盖游戏内 /ai groups 设置
         link.send({"cmd": "delegate", "groups": ",".join(str(group_to_slot(g)) for g in sorted(user_groups))})
@@ -462,11 +547,11 @@ def main():
     smz = summarize.Summarizer(map_msg.get("resources", []))
     # 执行层：经济/生产/升级自动调度（use_executor=false 可回退到纯 LLM 微操）
     executor = None
-    if cfg.get("use_executor", True):
+    if use_exec:
         executor = exec_mod.Executor(map_msg, pedia, log_activity)
-        system["content"] += ("\n\n【系统托管】经济建设（采集器/工厂建造、工厂生产、建筑升级、集结点）"
-                              "已由执行层自动完成，build/train/rally 已从你的工具表移除——"
-                              "禁止再尝试它们，你专注于委托小队的移动/交战/撤退与战术判断。")
+    # 反射层：受击撤退/基地回防（纯规则，始终启用）
+    import reflex as reflex_mod
+    reflex = reflex_mod.Reflex(log_activity)
     history = []
     # 失败封禁双轨：永封=非法/编造ID、死目标（本对局内）；临封=资金/施工/队列/科技等条件性失败，TTL 后可重试
     FAILED_TTL = 90.0
@@ -611,23 +696,36 @@ def main():
                     break
                 cmd_times.append(time.time())
                 log_activity("cmd", "⚙ " + json.dumps(ec, ensure_ascii=False))
+        # 反射层：受击撤退/基地回防（纯规则，毫秒级）
+        if reflex is not None and snap.get("delegated"):
+            home_xy = (smz.home["x"], smz.home["y"]) if getattr(smz, "home", None) else None
+            reflex.tick(snap, home_xy, set(snap.get("delegated", [])), link.send)
         if llm_off:  # 纯执行层模式：跳过 LLM 调用，只报执行层状态
             if time.time() - last_hint > 10:
                 last_hint = time.time()
                 print("[llm_off] " + (executor.status_line(snap) if executor else "执行层未启用"))
             time.sleep(0.5)
             continue
-        text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
+        if executor is not None:
+            text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
+                     + "\n【执行层】 " + executor.status_line(snap)
+                     + "\n[系统提示] 本回合必须调用一个战略工具（attack/harass/defend_home/expand/build_army/note）。")
+        else:
+            text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
         interval_override = (ac.get("interval") or 0) if ac else 0
         if not interval_override:
             interval_override = manual_interval
-        target_interval = pick_interval(cfg, alerts, snap, interval_override)
+        if executor is not None and not interval_override:
+            target_interval = (float(cfg["fast_interval_sec"]) if alerts
+                               else float(cfg.get("strategy_interval_sec", 25)))
+        else:
+            target_interval = pick_interval(cfg, alerts, snap, interval_override)
         if time.time() - last_cycle < target_interval:
             time.sleep(0.25)
             continue
         last_cycle = time.time()
 
-        active_tools = LLM_TOOLS if executor is not None else TOOLS
+        active_tools = STRAT_TOOLS if executor is not None else TOOLS
         messages = [system]
         for u, a in history:
             messages.append({"role": "user", "content": u})
@@ -650,8 +748,10 @@ def main():
             # DeepSeek 有时会只写分析不调工具——追问一次，强制工具调用
             print("[llm] 未调用工具，追问重试")
             messages.append({"role": "assistant", "content": note or "（空）"})
+            verbs = ("attack/harass/defend_home/expand/build_army" if executor is not None
+                     else "move/attack_move/attack_unit/build/train/stop")
             messages.append({"role": "user", "content":
-                             "刚才的回复没有任何工具调用。请直接用一个工具给出下一步指令（move/attack_move/attack_unit/build/train/stop 之一），或用 note 一句话说明等待原因。无需解释。"})
+                             f"刚才的回复没有任何工具调用。请直接用一个工具给出下一步指令（{verbs} 之一），或用 note 一句话说明等待原因。无需解释。"})
             try:
                 msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, active_tools,
                                timeout=int(cfg["timeout_sec"]))
@@ -680,6 +780,32 @@ def main():
                 t = str(args.get("text", "")).strip()
                 if t:
                     note_parts.append(t)
+                continue
+            # 战略动词映射（执行层托管时）
+            if executor is not None and name in ("attack", "harass"):
+                cmd = {"cmd": "attackmove",
+                       "x": clamp(float(args.get("x", 0)), 0, world_w),
+                       "y": clamp(float(args.get("y", 0)), 0, world_h)}
+            elif executor is not None and name == "defend_home":
+                if getattr(smz, "home", None):
+                    cmd = {"cmd": "move", "x": float(smz.home["x"]), "y": float(smz.home["y"])}
+                else:
+                    blocked.append("defend_home(找不到主基地)")
+                    continue
+            elif executor is not None and name == "expand":
+                cur = executor.econ_goal["extractors"]
+                executor.set_economy_goal(extractors=int(args.get("extractors") or cur + 1))
+                executed.append(f"expand(目标池{executor.econ_goal['extractors']})")
+                cmd_times.append(time.time())
+                continue
+            elif executor is not None and name == "build_army":
+                comp = args.get("composition") or {}
+                rally = None
+                if args.get("x") is not None and args.get("y") is not None:
+                    rally = (clamp(float(args["x"]), 0, world_w), clamp(float(args["y"]), 0, world_h))
+                executor.set_army_goal(composition=comp, rally=rally)
+                executed.append(f"build_army({comp})")
+                cmd_times.append(time.time())
                 continue
             # 执行层托管期间拦截幻觉调用的经济指令（工具表已移除，双保险）
             if executor is not None and name in ("build", "train", "rally"):
@@ -858,7 +984,8 @@ def main():
         if executed:
             record += "（系统记录：已下发 " + ", ".join(executed) + "）"
         history.append((text, record))
-        history = history[-int(cfg["history_turns"]):]
+        keep_turns = 2 if executor is not None else int(cfg["history_turns"])
+        history = history[-keep_turns:]
 
 
 if __name__ == "__main__":
