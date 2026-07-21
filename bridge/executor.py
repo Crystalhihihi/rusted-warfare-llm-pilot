@@ -251,21 +251,25 @@ class Executor:
             emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
-        # 5) 建筑升级：工厂优先（T2军力>一切），采集器只在高盈余时升；优先于常规补兵
+        # 5) 建筑升级双轨：采集器绝对优先（经济是根本），工厂并行不挤占；优先于常规补兵
         if funds >= 3200:
-            fac_up = [u for u in own if u.get("bld") and not _constructing(u) and "actory" in u["t"].lower()]
-            upgraded = False
-            for group, need in ((fac_up, 4000), (ext_done, 5000)):
-                if upgraded or funds < need:
+            for u in ext_done:  # 轨A：采集器
+                up = self.upgrade_action.get(u["t"])
+                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
                     continue
-                for u in group:
-                    up = self.upgrade_action.get(u["t"])
-                    if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
-                        continue
-                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                    emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                    upgraded = True
-                    break
+                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                break
+        if funds >= 4500:
+            for u in own:  # 轨B：工厂（更高盈余才动，不与采集器抢）
+                if not u.get("bld") or _constructing(u) or "actory" not in u["t"].lower():
+                    continue
+                up = self.upgrade_action.get(u["t"])
+                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
+                    continue
+                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                break
 
         # 6) 生产调度：按构成目标或默认优先级补队列
         #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"
