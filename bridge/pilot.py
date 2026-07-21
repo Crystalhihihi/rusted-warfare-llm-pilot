@@ -172,6 +172,11 @@ STRAT_TOOLS = [
         "description": "指挥委托小队攻击移动到坐标 (x,y)，沿途自动交战。用于进攻/压制/抢资源点。",
         "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}},
     {"type": "function", "function": {
+        "name": "attack_nearest",
+        "description": "全军压上攻击最近的可见敌人（无需坐标，系统自己算目标点）。犹豫不知道打哪时就先打最近这个。",
+        "parameters": {"type": "object", "properties": {}}},
+    },
+    {"type": "function", "function": {
         "name": "harass",
         "description": "指挥小队骚扰坐标 (x,y)（攻击移动，意图为牵制/打了就走）。",
         "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}},
@@ -343,8 +348,8 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
 【规则】
-- 每次回复必须包含至少一个**实质动作**（attack/harass/defend_home/expand/build_army 之一）；query 和 note 只是辅助，单独使用等于空过。尽量一揽子：1~2 个军事动作 + 1 个经济动作。
-- **交战铁律**：态势里有警报（遭袭/敌近）时，本回合必须包含 attack/harass/defend_home 之一——先活下来再谈发展，基地快没了还在发展就是输。
+- 每次回复必须包含至少一个**实质动作**（attack/attack_nearest/harass/defend_home/expand/build_army 之一）；query 和 note 只是辅助，单独使用等于空过。尽量一揽子：1~2 个军事动作 + 1 个经济动作。
+- **交战铁律**：态势里有警报（遭袭/敌近）时，本回合必须包含军事动词（attack/attack_nearest/harass/defend_home）——先活下来再谈发展；不知道打哪就 attack_nearest（全军压上打最近的）。
 - 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名；query(roster) 是全单位花名册。
 - 工厂升级后必须 query 该厂看新解锁兵种并换产：T2 单位全面强于 T1，继续造 T1 是浪费。
 - expand 采集器目标上限为 12，超过会被系统拒绝；经济够用就把资源转向军力和升级。
@@ -845,9 +850,9 @@ def main():
         if executor is not None:
             text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
                      + "\n【执行层】 " + executor.status_line(snap)
-                     + "\n[系统提示] 本回合必须包含一个实质动作（attack/harass/defend_home/expand/build_army）。")
+                     + "\n[系统提示] 本回合必须包含一个实质动作（attack/attack_nearest/harass/defend_home/expand/build_army）。")
             if alerts:
-                text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/harass/defend_home），只查资料或只发展视为失误。"
+                text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/attack_nearest/harass/defend_home），不知道打哪就 attack_nearest，只查资料或只发展视为失误。"
                 es = snap.get("enemy", [])[:3]
                 if es:
                     text += " 可直接攻击的可见敌人: " + ",".join(f"{e['t']}@({e['x']},{e['y']})" for e in es)
@@ -919,7 +924,7 @@ def main():
         # 交战强制：有警报且本批调用无军事动词时，经济动作一律不执行（逼 LLM 先解决战斗）
         if alerts and executor is not None:
             names = [(tc.get("function") or {}).get("name") for tc in calls]
-            if names and not any(n in ("attack", "harass", "defend_home") for n in names):
+            if names and not any(n in ("attack", "attack_nearest", "harass", "defend_home") for n in names):
                 before = len(calls)
                 calls = [tc for tc in calls if (tc.get("function") or {}).get("name")
                          not in ("expand", "build_army", "build_building")]
@@ -968,7 +973,18 @@ def main():
                     note_parts.append(t)
                 continue
             # 战略动词映射（执行层托管时）
-            if executor is not None and name in ("attack", "harass"):
+            if executor is not None and name == "attack_nearest":
+                executor.last_military_order = time.time()
+                es = snap.get("enemy", [])
+                squad_u = [u for u in snap.get("own", []) if u["id"] in set(snap.get("delegated", [])) and not u.get("bld")]
+                if es and squad_u:
+                    cx = sum(u["x"] for u in squad_u) / len(squad_u)
+                    cy = sum(u["y"] for u in squad_u) / len(squad_u)
+                    tgt = min(es, key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)
+                    cmd = {"cmd": "attackmove", "x": float(tgt["x"]), "y": float(tgt["y"])}
+                else:
+                    cmd = {"cmd": "attackmove", "x": world_w / 2, "y": world_h / 2}  # 无敌情就向图中心推进
+            elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
                        "x": clamp(float(args.get("x", 0)), 0, world_w),
@@ -1133,6 +1149,10 @@ def main():
             msg_blocked = "系统拦截了你的重复无效指令（之前已被拒绝，不要再试）: " + ", ".join(blocked)
             print("[pilot] " + msg_blocked)
             pending_notes.append(msg_blocked)
+
+        # 空过违规：整轮只有 query/note、没有任何实质动作 → 下轮硬性要求
+        if calls and not executed:
+            pending_notes.append("[系统强制] 你上回合没有任何实质动作（只分析/只查资料）。本回合必须包含 attack/attack_nearest/harass/defend_home/expand/build_army 之一；不知道打哪就 attack_nearest。")
 
         tick = snap.get("tick", 0)
         full_note = " ".join(p for p in [note] + note_parts if p).strip()
