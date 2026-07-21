@@ -192,7 +192,60 @@ STRAT_TOOLS = [
         "name": "note",
         "description": "一句话记录你的战略分析（不执行操作，玩家可见）。",
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "query",
+        "description": "查参考资料（本地数据即时回答，不占指令名额）。topic 选: unit(单位详情,arg=单位名) / building(建筑详情,arg=名称) / prices(生产者价格与产能表) / map_overview(全图地形粗览) / map_zone(区域详图,arg=\"x,y\"世界坐标) / bases(视野内已知主基地位置)。拿不准先查再决策，每轮最多2次。",
+        "parameters": {"type": "object", "properties": {"topic": {"type": "string"}, "arg": {"type": "string"}}, "required": ["topic"]}}},
 ]
+
+
+def answer_query(topic, arg, map_msg, pedia, snap):
+    """目录式资料应答器：全部本地数据生成，不调 LLM，答案紧凑。"""
+    units = {u["name"]: u for u in (pedia or {}).get("units", [])}
+    topic = (topic or "").strip()
+    arg = (arg or "").strip()
+    if topic in ("unit", "building"):
+        u = units.get(arg) or next((v for k, v in units.items() if k.lower() == arg.lower()), None)
+        if u is None:
+            cands = [k for k in units if arg.lower() in k.lower()][:8]
+            return f"未找到'{arg}'。相近: {','.join(cands) or '无'}"
+        builds = list(dict.fromkeys(u.get("builds", [])))
+        return (f"{u['name']}({u.get('display', '')}): ${u.get('price', '?')} T{u.get('tech', '?')} "
+                f"建筑={u.get('building')} 建造者={u.get('builder')} 移动={u.get('move', '?')} "
+                f"hp={u.get('hp', '?')} 动作[{','.join(builds[:24])}]")
+    if topic == "prices":
+        return _capability_brief(pedia)
+    if topic == "map_overview":
+        rows = map_msg.get("rows", [])
+        if not rows:
+            return "(无地图)"
+        f = max(1, len(rows) // 24)
+        return "\n".join(r[::f] for r in rows[::f])[:1600]
+    if topic == "map_zone":
+        rows = map_msg.get("rows", [])
+        if not rows:
+            return "(无地图)"
+        try:
+            x, y = (float(v) for v in arg.replace("(", "").replace(")", "").split(",")[:2])
+        except (ValueError, IndexError):
+            return "arg 需为 'x,y' 世界坐标"
+        tw, th = map_msg["tileW"], map_msg["tileH"]
+        tx, ty = int(x / tw), int(y / th)
+        rad = 12
+        grid = "\n".join(rows[gy][max(0, tx - rad):tx + rad]
+                         for gy in range(max(0, ty - rad), min(len(rows), ty + rad)))
+        zone = []
+        for label, key in (("我", "own"), ("敌", "enemy")):
+            for u in snap.get(key, []):
+                if abs(u["x"] - x) < rad * tw and abs(u["y"] - y) < rad * th:
+                    zone.append(f"{label}:{u['t']}@({u['x']},{u['y']})")
+        return grid[:1600] + (("\n单位: " + ",".join(zone[:20])) if zone else "")
+    if topic == "bases":
+        out = [f"{label}主基地@({u['x']},{u['y']})"
+               for key, label in (("own", "我方"), ("allies", "盟友"))
+               for u in snap.get(key, []) if u["t"] == "commandCenter"]
+        return "；".join(out) or "视野内暂无已知主基地（出生点 tmx 解析待接入）"
+    return "未知 topic，可选: unit/building/prices/map_overview/map_zone/bases"
 
 
 def strategic_grid(map_msg, snap, n=12):
@@ -261,10 +314,9 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【公平】你只看得见本队视野内的信息，迷雾中的敌情未知，不要臆测。
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
-【单位能力（名称/价格，产=可生产，升=升级动作）】
-{_capability_brief(pedia)}
 【规则】
-- 每次回复必须调用一个工具：attack(进攻坐标) / harass(骚扰坐标) / defend_home(回撤守家) / expand(提高采集器目标) / build_army(改军队构成与集结点) / note(一句分析)。
+- 每次回复必须调用一个工具：attack(进攻坐标) / harass(骚扰坐标) / defend_home(回撤守家) / expand(提高采集器目标) / build_army(改军队构成与集结点) / note(一句分析)。另有 query(查资料) 随时可用。
+- 单位/建筑/价格/地图详情拿不准就用 query 查（每轮最多2次），严禁编造动作ID和单位名。
 - 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
 - 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
 - build_army 可带集结点坐标(x,y)：出厂单位会自动向集结点汇聚。把集结点设在主基地靠前/交火方向，别默认让部队蹲在厂里。
@@ -733,7 +785,15 @@ def main():
         if executor is not None:
             text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
                      + "\n【执行层】 " + executor.status_line(snap)
-                     + "\n[系统提示] 本回合必须调用一个战略工具（attack/harass/defend_home/expand/build_army/note）。")
+                     + "\n[系统提示] 本回合必须调用一个战略工具（attack/harass/defend_home/expand/build_army/note/query）。")
+            # 委托队无战斗单位时明确提示（attack/harass 会失败）
+            squad_ids = set(snap.get("delegated", []))
+            combat = [u for u in snap.get("own", [])
+                      if u["id"] in squad_ids and not u.get("bld")
+                      and "uilder" not in u["t"] and "abricator" not in u["t"]]
+            if squad_ids and not combat:
+                text += ("\n⚠ 委托小队里没有战斗单位（attack/harass 会失败）——"
+                         "请玩家把战斗单位也编入委托编队，或点全队接管。")
         else:
             text += "\n\n[系统提示] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。[idle] 表示单位已完成上一个指令（空闲待命），不是卡住、也不是指令被忽略。"
         interval_override = (ac.get("interval") or 0) if ac else 0
@@ -790,6 +850,32 @@ def main():
         blocked = []
         visible_enemy_ids = {u["id"] for u in snap.get("enemy", [])}
         own_ids = {u["id"] for u in snap.get("own", [])}
+
+        # 资料查询预处理：本地即时回答→回填→追问（最多2轮），随后进入正常指令执行
+        for _qr in range(2):
+            q_calls = [tc for tc in calls if (tc.get("function") or {}).get("name") == "query"]
+            if not q_calls:
+                break
+            messages.append({"role": "assistant", "content": msg.get("content"),
+                             "tool_calls": msg.get("tool_calls")})
+            for tc in q_calls:
+                fn = tc.get("function") or {}
+                try:
+                    qa = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    qa = {}
+                ans = answer_query(qa.get("topic", ""), qa.get("arg", ""), map_msg, pedia, snap)
+                messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": ans[:1500]})
+                log_activity("note", f"🔍 查{qa.get('topic')}:{qa.get('arg', '')}")
+            calls = [tc for tc in calls if (tc.get("function") or {}).get("name") != "query"]
+            try:
+                msg = llm.chat(cfg["base_url"], api_key, cfg["model"], messages, active_tools,
+                               timeout=int(cfg["timeout_sec"]))
+                note = (msg.get("content") or "").strip() or note
+                calls = list(msg.get("tool_calls") or []) + calls
+            except llm.LlmError as e:
+                print(f"[llm] 查询追问失败: {e}")
+                break
 
         for tc in calls:
             if len(executed) >= max_cmds:
