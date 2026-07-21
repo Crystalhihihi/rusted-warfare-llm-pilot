@@ -591,6 +591,21 @@ def ground_combat_ids(snap, squad_ids):
                     and u["t"] not in AA_ONLY)
 
 
+def aa_follow(snap, cmd, cx, cy):
+    """纯防空单位不当炮灰也不蹲家：move 到攻击目标后撤 500px 的后排，罩住空域。"""
+    if cx is None:
+        return
+    aa = [str(u["id"]) for u in snap.get("own", [])
+          if u["id"] in set(snap.get("delegated", [])) and not u.get("bld") and u["t"] in AA_ONLY]
+    if not aa:
+        return
+    tx, ty = cmd["x"], cmd["y"]
+    dx, dy = tx - cx, ty - cy
+    d = max(1.0, (dx * dx + dy * dy) ** 0.5)
+    bx, by = tx - dx / d * 500, ty - dy / d * 500
+    link.send({"cmd": "move", "x": bx, "y": by, "units": ",".join(aa)})
+
+
 def executor_worker(link, holder, cmd_times):
     """执行层独立线程：每 2s 跑一拍，不再被 LLM 调用阻塞（指令饿死的根治）。"""
     while True:
@@ -1004,10 +1019,12 @@ def main():
                     tgt = min(es, key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)
                     cmd = {"cmd": "attackmove", "x": float(tgt["x"]), "y": float(tgt["y"])}
                 else:
+                    cx = cy = None
                     cmd = {"cmd": "attackmove", "x": world_w / 2, "y": world_h / 2}  # 无敌情就向图中心推进
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
-                    cmd["units"] = gids  # 地面进攻只带能打地面的，防空兵留家
+                    cmd["units"] = gids  # 地面进攻只带能打地面的
+                aa_follow(snap, cmd, cx, cy)
             elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
@@ -1016,6 +1033,11 @@ def main():
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
                     cmd["units"] = gids
+                squad_u = [u for u in snap.get("own", []) if u["id"] in set(snap.get("delegated", [])) and not u.get("bld")]
+                if squad_u:
+                    cx = sum(u["x"] for u in squad_u) / len(squad_u)
+                    cy = sum(u["y"] for u in squad_u) / len(squad_u)
+                    aa_follow(snap, cmd, cx, cy)
             elif executor is not None and name == "defend_home":
                 executor.last_military_order = time.time()
                 if getattr(smz, "home", None):
