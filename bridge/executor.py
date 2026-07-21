@@ -82,6 +82,13 @@ class Executor:
         self.known_prod = set()        # 全部已知生产动作ID（构成键归一化用）
         for acts in self.factory_actions.values():
             self.known_prod.update(acts)
+        # 动作 -> 产出单位科技等级（T2工厂不产T1兵的依据）
+        self.action_tech = {}
+        for u in (pedia or {}).get("units", []):
+            name = u.get("name")
+            for acts in self.factory_actions.values():
+                if ("u_" + name) in acts:
+                    self.action_tech["u_" + name] = u.get("tech", 1)
         self.econ_goal = dict(DEFAULT_ECON)
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
         self.stance = "expand"
@@ -386,9 +393,24 @@ class Executor:
         return cmds
 
     # ---------- 生产决策 ----------
+    def _fac_tier(self, ftype):
+        if ftype.endswith("T3"):
+            return 3
+        if ftype.endswith("T2"):
+            return 2
+        return 1
+
+    def _tech_ok(self, action, tier):
+        """T2+ 工厂不产低于其等级的单位（同价 T2 更强）。"""
+        if tier <= 1:
+            return True
+        t = self.action_tech.get(action)
+        return t is None or t >= tier
+
     def _next_production(self, fac, own):
         now = time.time()
         ftype = fac["t"]
+        tier = self._fac_tier(ftype)
         avail = self.factory_actions.get(ftype)
         # 构成目标模式：按缺口最大者优先；全部达标/被过滤时回落默认优先级（防工厂空转）
         comp = self.army_goal["composition"]
@@ -403,6 +425,8 @@ class Executor:
                     continue
                 if avail is not None and action not in avail:
                     continue
+                if not self._tech_ok(action, tier):
+                    continue
                 unit_type = action[2:] if action.startswith("u_") else action
                 deficit = target - counts.get(unit_type, 0)
                 if deficit > best_deficit:
@@ -415,11 +439,13 @@ class Executor:
                 continue
             if avail is not None and act not in avail:
                 continue
+            if not self._tech_ok(act, tier):
+                continue
             return act
         # 静态表没有时退回百科里第一个可用的
         if avail:
             for act in sorted(avail):
-                if not self._bad(act, now):
+                if not self._bad(act, now) and self._tech_ok(act, tier):
                     return act
         return None
 
