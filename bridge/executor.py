@@ -291,7 +291,8 @@ class Executor:
             emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
-        # 4.55) 僵局经济：资源点被我方/盟友占完且资金富余时，造资源制造仪发展额外经济（≤2座）
+        # 4.55) 僵局经济：资源点被占完、或采集器达标且资金爆表(≥15000)时，
+        #      造资源制造仪发展额外经济（≤2座）——此前条件过严永远不会触发
         if funds >= 2500:
             fab_count = sum(1 for u in own if u["t"].startswith("fabricator") and u.get("bld"))
             fab_inflight = sum(1 for t, _ in self.issued_builds if t.startswith("fabricator"))
@@ -299,7 +300,8 @@ class Executor:
             free_pools = [p for p in self.resources
                           if not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
                                      for u in friendly if u.get("bld"))]
-            if not free_pools and fab_count + fab_inflight < 2 and idle_builders \
+            stalemate = (not free_pools) or (len(ext_done) >= self.econ_goal["extractors"] and funds >= 15000)
+            if stalemate and fab_count + fab_inflight < 2 and idle_builders \
                     and not self._bad("b_fabricatorT1", now):
                 b = idle_builders[0]
                 emit({"cmd": "build", "action": "b_fabricatorT1", "builder": b["id"]},
