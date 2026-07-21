@@ -249,9 +249,11 @@ class Executor:
         fac_want = max(2, 1 + army_total // 10)
         if funds > 8000:
             fac_want += 1
+        if funds > 15000:
+            fac_want += 1
         if funds > 30000:
             fac_want += 2
-        fac_want = min(6, fac_want)
+        fac_want = min(8, fac_want)
         comp = self.army_goal["composition"] or {}
         air_acts = {"u_lightGunship", "u_c_interceptor", "u_gunShip", "u_c_helicopter", "u_bomber"}
         fac_action = "b_airFactory" if any(a in comp for a in air_acts) else "b_landFactory"
@@ -291,11 +293,12 @@ class Executor:
             tcmd = {"cmd": "build", "action": tur_action, "builder": b["id"]}
             mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
             mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
-            if cc and mw and mh:  # 朝地图中心（前线方向）前移一段落位
+            if cc and mw and mh:  # 朝地图中心方向逐座前移：第1座260px，之后每座再+160（防线前推稳定领土）
                 dx, dy = mw / 2 - cc["x"], mh / 2 - cc["y"]
                 d = max(1.0, math.hypot(dx, dy))
-                tcmd["x"] = float(cc["x"] + dx / d * 260)
-                tcmd["y"] = float(cc["y"] + dy / d * 260)
+                off = min(900, 260 + len(turrets) * 160)
+                tcmd["x"] = float(cc["x"] + dx / d * off)
+                tcmd["y"] = float(cc["y"] + dy / d * off)
             emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
@@ -309,14 +312,34 @@ class Executor:
                           if not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
                                      for u in friendly if u.get("bld"))]
             stalemate = (not free_pools) or (len(ext_done) >= self.econ_goal["extractors"] and funds >= 15000)
-            if stalemate and fab_count + fab_inflight < 2 and idle_builders \
+            fab_cap = 4 if funds >= 15000 else 2
+            if stalemate and fab_count + fab_inflight < fab_cap and idle_builders \
                     and not self._bad("b_fabricatorT1", now):
                 b = idle_builders[0]
                 emit({"cmd": "build", "action": "b_fabricatorT1", "builder": b["id"]},
                      f"build:fab:{b['id']}", 8.0)
                 idle_builders = idle_builders[1:]
 
-        # 4.6) LLM 指定建造（build_building 队列）：海厂/机甲厂/维修湾/实验厂等战略建筑
+        # 4.6) 高盈余战略建筑：实验厂（≥20000 且 ≥2 陆厂，限1座）与海军厂（水图才造）
+        exp_count = sum(1 for u in own if "experimental" in u["t"].lower() and u.get("bld"))
+        exp_inflight = sum(1 for t, _ in self.issued_builds if "experimental" in t.lower())
+        if (funds >= 20000 and len(land_factories) >= 2 and exp_count + exp_inflight < 1
+                and idle_builders and not self._bad("b_experimentalLandFactory", now)):
+            b = idle_builders[0]
+            emit({"cmd": "build", "action": "b_experimentalLandFactory", "builder": b["id"]},
+                 f"build:exp:{b['id']}", 8.0)
+            idle_builders = idle_builders[1:]
+        water_pools = sum(1 for p in self.resources if p.get("w"))
+        sea_count = sum(1 for u in fac_producers if u["t"] == "seaFactory")
+        sea_inflight = sum(1 for t, _ in self.issued_builds if t == "seaFactory")
+        if (water_pools >= 2 and len(ext_done) >= 2 and sea_count + sea_inflight < 1
+                and funds >= 1500 and idle_builders and not self._bad("b_seaFactory", now)):
+            b = idle_builders[0]
+            emit({"cmd": "build", "action": "b_seaFactory", "builder": b["id"]},
+                 f"build:sea:{b['id']}", 8.0)
+            idle_builders = idle_builders[1:]
+
+        # 4.7) LLM 指定建造（build_building 队列）：海厂/机甲厂/维修湾/实验厂等战略建筑
         while self.custom_builds and idle_builders and funds >= 500:
             action, bx, by = self.custom_builds[0]
             if self._bad(action, now):
