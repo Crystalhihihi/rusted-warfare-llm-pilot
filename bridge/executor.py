@@ -11,6 +11,7 @@ LLM 只能通过三个 goal 接口影响它；设 LLM_OFF=1 时可完全独立�
 """
 import math
 import re
+import threading
 import time
 from collections import Counter
 
@@ -32,7 +33,7 @@ EXTRACTOR_PRICE = 700
 FUNDS_RESERVE = 700        # 非采集器开支的资金底线
 UPGRADE_FUNDS = 2600       # 超过此资金且采集器达标后开始升级
 QUEUE_MAX = 2              # 每厂队列上限
-MAX_CMDS_PER_TICK = 2
+MAX_CMDS_PER_TICK = 4      # 每拍指令上限（2 会被经济/升级占满，生产饿死）
 ACTION_COOLDOWN = 2.0      # 同类指令最小间隔
 UPGRADE_COOLDOWN = 30.0    # 同一建筑升级冷却
 
@@ -72,9 +73,15 @@ class Executor:
             prod = [b for b in builds if b.startswith("u_")]
             if prod:
                 self.factory_actions[u["name"]] = set(prod)
-            ups = [b for b in builds if not b.startswith(("b_", "u_", "c_"))]
+            # 升级动作候选：排除 b_/u_/c_/s_ 前缀与垃圾 id（如自动生成的 "_0"）
+            ups = [b for b in builds
+                   if not b.startswith(("b_", "u_", "c_", "s_"))
+                   and len(b) >= 3 and not b.startswith("_")]
             if ups:
                 self.upgrade_action[u["name"]] = ups[0]
+        self.known_prod = set()        # 全部已知生产动作ID（构成键归一化用）
+        for acts in self.factory_actions.values():
+            self.known_prod.update(acts)
         self.econ_goal = dict(DEFAULT_ECON)
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
         self.stance = "expand"
@@ -85,6 +92,7 @@ class Executor:
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
         self.last_upgrade = None
+        self.lock = threading.Lock()   # tick/目标设置/失败学习 共用（执行层独立线程）
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
@@ -100,14 +108,20 @@ class Executor:
 
     def set_army_goal(self, composition=None, rally=None):
         if composition is not None:
-            # 归一化键名：LLM 常省略 u_ 前缀（'c_tank' -> 'u_c_tank'）
+            # 归一化按"真实生产动作表"匹配：'c_tank'→'u_c_tank'；无法识别的键丢弃并上报（防静默死键）
             norm = {}
+            dropped = []
             for k, v in composition.items():
                 key = str(k)
-                if not key.startswith(("u_", "b_", "c_")):
-                    key = "u_" + key
-                norm[key] = int(v)
+                if key in self.known_prod:
+                    norm[key] = int(v)
+                elif ("u_" + key) in self.known_prod:
+                    norm["u_" + key] = int(v)
+                else:
+                    dropped.append(key)
             self.army_goal["composition"] = norm
+            if dropped:
+                self.log("status", f"⚙ 构成键无法识别已丢弃: {','.join(dropped)}（用 query prices 查真实动作ID）")
         if rally is not None:
             self.army_goal["rally"] = (float(rally[0]), float(rally[1]))
             self.rallied.clear()
@@ -238,6 +252,18 @@ class Executor:
             emit(fcmd, f"build:fac:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
+        # 4.4) 生产调度（提到炮塔/升级之前：军力是之本，防止被经济动作饿死）
+        #    按构成目标或默认优先级补队列；资金低于储备线且经济未达标时暂停
+        econ_pending = (len(ext_done) + ext_inflight < ext_target) or (not land_factories)
+        for fac in fac_producers:
+            if (fac.get("q") or 0) >= QUEUE_MAX:
+                continue
+            if funds < FUNDS_RESERVE and econ_pending:
+                continue
+            act = self._next_production(fac, own)
+            if act:
+                emit({"cmd": "train", "action": act, "factory": fac["id"]}, f"train:{fac['id']}")
+
         # 4.5) 防御：炮塔数量随资金增长（2→6），敌方有空军时穿插防空炮塔
         turrets = [u for u in own if "turret" in u["t"].lower() and u.get("bld")]
         t_inflight = sum(1 for t, _ in self.issued_builds if "turret" in t.lower())
@@ -271,35 +297,26 @@ class Executor:
                     continue
                 if now < self.cool.get(f"up:{u['id']}", 0):
                     continue
-                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                self.last_upgrade = (u["id"], up, now)
-                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                if emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}"):
+                    # emit 成功才扣冷却（此前先扣后失败会吞掉这次升级）
+                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                    self.last_upgrade = (u["id"], up, now)
                 return
 
         try_upgrade(ext_done, 3200)   # 轨A：采集器绝对优先
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
                      and "actory" in u["t"].lower()], 4500)  # 轨B：工厂并行
+        try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                     and "turret" in u["t"].lower()], 1500)  # 轨C：炮塔（最便宜升级700起）
 
-        # 6) 生产调度：按构成目标或默认优先级补队列
-        #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"
-        econ_pending = (len(ext_done) + ext_inflight < ext_target) or (not land_factories)
-        for fac in fac_producers:
-            if (fac.get("q") or 0) >= QUEUE_MAX:
-                continue
-            if funds < FUNDS_RESERVE and econ_pending:
-                continue
-            act = self._next_production(fac, own)
-            if act:
-                emit({"cmd": "train", "action": act, "factory": fac["id"]}, f"train:{fac['id']}")
-
-        # 7) 集结点（army_goal 指定时，每厂设一次）
+        # 7) 集结点（army_goal 指定时，每厂设一次；emit 成功才登记，失败下拍重试）
         if self.army_goal["rally"]:
             rx, ry = self.army_goal["rally"]
             for fac in fac_producers:
                 if fac["id"] not in self.rallied:
-                    self.rallied.add(fac["id"])
-                    emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
-                         f"rally:{fac['id']}", 5.0)
+                    if emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
+                            f"rally:{fac['id']}", 5.0):
+                        self.rallied.add(fac["id"])
 
         # 8) LLM 沉默时的默认军事行为（默认关闭，config auto_military=true 才启用）
         army = [u for u in own if not u.get("bld") and not _is_builder(u)]
@@ -330,7 +347,7 @@ class Executor:
         now = time.time()
         ftype = fac["t"]
         avail = self.factory_actions.get(ftype)
-        # 构成目标模式：按缺口最大者优先
+        # 构成目标模式：按缺口最大者优先；全部达标/被过滤时回落默认优先级（防工厂空转）
         comp = self.army_goal["composition"]
         if comp:
             counts = Counter()
@@ -347,7 +364,8 @@ class Executor:
                 deficit = target - counts.get(unit_type, 0)
                 if deficit > best_deficit:
                     best, best_deficit = action, deficit
-            return best
+            if best:
+                return best
         # 默认优先级模式
         for act in DEFAULT_PROD.get(ftype, []):
             if self._bad(act, now):

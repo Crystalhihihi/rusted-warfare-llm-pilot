@@ -541,6 +541,31 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def executor_worker(link, holder, cmd_times):
+    """执行层独立线程：每 2s 跑一拍，不再被 LLM 调用阻塞（指令饿死的根治）。"""
+    while True:
+        time.sleep(2.0)
+        ex = holder.get("ex")
+        if ex is None:
+            continue
+        snap = link.snapshot()
+        if snap is None or not snap.get("team") or snap["team"].get("ai"):
+            continue
+        if not snap.get("delegated"):
+            continue
+        with ex.lock:
+            try:
+                cmds = ex.tick(snap)
+            except Exception as e:
+                print(f"[executor] tick 异常: {e}")
+                continue
+        for ec in cmds:
+            if not link.send(ec):
+                break
+            cmd_times.append(time.time())
+            log_activity("cmd", "⚙ " + json.dumps(ec, ensure_ascii=False))
+
+
 def group_to_slot(g: int) -> int:
     """用户编队号(1-9,0) → agent 槽位(0-8,9)。"""
     return (g - 1) % 10 if g != 0 else 9
@@ -689,6 +714,12 @@ def main():
     max_cmds = int(cfg["max_commands_per_cycle"])
     apm_cap = int(cfg["apm_cap"])
 
+    # 执行层独立线程：每 2s 一拍，与 LLM 调用完全解耦
+    exec_holder = {"ex": executor}
+    if executor is not None:
+        threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
+                         daemon=True, name="rw-executor").start()
+
     while True:
         # 新对局检测：地图消息版本变化 → 清空 LLM 上下文与摘要器状态
         mv = getattr(link, "map_version", 0)
@@ -701,6 +732,8 @@ def main():
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
             if cfg.get("use_executor", True):
                 executor = exec_mod.Executor(new_map, pedia, log_activity)
+                executor.auto_military = bool(cfg.get("auto_military", False))
+                exec_holder["ex"] = executor
             print("[pilot] 检测到新对局，上下文已重置")
             log_activity("status", "新对局开始，AI 上下文已重置")
             continue
@@ -765,14 +798,10 @@ def main():
         if pending_notes:
             text += "\n\n" + "\n".join(pending_notes)
             pending_notes.clear()
-        # 执行层：经济/生产自动调度（不受 LLM 节拍限制，每个循环都跑）
+        # 失败回执喂给执行层学习（tick 已在独立线程跑，这里只喂回执）
         if executor is not None:
-            executor.on_cmd_results(results)
-            for ec in executor.tick(snap):
-                if not link.send(ec):
-                    break
-                cmd_times.append(time.time())
-                log_activity("cmd", "⚙ " + json.dumps(ec, ensure_ascii=False))
+            with executor.lock:
+                executor.on_cmd_results(results)
         # 反射层：受击撤退/基地回防（纯规则，毫秒级）
         if reflex is not None and snap.get("delegated"):
             home_xy = (smz.home["x"], smz.home["y"]) if getattr(smz, "home", None) else None
@@ -906,9 +935,10 @@ def main():
                     blocked.append("defend_home(找不到主基地)")
                     continue
             elif executor is not None and name == "expand":
-                cur = executor.econ_goal["extractors"]
-                executor.set_economy_goal(extractors=int(args.get("extractors") or cur + 1))
-                executed.append(f"expand(目标池{executor.econ_goal['extractors']})")
+                with executor.lock:
+                    cur = executor.econ_goal["extractors"]
+                    executor.set_economy_goal(extractors=int(args.get("extractors") or cur + 1))
+                    executed.append(f"expand(目标池{executor.econ_goal['extractors']})")
                 cmd_times.append(time.time())
                 continue
             elif executor is not None and name == "build_army":
@@ -916,7 +946,8 @@ def main():
                 rally = None
                 if args.get("x") is not None and args.get("y") is not None:
                     rally = (clamp(float(args["x"]), 0, world_w), clamp(float(args["y"]), 0, world_h))
-                executor.set_army_goal(composition=comp, rally=rally)
+                with executor.lock:
+                    executor.set_army_goal(composition=comp, rally=rally)
                 executed.append(f"build_army({comp})")
                 cmd_times.append(time.time())
                 continue
