@@ -225,14 +225,19 @@ class Executor:
                  f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
-        # 5) 采集器升级（≥3池且资金富余即可；优先于常规补兵，否则永远排不上）
-        if funds >= 3200 and len(ext_done) >= 3:
-            for u in ext_done:
+        # 5) 建筑升级（资金富余即可；所有可升级建筑轮换，工厂升级需更多余钱；优先于常规补兵）
+        if funds >= 3200:
+            for u in own:
+                if not u.get("bld") or _constructing(u):
+                    continue
                 up = self.upgrade_action.get(u["t"])
-                if up and not self._bad(up, now) and now >= self.cool.get(f"up:{u['id']}", 0):
-                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
-                    emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
-                    break
+                if not up or self._bad(up, now) or now < self.cool.get(f"up:{u['id']}", 0):
+                    continue
+                if "actory" in u["t"].lower() and funds < 4500:
+                    continue
+                self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}")
+                break
 
         # 6) 生产调度：按构成目标或默认优先级补队列
         #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"

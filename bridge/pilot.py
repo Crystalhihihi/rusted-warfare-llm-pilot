@@ -230,6 +230,25 @@ def strategic_grid(map_msg, snap, n=12):
     return "\n".join(out)
 
 
+def _capability_brief(pedia):
+    """紧凑的单位能力清单：主要生产者可产兵种与升级路径（防止 LLM 不知道有什么可造）。"""
+    by_name = {u["name"]: u for u in (pedia or {}).get("units", [])}
+    rows = []
+    for name in ("commandCenter", "builder", "landFactory", "airFactory", "seaFactory", "mechFactory"):
+        u = by_name.get(name)
+        if not u:
+            continue
+        prods = list(dict.fromkeys(b for b in u.get("builds", []) if b.startswith("u_")))[:8]
+        ups = list(dict.fromkeys(b for b in u.get("builds", []) if not b.startswith(("b_", "u_", "c_"))))[:3]
+        s = f"{name}(${u.get('price', '?')})"
+        if prods:
+            s += " 产[" + ",".join(prods) + "]"
+        if ups:
+            s += " 升[" + ",".join(ups) + "]"
+        rows.append(s)
+    return "\n".join(rows) or "（百科未载入）"
+
+
 def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
     """战略层系统提示（静态）：职责、地图基础信息、图例。token 预算 ~1.5K。"""
     tw = map_msg["tilesW"] * map_msg["tileW"]
@@ -242,9 +261,12 @@ def build_strategy_prompt(map_msg, pedia, cfg, user_groups):
 【公平】你只看得见本队视野内的信息，迷雾中的敌情未知，不要臆测。
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。地图上的资源点: {res_txt}
 【战略格图例】每轮战场态势里附一张 12x12 战略格：o=我方单位，1-9=可见敌人数量，X=敌我皆有；地形 .=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
+【单位能力（名称/价格，产=可生产，升=升级动作）】
+{_capability_brief(pedia)}
 【规则】
 - 每次回复必须调用一个工具：attack(进攻坐标) / harass(骚扰坐标) / defend_home(回撤守家) / expand(提高采集器目标) / build_army(改军队构成与集结点) / note(一句分析)。
-- 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整。
+- 生产与建造不要插手（没有对应工具），军队构成只通过 build_army 调整；兵种要混合（主战+防空+远程），看敌方构成针对性调整，构成ID从上面能力表选。
+- 禁止军队闲置：构成基本成型且视野无敌情时，用 attack/harass 向地图中部或未探索区域推进侦察；连续两轮只发展不行动是不允许的。
 - 小队残血或被围就用 defend_home，别硬拼；扩张与进攻二选一，不要同时。
 - 你只给战略方向，微观走位/集火由系统和游戏AI完成。"""
 
