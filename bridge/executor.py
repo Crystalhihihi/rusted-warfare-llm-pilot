@@ -89,6 +89,7 @@ class Executor:
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
+        self.custom_builds = []        # LLM 指定建造队列 [(action, x, y)]
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
         self.last_upgrade = None
@@ -128,6 +129,10 @@ class Executor:
 
     def set_stance(self, stance):
         self.stance = str(stance)
+
+    def queue_build(self, action, x=None, y=None):
+        """LLM 指定建造（build_building 动词）：进入自定义建造队列，下拍执行。"""
+        self.custom_builds.append((action, x, y))
 
     def _bad(self, act, now):
         """动作当前是否不可用（None=永久；限时项到期自动解封重试）。"""
@@ -284,6 +289,22 @@ class Executor:
                 tcmd["y"] = float(cc["y"] + dy / d * 260)
             emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
+
+        # 4.6) LLM 指定建造（build_building 队列）：海厂/机甲厂/维修湾/实验厂等战略建筑
+        while self.custom_builds and idle_builders and funds >= 500:
+            action, bx, by = self.custom_builds[0]
+            if self._bad(action, now):
+                self.custom_builds.pop(0)
+                continue
+            b = idle_builders[0]
+            bcmd = {"cmd": "build", "action": action, "builder": b["id"]}
+            if bx is not None and by is not None:
+                bcmd["x"], bcmd["y"] = float(bx), float(by)
+            if emit(bcmd, f"build:custom:{b['id']}", 6.0):
+                self.custom_builds.pop(0)
+                idle_builders = idle_builders[1:]
+            else:
+                break
 
         # 5) 建筑升级双轨：采集器绝对优先（经济是根本），工厂并行不挤占；优先于常规补兵
         def try_upgrade(units, need):

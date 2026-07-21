@@ -189,6 +189,11 @@ STRAT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "composition": {"type": "object"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["composition"]}}},
     {"type": "function", "function": {
+        "name": "build_building",
+        "description": "指定建造一种建筑（动作ID取自建造者建造菜单，用 query(unit,builder) 查，如 b_seaFactory/b_mechFactory/b_repairbay/b_laserDefence/b_experimentalLandFactory）。执行层自动选建造者与选址。",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}}, "required": ["action"]}}},
+    {"type": "function", "function": {
         "name": "note",
         "description": "一句话记录你的战略分析（不执行操作，玩家可见）。",
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
@@ -843,6 +848,9 @@ def main():
                      + "\n[系统提示] 本回合必须包含一个实质动作（attack/harass/defend_home/expand/build_army）。")
             if alerts:
                 text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/harass/defend_home），只查资料或只发展视为失误。"
+                es = snap.get("enemy", [])[:3]
+                if es:
+                    text += " 可直接攻击的可见敌人: " + ",".join(f"{e['t']}@({e['x']},{e['y']})" for e in es)
             # 委托队无战斗单位时明确提示（attack/harass 会失败）
             squad_ids = set(snap.get("delegated", []))
             combat = [u for u in snap.get("own", [])
@@ -907,6 +915,16 @@ def main():
         blocked = []
         visible_enemy_ids = {u["id"] for u in snap.get("enemy", [])}
         own_ids = {u["id"] for u in snap.get("own", [])}
+
+        # 交战强制：有警报且本批调用无军事动词时，经济动作一律不执行（逼 LLM 先解决战斗）
+        if alerts and executor is not None:
+            names = [(tc.get("function") or {}).get("name") for tc in calls]
+            if names and not any(n in ("attack", "harass", "defend_home") for n in names):
+                before = len(calls)
+                calls = [tc for tc in calls if (tc.get("function") or {}).get("name")
+                         not in ("expand", "build_army", "build_building")]
+                if len(calls) < before:
+                    pending_notes.append("[系统强制] 正在交战而你没下军事指令：本次经济动作被拒绝执行。先 attack/harass/defend_home，再谈发展。")
 
         # 资料查询预处理：本地即时回答→回填→追问（最多2轮），随后进入正常指令执行
         for _qr in range(2):
@@ -977,6 +995,14 @@ def main():
                 with executor.lock:
                     executor.set_army_goal(composition=comp, rally=rally)
                 executed.append(f"build_army({comp})")
+                cmd_times.append(time.time())
+                continue
+            elif executor is not None and name == "build_building":
+                bx = clamp(float(args["x"]), 0, world_w) if args.get("x") is not None else None
+                by = clamp(float(args["y"]), 0, world_h) if args.get("y") is not None else None
+                with executor.lock:
+                    executor.queue_build(str(args.get("action", "")), bx, by)
+                executed.append(f"build_building({args.get('action')})")
                 cmd_times.append(time.time())
                 continue
             # 执行层托管期间拦截幻觉调用的经济指令（工具表已移除，双保险）
