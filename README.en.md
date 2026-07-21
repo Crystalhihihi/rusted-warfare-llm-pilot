@@ -4,44 +4,48 @@
 
 > ## ⚠️ WARNING
 >
-> **This project is at an early experimental stage. The AI's control of the game
-> has many known defects, including but not limited to:**
->
-> - Building on resource points may fail (placement/occupancy checks are incomplete)
-> - Production and construction lack variety; upgrading is effectively broken
-> - Disorientation in some openings (cannot locate the HQ, wanders to faraway resource points)
-> - Buildings may be wrongly included in move orders; macro control is essentially serial
->
-> **DO NOT use this project in multiplayer / online matches.**
-> The AI's mistakes will drag down teammates and ruin other players' experience,
-> and automated control violates fair-play principles in any multiplayer setting.
-> **This project is for single-player, local reverse-engineering research only.
+> **Experimental project — DO NOT use in multiplayer / online matches.**
+> Automated control violates fair-play principles, and AI mistakes will drag down
+> teammates. **Single-player, local reverse-engineering research only.
 > You are solely responsible for any consequences of misuse.**
+>
+> Known limitations (the layered v2 architecture has fixed most early control defects):
+> - The executor's build order is a fixed template (land maps mainly); water maps and
+>   exotic starts are not well tested
+> - Stalled constructions (e.g. builder died) are not auto-resumed — a status line
+>   reports them for manual completion
+> - Strategic quality depends on the LLM you plug in; weak models still make bad calls
 
 An experiment that connects large language models to the real-time strategy game
 Rusted Warfare: it extracts live battlefield state in a non-intrusive way, lets an
 LLM make decisions, and injects the resulting orders back to command your forces.
 
-## How it works
+## How it works (three layers)
 
 ```
 Rusted Warfare (JVM)
   └─ javaagent: rw-agent.jar ──TCP 127.0.0.1:41234 / NDJSON──▶ bridge (Python)
-                                                                   │  OpenAI-compatible API (DeepSeek by default)
-                                                                   ▼
-                                        LLM decisions → orders injected via the game's normal command queue
+                                                                 │
+   ┌─ Strategy layer (LLM, ~every 25s: attack/defend/expand/build_army only)
+   │      token budget ≈ 1/30 of a pure-LLM micro-control design
+   ├─ Executor (deterministic FSM: build order / production / upgrades / builders)
+   └─ Reflex (pure rules, millisecond: retreat under fire, defend the base)
+                                                                 ▼
+                                     atomic orders injected via the game's normal command queue
 ```
 
-- **agent/**: a Java `javaagent` attached at game launch (it modifies no game
-  files) that periodically emits battlefield snapshots (own/ally/visible-enemy
-  unit counts, funds, team state, downsampled ASCII map, etc.).
-- **bridge/**: a Python bridge (standard library only, Python ≥ 3.11) that turns
-  snapshots into prompts for an OpenAI-compatible API and translates the model's
-  tool calls back into game orders. Includes adaptive tick rates (faster under
-  threat, slower when calm), an APM cap with human-like pacing, and hot-reloadable
-  squad delegation.
-- **tools/**: an analysis probe and a launcher script that starts the game with
-  the agent attached.
+- **agent/**: a Java `javaagent` attached at game launch (modifies no game files),
+  emitting periodic battlefield snapshots (own/ally/visible-enemy units, funds,
+  build progress, production queues, ASCII map and resource points).
+- **bridge/executor.py**: deterministic execution layer — default build order,
+  action-availability self-learning, parallel builders, stalled-construction
+  detection; runs the economy with zero LLM calls (`LLM_OFF=1`).
+- **bridge/pilot.py**: strategy layer — distills the battlefield into a 12×12
+  strategic grid plus executor status, asks an OpenAI-compatible API (DeepSeek by
+  default) for one strategic verb every ~25s, and translates it into goals or orders.
+- **bridge/reflex.py**: pure-rule reflexes — retreat when the squad's HP crashes,
+  pull back when the base is threatened.
+- **tools/**: an analysis probe and a launcher that starts the game with the agent.
 
 Fair-play by design: only information within the team's own vision is forwarded;
 orders go through the game's normal command queue; everything is rate-limited.
@@ -58,8 +62,12 @@ orders go through the game's normal command queue; everything is rate-limited.
 3. **Launch the game**: edit paths in `tools/run-with-agent.bat` and run it —
    the game starts with the agent attached.
 4. **Run the bridge**:
-   - `python bridge/main.py` — prints battlefield summaries (useful for bring-up)
-   - `python bridge/pilot.py` — the LLM commander loop
+   - `python bridge/main.py` — battlefield summary printout (bring-up check)
+   - `LLM_OFF=1 python bridge/pilot.py` — executor-only mode (zero tokens, verify auto-economy)
+   - `python bridge/pilot.py` — full mode (executor economy + reflexes + LLM strategy)
+
+   In-game, delegate units first: click "control all" on the overlay panel, or box-select
+   units and click "delegate selection".
 
 ## Compliance
 

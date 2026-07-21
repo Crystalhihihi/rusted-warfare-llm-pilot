@@ -813,52 +813,6 @@ public final class Commands {
         }
         return firstBuilder;
     }
-    private static float[] snapToResource(l engine, float x, float y) {
-        try {
-            Object map = engine.bL;
-            if (map == null) {
-                return null;
-            }
-            Class<?> mc = map.getClass();
-            java.util.ArrayList<?> res = (java.util.ArrayList<?>) mc.getField("A").get(map);
-            if (res == null) {
-                return null;
-            }
-            int yOff = mc.getField("o").getInt(map); // 池点 Y 偏移
-            java.lang.reflect.Method toWorld = null;
-            java.lang.reflect.Field fx = null;
-            java.lang.reflect.Field fy = null;
-            float best = 80f;
-            float[] out = null;
-            for (Object p : res) {
-                if (p == null) {
-                    continue;
-                }
-                if (toWorld == null) {
-                    toWorld = mc.getMethod("a", p.getClass());
-                }
-                Object pf = toWorld.invoke(map, p);
-                if (pf == null) {
-                    continue;
-                }
-                if (fx == null) {
-                    fx = pf.getClass().getField("a");
-                    fy = pf.getClass().getField("b");
-                }
-                float px = fx.getFloat(pf);
-                float py = fy.getFloat(pf) + yOff;
-                float d = (float) Math.hypot(px - x, py - y);
-                if (d < best) {
-                    best = d;
-                    out = new float[]{px, py};
-                }
-            }
-            return out;
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
     /** 目标位置 radius 内是否已有建筑（任意队伍的建筑都算阻挡）。 */
     private static boolean blockedByBuilding(float x, float y) {
         return blockedByBuilding(x, y, 55f);
