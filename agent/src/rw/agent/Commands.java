@@ -316,7 +316,7 @@ public final class Commands {
             ay = cc.ep;
         }
         StringBuilder spotReason = new StringBuilder();
-        float[] spot = findBuildSpot(engine, team, type, ax, ay, spotReason);
+        float[] spot = findBuildSpot(engine, team, type, ax, ay, spotReason, builder);
         if (spot == null) {
             String extra = "";
             try {
@@ -334,23 +334,7 @@ public final class Commands {
         x = spot[0];
         yv = spot[1];
         // 可达性预检：目标 85px 环带采样——建造者能走到施工距离内任一点即放行（岸边造水上建筑合法）
-        boolean reachable = true;
-        try {
-            ao bmt = builder.h();
-            if (bmt != null && bmt != ao.a && bmt != ao.c && bmt != ao.d) {
-                reachable = com.corrodinggames.rts.gameFramework.utility.y.a(
-                    builder.eo, builder.ep, x.floatValue(), yv.floatValue(), bmt);
-                for (int k = 0; k < 8 && !reachable; k++) {
-                    double ang = k * Math.PI / 4.0;
-                    float sx = x.floatValue() + (float) (Math.cos(ang) * 85.0);
-                    float sy = yv.floatValue() + (float) (Math.sin(ang) * 85.0);
-                    reachable = com.corrodinggames.rts.gameFramework.utility.y.a(
-                        builder.eo, builder.ep, sx, sy, bmt);
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-        if (!reachable) {
+        if (!builderCanApproach(builder, x.floatValue(), yv.floatValue())) {
             reply(false, cmd, "建造者无法靠近目标85px内（水域/隔断），需换海上建造者或换位置");
             return;
         }
@@ -651,17 +635,27 @@ public final class Commands {
     }
 
     private static float[] findBuildSpot(l engine, n team, as type, float ax, float ay, StringBuilder reason) {
+        return findBuildSpot(engine, team, type, ax, ay, reason, null);
+    }
+
+    /** 带建造者的选址：池点过滤时同时排除建造者无法靠近的（水域/隔断），避免选了对岸的池反复撞墙。 */
+    private static float[] findBuildSpot(l engine, n team, as type, float ax, float ay, StringBuilder reason, am builder) {
         try {
             if (type.p()) {
                 java.util.ArrayList<float[]> pools = resourcePoints(engine);
                 pools.sort((a, b) -> Float.compare(dist2(a, ax, ay), dist2(b, ax, ay)));
                 int blocked = 0;
                 int invalid = 0;
+                int unreachable = 0;
                 String firstErr = null;
                 float[] firstPool = pools.isEmpty() ? null : pools.get(0);
                 for (float[] p : pools) {
                     if (blockedByBuilding(p[0], p[1], POOL_BLOCK_RADIUS)) {
                         blocked++;
+                        continue;
+                    }
+                    if (builder != null && !builderCanApproach(builder, p[0], p[1])) {
+                        unreachable++;
                         continue;
                     }
                     boolean ok = false;
@@ -678,6 +672,7 @@ public final class Commands {
                     }
                 }
                 reason.append("资源池共").append(pools.size()).append("个：被占").append(blocked)
+                      .append("，无法靠近").append(unreachable)
                       .append("，校验不过").append(invalid)
                       .append(firstErr == null ? "" : "，" + firstErr)
                       .append(firstPool == null ? "" : "，最近池(" + (int) firstPool[0] + "," + (int) firstPool[1] + ")");
@@ -780,6 +775,27 @@ public final class Commands {
             }
         } catch (Throwable t) {
             return null; // 校验失败不挡指令
+        }
+    }
+
+    /** 建造者能否靠近目标（目标点或 85px 环带任一点可达即放行，岸边造水上建筑合法）。 */
+    private static boolean builderCanApproach(am builder, float x, float y) {
+        try {
+            ao bmt = builder.h();
+            if (bmt == null || bmt == ao.a || bmt == ao.c || bmt == ao.d) {
+                return true;
+            }
+            boolean ok = com.corrodinggames.rts.gameFramework.utility.y.a(
+                builder.eo, builder.ep, x, y, bmt);
+            for (int k = 0; k < 8 && !ok; k++) {
+                double ang = k * Math.PI / 4.0;
+                ok = com.corrodinggames.rts.gameFramework.utility.y.a(
+                    builder.eo, builder.ep,
+                    x + (float) (Math.cos(ang) * 85.0), y + (float) (Math.sin(ang) * 85.0), bmt);
+            }
+            return ok;
+        } catch (Throwable t) {
+            return true; // 检查失败不挡指令
         }
     }
 
