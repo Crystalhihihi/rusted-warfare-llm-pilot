@@ -168,14 +168,14 @@ class Summarizer:
             lines.append(f"你的小队({len(squad)}): {su}")
         else:
             lines.append("你的小队: 空（等待玩家把单位编入委托编队）")
-        # 建造者忙闲状态（防重复派活）
+        # 建造者忙闲状态（防重复派活；施工走路=build@，盖着时=repair→，都算忙）
         busy_b, idle_b = [], []
         for u in squad:
             if "uilder" in u["t"] or "abricator" in u["t"]:
                 act = u.get("act") or ""
-                if act.startswith("build"):
+                if act not in ("", "idle"):
                     busy_b.append(f"#{u['id']}[{act}]")
-                elif act in ("", "idle"):
+                else:
                     idle_b.append(f"#{u['id']}")
         if busy_b or idle_b:
             parts = []

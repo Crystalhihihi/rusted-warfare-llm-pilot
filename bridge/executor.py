@@ -48,7 +48,9 @@ def _is_factory(u):
 
 
 def _busy(u):
-    return (u.get("act") or "").startswith("build")
+    # 实测：走路去施工 act="build@(x,y)"，真正盖着时 act="repair→目标"——
+    # 除 None/""/"idle" 外都算忙，否则盖一半会被当成空闲而拉走
+    return u.get("act") not in (None, "", "idle")
 
 
 def _constructing(u):
@@ -79,6 +81,7 @@ class Executor:
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
+        self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.start_ts = time.time()
 
     # ---------- LLM 目标接口 ----------
@@ -125,7 +128,22 @@ class Executor:
         factories = [u for u in own if _is_factory(u) and not _constructing(u)]
         fac_producers = [u for u in factories if u["t"] != "commandCenter"]
         cc = next((u for u in factories if u["t"] == "commandCenter"), None)
-        constructing = [u for u in own if u.get("bld") and _constructing(u)]
+        constructing = []
+        for u in own:
+            if u.get("bld") and _constructing(u):
+                # 进度跟踪：60s 内进度有涨的才算"在盖"，不涨的记为烂尾（不占用在建数）
+                last = self.prog_seen.get(u["id"])
+                prog = u.get("prog", 1)
+                if last is None or abs(prog - last[0]) > 0.005:
+                    self.prog_seen[u["id"]] = (prog, now)
+                    constructing.append(u)
+                elif now - last[1] < 60:
+                    constructing.append(u)
+                # else: 烂尾（>60s 无进展）——不计入 constructing
+        stalled = [u for u in own if u.get("bld") and _constructing(u) and u not in constructing]
+        self.last_stalled = len(stalled)
+        live_ids = {u["id"] for u in own}
+        self.prog_seen = {k: v for k, v in self.prog_seen.items() if k in live_ids}
         busy_cnt = len(builders) - len(idle_builders)
 
         def emit(cmd, cool_key, cooldown=ACTION_COOLDOWN):
@@ -141,11 +159,9 @@ class Executor:
                 self.issued_builds.append((btype, now + 45.0))  # 施工窗口期，防重复下单
             return True
 
-        # 1) 建造者数量
+        # 1) 建造者数量：低于目标且有钱就补（此前条件写反导致归零后永不补产）
         if cc and len(builders) < self.econ_goal["builders"] and (cc.get("q") or 0) < QUEUE_MAX:
-            if funds >= 250 and not idle_builders:  # 有闲置才产（与原守卫一致），开局除外
-                pass
-            elif funds >= 250:
+            if funds >= 250:
                 emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
 
         # 2) 采集器扩建（最高优先；agent 自动选最近空闲池）
@@ -180,8 +196,12 @@ class Executor:
             idle_builders = idle_builders[1:]
 
         # 5) 生产调度：按构成目标或默认优先级补队列
+        #    资金低于储备线时暂停补兵——经济建设（采集器/工厂）优先，防止"造兵把钱抽空、建造停工"
+        econ_pending = (len(ext_done) + ext_inflight < ext_target) or (not land_factories)
         for fac in fac_producers:
             if (fac.get("q") or 0) >= QUEUE_MAX:
+                continue
+            if funds < FUNDS_RESERVE and econ_pending:
                 continue
             act = self._next_production(fac, own)
             if act:
@@ -250,5 +270,6 @@ class Executor:
         idle_b = sum(1 for u in builders if not _busy(u))
         ext = sum(1 for u in own if u["t"].startswith("extractor") and u.get("bld") and not _constructing(u))
         facs = sum(1 for u in own if _is_factory(u) and not _constructing(u))
+        stalled_txt = f" 烂尾{getattr(self, 'last_stalled', 0)}座(请手动补盖)" if getattr(self, "last_stalled", 0) else ""
         return (f"执行层: 池{ext}/{self.econ_goal['extractors']} 厂{facs} "
-                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}")
+                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}{stalled_txt}")

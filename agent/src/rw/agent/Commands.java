@@ -87,8 +87,8 @@ public final class Commands {
                             continue;
                         }
                         String act = Activity.describe(u);
-                        if (act != null && act.startsWith("build")) {
-                            busy++;
+                        if (act != null && (act.startsWith("build") || act.startsWith("repair"))) {
+                            busy++; // 施工走路(build@)与盖着(repair→)都算施工中
                             continue;
                         }
                     }
@@ -291,10 +291,10 @@ public final class Commands {
             reply(false, cmd, "no builder in delegated units");
             return;
         }
-        // 施工保护：目标建造者已有施工任务时拒绝（防顶掉原施工）
+        // 施工保护：目标建造者已有施工任务时拒绝（防顶掉原施工；build@与repair→都算）
         try {
             String bAct = Activity.describe(builder);
-            if (bAct != null && bAct.startsWith("build")) {
+            if (bAct != null && (bAct.startsWith("build") || bAct.startsWith("repair"))) {
                 reply(false, cmd, "builder#" + builder.eh + " 正在施工(" + bAct + ")，完工后再派新任务（或换其他空闲建造者）");
                 return;
             }
