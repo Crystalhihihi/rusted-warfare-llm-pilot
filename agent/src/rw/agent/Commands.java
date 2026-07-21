@@ -107,7 +107,8 @@ public final class Commands {
                     }
                 }
                 if (reach.isEmpty() && !targets.isEmpty()) {
-                    reply(false, cmd, "目标点对全部受令单位不可达（被水/岩浆/高崖隔断），换个目标或换兵种");
+                    reply(false, cmd, "目标点对全部受令单位不可达（被水/岩浆/高崖隔断）。"
+                        + findDetour(targets, x.floatValue(), yv.floatValue()));
                     return;
                 }
                 e c = engine.cf.b(team);
@@ -784,6 +785,37 @@ public final class Commands {
         } catch (Throwable t) {
             return null; // 校验失败不挡指令
         }
+    }
+
+    /** 目标不可达时，在目标周围环形搜索一个"从部队和到目标都可达"的绕行点，写进回执引导绕行。 */
+    private static String findDetour(ArrayList<am> units, float tx, float ty) {
+        try {
+            for (am u : units) {
+                if (!(u instanceof y)) {
+                    continue;
+                }
+                ao mt = u.h();
+                if (mt == null || mt == ao.a || mt == ao.c || mt == ao.d) {
+                    continue;
+                }
+                float[] radii = {300f, 600f, 1000f, 1500f, 2200f, 3000f};
+                for (float r : radii) {
+                    for (int k = 0; k < 8; k++) {
+                        double ang = k * Math.PI / 4.0;
+                        float cx = tx + (float) (Math.cos(ang) * r);
+                        float cy = ty + (float) (Math.sin(ang) * r);
+                        boolean toUnit = com.corrodinggames.rts.gameFramework.utility.y.a(u.eo, u.ep, cx, cy, mt);
+                        boolean toTarget = com.corrodinggames.rts.gameFramework.utility.y.a(cx, cy, tx, ty, mt);
+                        if (toUnit && toTarget) {
+                            return "可先 move 到(" + (int) cx + "," + (int) cy + ")绕行（该点部队与目标双向可达）";
+                        }
+                    }
+                }
+                break; // 只用第一个机动单位测
+            }
+        } catch (Throwable ignored) {
+        }
+        return "未找到绕行点，换个目标或换兵种";
     }
 
     /** 建造者能否靠近目标（目标点或 85px 环带任一点可达即放行，岸边造水上建筑合法）。 */
