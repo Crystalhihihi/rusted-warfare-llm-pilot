@@ -194,13 +194,14 @@ STRAT_TOOLS = [
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
     {"type": "function", "function": {
         "name": "query",
-        "description": "查参考资料（本地数据即时回答，不占指令名额）。topic 选: roster(全单位花名册,分组+科技) / unit(单位详情,arg=单位名) / building(建筑详情,arg=名称) / prices(生产者价格与产能表) / map_overview(全图地形粗览) / map_zone(区域详图,arg=\"x,y\"世界坐标) / bases(视野内已知主基地位置)。拿不准先查再决策，每轮最多2次。",
+        "description": "查参考资料（本地数据即时回答，不占指令名额）。topic 选: guide(战术手册:兵种定位与克制) / roster(全单位花名册,分组+科技) / unit(单位详情,arg=单位名) / building(建筑详情,arg=名称) / prices(生产者价格与产能表) / map_overview(全图地形粗览) / map_zone(区域详图,arg=\"x,y\"世界坐标) / bases(视野内已知主基地位置)。拿不准先查再决策，每轮最多2次。",
         "parameters": {"type": "object", "properties": {"topic": {"type": "string"}, "arg": {"type": "string"}}, "required": ["topic"]}}},
 ]
 
 
 def answer_query(topic, arg, map_msg, pedia, snap):
     """目录式资料应答器：全部本地数据生成，不调 LLM，答案紧凑。"""
+    import tactics_guide
     units = {u["name"]: u for u in (pedia or {}).get("units", [])}
     topic = (topic or "").strip()
     arg = (arg or "").strip()
@@ -210,9 +211,13 @@ def answer_query(topic, arg, map_msg, pedia, snap):
             cands = [k for k in units if arg.lower() in k.lower()][:8]
             return f"未找到'{arg}'。相近: {','.join(cands) or '无'}"
         builds = list(dict.fromkeys(u.get("builds", [])))
-        return (f"{u['name']}({u.get('display', '')}): ${u.get('price', '?')} T{u.get('tech', '?')} "
-                f"建筑={u.get('building')} 建造者={u.get('builder')} 移动={u.get('move', '?')} "
-                f"hp={u.get('hp', '?')} 动作[{','.join(builds[:24])}]")
+        ans = (f"{u['name']}({u.get('display', '')}): ${u.get('price', '?')} T{u.get('tech', '?')} "
+               f"建筑={u.get('building')} 建造者={u.get('builder')} 移动={u.get('move', '?')} "
+               f"hp={u.get('hp', '?')} 动作[{','.join(builds[:24])}]")
+        note = tactics_guide.GUIDE.get(u["name"])
+        return ans + (f"\n战术: {note}" if note else "")
+    if topic == "guide":
+        return tactics_guide.GUIDE_FULL
     if topic == "prices":
         return _capability_brief(pedia)
     if topic == "roster":

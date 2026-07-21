@@ -312,11 +312,15 @@ class Executor:
         # 7) 集结点（army_goal 指定时，每厂设一次；emit 成功才登记，失败下拍重试）
         if self.army_goal["rally"]:
             rx, ry = self.army_goal["rally"]
-            for fac in fac_producers:
-                if fac["id"] not in self.rallied:
-                    if emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
-                            f"rally:{fac['id']}", 5.0):
-                        self.rallied.add(fac["id"])
+            # 集结点落在敌人 500px 内 = 让部队排队送死，本拍跳过并告知
+            if any((e["x"] - rx) ** 2 + (e["y"] - ry) ** 2 < 500 ** 2 for e in snap.get("enemy", [])):
+                self.log("status", "⚙ 集结点距敌人过近已跳过（LLM 选点不慎，需重设）")
+            else:
+                for fac in fac_producers:
+                    if fac["id"] not in self.rallied:
+                        if emit({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry},
+                                f"rally:{fac['id']}", 5.0):
+                            self.rallied.add(fac["id"])
 
         # 8) LLM 沉默时的默认军事行为（默认关闭，config auto_military=true 才启用）
         army = [u for u in own if not u.get("bld") and not _is_builder(u)]
