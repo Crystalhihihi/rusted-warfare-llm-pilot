@@ -1,12 +1,12 @@
 @echo off
 rem ============================================
-rem  Rusted Warfare + LLM AI 一键全启动
-rem  1. 带 rw-agent 启动游戏   2. 启动 Python 桥接
-rem  注意：ASCII only (Chinese in .bat breaks cmd.exe parsing)
+rem  Rusted Warfare + LLM AI one-click launcher
+rem  1. start game with rw-agent  2. start Python bridge
+rem  NOTE: ASCII only. Chinese in .bat breaks cmd.exe parsing.
 rem ============================================
 cd /d %~dp0
 
-rem 旧实例检查：端口 41234 被占用说明 agent 已在跑
+rem Check for an already-running agent (port 41234 in use)
 netstat -ano | findstr ":41234" | findstr "LISTENING" >nul 2>nul
 if not errorlevel 1 (
   echo [WARN] port 41234 already in use - an agent instance may already be running.
