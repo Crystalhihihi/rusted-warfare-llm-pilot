@@ -5,6 +5,7 @@
 - 小队受击撤退：委托小队血量短时间急跌且敌人在附近 → 向主基地撤（带滞回，防抖动）
 - 基地遇袭回防：敌人逼近主基地 → 小队拉回防守（冷却，防与 LLM 指令打架）
 """
+import re
 import time
 
 RETREAT_HP_DROP = 0.15     # 血量跌幅阈值（相对上次快照）
@@ -21,6 +22,8 @@ class Reflex:
         self.prev_ts = 0.0
         self.retreat_cd = 0.0
         self.defend_cd = 0.0
+        self.dmap = None              # DangerMap（pilot 注入）
+        self.builder_recall_cd = {}   # 建造者id -> 召回冷却
 
     @staticmethod
     def _centroid(units):
@@ -62,3 +65,20 @@ class Reflex:
                 self.defend_cd = now + DEFEND_COOL
                 if send({"cmd": "move", "x": hx, "y": hy}):
                     self.log("alert", f"⚡ 反射：基地遇袭回防（敌 {len(threat)} 个逼近）")
+
+        # 3) 建造者召回：赶路去危险区的建造者立即撤回（act=build@(x,y) 且目标点危险）
+        if self.dmap is not None:
+            for u in own:
+                if "uilder" not in u["t"] and "abricator" not in u["t"]:
+                    continue
+                act = u.get("act") or ""
+                if not act.startswith("build@"):
+                    continue
+                m = re.search(r"build@\((-?\d+),(-?\d+)\)", act)
+                if not m:
+                    continue
+                tx, ty = float(m.group(1)), float(m.group(2))
+                if self.dmap.danger(tx, ty, snap) and now >= self.builder_recall_cd.get(u["id"], 0):
+                    self.builder_recall_cd[u["id"]] = now + 20.0
+                    if send({"cmd": "move", "units": str(u["id"]), "x": hx, "y": hy}):
+                        self.log("alert", f"⚡ 反射：召回赴险建造者#{u['id']}（目标点在敌区）")

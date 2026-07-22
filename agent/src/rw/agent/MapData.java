@@ -39,6 +39,13 @@ public final class MapData {
             StringBuilder sb = new StringBuilder(w * h + 4096);
             sb.append("{\"type\":\"map\",\"tilesW\":").append(w).append(",\"tilesH\":").append(h)
               .append(",\"tileW\":").append(tsx).append(",\"tileH\":").append(tsy);
+            // 地图路径（如 maps/skirmish/[p2]Lake (2p).tmx），供 bridge 解析出生点
+            try {
+                if (engine.dl != null) {
+                    sb.append(",\"path\":\"").append(Commands.esc(engine.dl)).append('"');
+                }
+            } catch (Throwable ignored) {
+            }
 
             appendResources(sb, map, mc);
             sb.append(",\"legend\":{\".\":\"land\",\"~\":\"water\",\"=\":\"bridge\",\"L\":\"lava\",\"^\":\"cliff\",\"#\":\"largeCliff\",\" \":\"void\"}");

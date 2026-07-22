@@ -21,6 +21,8 @@ from collections import deque
 import llm
 import summarize
 import executor as exec_mod
+import spawns
+import danger as danger_mod
 
 try:  # Windows GBK 控制台打印 ✓/✗/⚙ 等字符会崩线程，统一改 UTF-8+替换
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -723,9 +725,25 @@ def main():
     if use_exec:
         executor = exec_mod.Executor(map_msg, pedia, log_activity)
         executor.auto_military = bool(cfg.get("auto_military", False))
-    # 反射层：受击撤退/基地回防（纯规则，始终启用）
+
+    # 地图识别：出生点解析（tmx）+ 动态危险区
+    danger_map = danger_mod.DangerMap()
+    own_cc0 = next((u for u in (link.snapshot() or {}).get("own", []) if u["t"] == "commandCenter"), None)
+    mine_spawn, enemy_spawns = spawns.friendly_spawns(
+        map_msg.get("path", ""), (own_cc0["x"], own_cc0["y"]) if own_cc0 else None)
+    if enemy_spawns:
+        danger_map.seed_bases(enemy_spawns)
+        print(f"[map] 出生点: 我方{mine_spawn} 敌方{enemy_spawns}")
+    if executor is not None:
+        executor.dmap = danger_map
+    if mine_spawn or enemy_spawns:
+        system["content"] += (f"\n【出生点（开局房间公开信息）】我方≈{mine_spawn}；敌方: "
+                              + ",".join(f"({int(x)},{int(y)})" for x, y in enemy_spawns)
+                              + "。敌方主力大概率从这些方向来，扩张/防线方向据此判断。")
+    # 反射层：受击撤退/基地回防/建造者召回（纯规则，始终启用）
     import reflex as reflex_mod
     reflex = reflex_mod.Reflex(log_activity)
+    reflex.dmap = danger_map
     history = []
     # 失败封禁双轨：永封=非法/编造ID、死目标（本对局内）；临封=资金/施工/队列/科技等条件性失败，TTL 后可重试
     FAILED_TTL = 90.0
@@ -802,10 +820,19 @@ def main():
             failed_temp.clear()
             new_map = link.map_message()
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
+            danger_map = danger_mod.DangerMap()
+            own_cc0 = next((u for u in (new_map and link.snapshot() or {}).get("own", [])
+                            if u["t"] == "commandCenter"), None)
+            mine_spawn, enemy_spawns = spawns.friendly_spawns(
+                (new_map or {}).get("path", ""), (own_cc0["x"], own_cc0["y"]) if own_cc0 else None)
+            if enemy_spawns:
+                danger_map.seed_bases(enemy_spawns)
             if cfg.get("use_executor", True):
                 executor = exec_mod.Executor(new_map, pedia, log_activity)
                 executor.auto_military = bool(cfg.get("auto_military", False))
+                executor.dmap = danger_map
                 exec_holder["ex"] = executor
+            reflex.dmap = danger_map
             print("[pilot] 检测到新对局，上下文已重置")
             log_activity("status", "新对局开始，AI 上下文已重置")
             continue
@@ -862,6 +889,8 @@ def main():
             continue
 
         text, alerts = smz.summarize(snap)
+        # 动态危险区：喂快照（敌人记忆/威胁热力/前线趋势）
+        danger_map.update(snap, (smz.home["x"], smz.home["y"]) if getattr(smz, "home", None) else None)
         results = link.drain_cmd_results()
         if results:
             text += "\n\n指令回执（你上一条指令的执行结果，失败原因必须据此纠正）:\n" + "\n".join(
@@ -892,8 +921,10 @@ def main():
             time.sleep(0.5)
             continue
         if executor is not None:
+            front = danger_map.front_status()
             text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
                      + "\n【执行层】 " + executor.status_line(snap)
+                     + (f"\n【前线】 {front}" if front != "unknown" else "")
                      + "\n[系统提示] 本回合必须包含一个实质动作（attack/attack_nearest/harass/defend_home/expand/build_army）。")
             if alerts:
                 text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/attack_nearest/harass/defend_home），不知道打哪就 attack_nearest，只查资料或只发展视为失误。"

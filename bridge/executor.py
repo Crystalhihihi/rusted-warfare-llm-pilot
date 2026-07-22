@@ -102,6 +102,7 @@ class Executor:
         self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
         self.last_upgrade = None
         self.lock = threading.Lock()   # tick/目标设置/失败学习 共用（执行层独立线程）
+        self.dmap = None               # DangerMap（pilot 注入）：敌人记忆/威胁热力
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
@@ -183,10 +184,12 @@ class Executor:
         builders = [u for u in own if _is_builder(u)]
         idle_builders = [u for u in builders if not _busy(u)]
 
-        # 危险区：可见敌人 600px 内不派建造者（前线崩溃时不再派民夫送死）
+        # 危险区：可见敌人 + 记忆威胁（敌人离开视野仍算危险，由 DangerMap 提供）
         enemies = snap.get("enemy", [])
 
         def danger(x, y, r=600):
+            if self.dmap is not None:
+                return self.dmap.danger(x, y, snap)
             return any((e["x"] - x) ** 2 + (e["y"] - y) ** 2 < r * r for e in enemies)
 
         _cc = next((u for u in own if u["t"] == "commandCenter" and u.get("bld")), None)
