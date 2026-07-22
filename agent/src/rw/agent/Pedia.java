@@ -5,11 +5,13 @@ import java.util.ArrayList;
 import com.corrodinggames.rts.game.units.am;
 import com.corrodinggames.rts.game.units.ar;
 import com.corrodinggames.rts.game.units.as;
+import com.corrodinggames.rts.game.units.y;
 
 /**
  * One-shot per-match unit-pedia export: every registered unit type with
  * price / tech level / building & builder flags / movement type / hp /
- * buildable action ids. Sent to the bridge as a "pedia" message.
+ * weapon stats (target type, damage, dps, range, count) / buildable action ids.
+ * Sent to the bridge as a "pedia" message.
  * Registry: ar.ae. Stats sample: shared instance am.a(as).
  * Game thread only.
  */
@@ -46,6 +48,7 @@ public final class Pedia {
                     am sample = am.a(t);
                     if (sample != null) {
                         sb.append(",\"hp\":").append((int) sample.cv);
+                        appendAttack(sb, sample);
                     }
                 } catch (Throwable ignored) {
                 }
@@ -99,6 +102,44 @@ public final class Pedia {
             return d == null ? "" : d;
         } catch (Throwable ex) {
             return "";
+        }
+    }
+
+    /**
+     * 武器属性导出：目标类型(g=对地/a=对空)/单轮总伤害 dmg/dps/最大射程 rng/门数 n。
+     * 走实体统一接口 y（custom.j 与内置硬编码单位通用），无武装单位也发全 false
+     * 的 atk，让 bridge 能区分"无武装"与"无数据"。硬编码单位未覆盖 q(int) 时
+     * dmg/dps 为 0（官方口径需实弹试射，代价太大，见 ar.s()）。
+     */
+    private static void appendAttack(StringBuilder sb, am sample) {
+        try {
+            if (!(sample instanceof y)) {
+                return;
+            }
+            y u = (y) sample;
+            if (!u.l()) { // am.l() = canAttack
+                sb.append(",\"atk\":{\"g\":false,\"a\":false,\"dmg\":0,\"dps\":0,\"rng\":0,\"n\":0}");
+                return;
+            }
+            int n = Math.max(0, u.bl()); // 武器门数（战列舰等多炮塔 > 1）
+            int dmg = 0;
+            float dps = 0f;
+            for (int i = 0; i < n; i++) {
+                float d = u.q(i);  // 第 i 门单发伤害
+                float cd = u.b(i); // 第 i 门冷却 tick（60 tick = 1s）
+                dmg += (int) d;
+                if (cd > 0) {
+                    dps += d * 60.0f / cd;
+                }
+            }
+            sb.append(",\"atk\":{\"g\":").append(u.ag())
+              .append(",\"a\":").append(u.af())
+              .append(",\"dmg\":").append(dmg)
+              .append(",\"dps\":").append((int) (dps + 0.5f))
+              .append(",\"rng\":").append((int) u.m())
+              .append(",\"n\":").append(n)
+              .append('}');
+        } catch (Throwable ignored) {
         }
     }
 }

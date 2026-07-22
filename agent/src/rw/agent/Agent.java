@@ -22,6 +22,8 @@ public final class Agent {
                 String v = kv.substring(i + 1).trim();
                 if ("log".equals(k)) {
                     logPath = v;
+                } else if ("dumpPedia".equals(k)) {
+                    Bootstrap.dumpPediaPath = v; // 诊断：注册表稳定后 dump 百科到文件，无需开战
                 }
             }
         }

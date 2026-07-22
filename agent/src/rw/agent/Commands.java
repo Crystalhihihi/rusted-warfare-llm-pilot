@@ -160,6 +160,41 @@ public final class Commands {
                 }
                 c.a(target);
                 reply(true, cmd, n0 + " units attack " + target.r().i());
+            } else if ("resume".equals(cmd)) {
+                // 续建未完工建筑：repair 路点（av.d），与玩家右键未完工建筑同一条路径
+                Float bid = numVal(line, "builder");
+                Float tid = numVal(line, "target");
+                if (bid == null || tid == null) {
+                    reply(false, cmd, "missing builder/target");
+                    return;
+                }
+                am b = w.a(bid.longValue(), false);
+                am t = w.a(tid.longValue(), false);
+                if (b == null || b.bV || b.bX != team) {
+                    reply(false, cmd, "builder not found/dead");
+                    return;
+                }
+                if (t == null || t.bV || t.bX != team) {
+                    reply(false, cmd, "target not found/dead");
+                    return;
+                }
+                if (t.cm >= 1.0f) {
+                    reply(false, cmd, "target 已完工，无需续建");
+                    return;
+                }
+                boolean isBuilder = false;
+                try {
+                    isBuilder = b.r().l();
+                } catch (Throwable ignored) {
+                }
+                if (!isBuilder) {
+                    reply(false, cmd, "指定的 builder 不是建造者");
+                    return;
+                }
+                e c = engine.cf.b(team);
+                c.a((y) b);
+                c.b(t); // repair 路点：建造者会自己走进施工距离续建，完工/目标死亡游戏自动清路点
+                reply(true, cmd, "builder#" + b.eh + " resume " + t.r().i() + "#" + t.eh);
             } else if ("delegate".equals(cmd)) {
                 String groups = strVal(line, "groups");
                 if (groups == null) {

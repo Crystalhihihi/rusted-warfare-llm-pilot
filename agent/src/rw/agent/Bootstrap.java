@@ -1,6 +1,7 @@
 package rw.agent;
 
 import com.corrodinggames.rts.gameFramework.l;
+import com.corrodinggames.rts.game.units.ar;
 
 /**
  * Waits for the engine + a loaded map, then registers a BridgeObject into the
@@ -10,6 +11,10 @@ import com.corrodinggames.rts.gameFramework.l;
  */
 public final class Bootstrap implements Runnable {
     private static OverlayObject overlay;
+    static volatile String dumpPediaPath = null; // agent 参数 dumpPedia=<path> 启用
+    private static boolean pediaDumped = false;
+    private static int pediaStableSize = -1;
+    private static int pediaFailures = 0;
 
     @Override
     public void run() {
@@ -27,6 +32,9 @@ public final class Bootstrap implements Runnable {
 
     private static void tick() {
         l engine = l.B();
+        if (dumpPediaPath != null && !pediaDumped) {
+            tryDumpPedia();
+        }
         if (engine == null || engine.bL == null) {
             return; // no engine yet, or sitting in menu
         }
@@ -45,6 +53,32 @@ public final class Bootstrap implements Runnable {
             overlay = new OverlayObject();
             BridgeObject.callbackTick = engine.bx;
             Log.info("BridgeObject+OverlayObject registered at tick=" + engine.bx + " obj=" + bo);
+        }
+    }
+
+    /** 诊断 dump：等单位注册表大小稳定（连续两拍不变且非空）后导出 Pedia，最多重试 10 次。 */
+    private static void tryDumpPedia() {
+        try {
+            if (ar.ae == null) {
+                return;
+            }
+            int size = ar.ae.size();
+            if (size == 0 || size != pediaStableSize) {
+                pediaStableSize = size;
+                return;
+            }
+            String p = Pedia.build();
+            if (p == null) {
+                return;
+            }
+            java.nio.file.Files.write(java.nio.file.Paths.get(dumpPediaPath), p.getBytes("UTF-8"));
+            pediaDumped = true;
+            Log.info("pedia dumped: " + dumpPediaPath + " units=" + size);
+        } catch (Throwable t) {
+            Log.error("dumpPedia error", t);
+            if (++pediaFailures >= 10) {
+                pediaDumped = true; // 放弃，不再刷屏
+            }
         }
     }
 
