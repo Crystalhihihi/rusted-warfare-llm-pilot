@@ -182,6 +182,21 @@ class Executor:
 
         builders = [u for u in own if _is_builder(u)]
         idle_builders = [u for u in builders if not _busy(u)]
+
+        # 危险区：可见敌人 600px 内不派建造者（前线崩溃时不再派民夫送死）
+        enemies = snap.get("enemy", [])
+
+        def danger(x, y, r=600):
+            return any((e["x"] - x) ** 2 + (e["y"] - y) ** 2 < r * r for e in enemies)
+
+        ccx = cc["x"] if cc else 0
+        ccy = cc["y"] if cc else 0
+        safe_pools = sorted(
+            (p for p in self.resources
+             if not p.get("w") and not danger(p["x"], p["y"])
+             and not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
+                         for u in own + snap.get("allies", []) if u.get("bld"))),
+            key=lambda p: (p["x"] - ccx) ** 2 + (p["y"] - ccy) ** 2)
         extractors = [u for u in own if u["t"].startswith("extractor") and u.get("bld")]
         ext_done = [u for u in extractors if not _constructing(u)]
         factories = [u for u in own if _is_factory(u) and not _constructing(u)]
@@ -223,14 +238,15 @@ class Executor:
             if funds >= 250:
                 emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
 
-        # 2) 采集器扩建（最高优先；agent 自动选最近空闲池；完工数达标即停）
+        # 2) 采集器扩建（最高优先；只去安全池——敌区600px内不派建造者；完工数达标即停）
         ext_target = self.econ_goal["extractors"]
         ext_inflight = (sum(1 for u in constructing if u["t"].startswith("extractor"))
                         + sum(1 for t, _ in self.issued_builds if t.startswith("extractor")))
         if (len(ext_done) < ext_target and ext_inflight < 2
-                and funds >= EXTRACTOR_PRICE and idle_builders):
+                and funds >= EXTRACTOR_PRICE and idle_builders and safe_pools):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_extractorT1", "builder": b["id"]},
+            emit({"cmd": "build", "action": "b_extractorT1", "builder": b["id"],
+                  "x": float(safe_pools[0]["x"]), "y": float(safe_pools[0]["y"])},
                  f"build:ext:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
@@ -307,8 +323,11 @@ class Executor:
                 lat = 130 if len(turrets) % 2 else -130
                 tcmd["x"] = float(cc["x"] + dx / d * off - dy / d * lat)
                 tcmd["y"] = float(cc["y"] + dy / d * off + dx / d * lat)
-            emit(tcmd, f"build:tur:{b['id']}", 6.0)
-            idle_builders = idle_builders[1:]
+            if "x" in tcmd and danger(tcmd["x"], tcmd["y"], 500):
+                pass  # 炮塔位在敌区500px内，本拍不落（防线崩溃时不往火线上送）
+            else:
+                emit(tcmd, f"build:tur:{b['id']}", 6.0)
+                idle_builders = idle_builders[1:]
 
         # 4.55) 僵局经济：资源点被占完、或采集器达标且资金爆表(≥15000)时，
         #      造资源制造仪发展额外经济（≤2座）——此前条件过严永远不会触发
