@@ -15,6 +15,7 @@ tools/vineflower.jar
 
 # 运行产物
 agent/logs/
+tools/pedia-dump.json
 bridge/__pycache__/
 bridge/activity.jsonl
 bridge/control.json
