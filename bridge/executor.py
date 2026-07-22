@@ -13,7 +13,7 @@ import math
 import re
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 
 BUILDER_BUILD = {  # 建造者建造动作的静态优先级（按局面分支使用）
     "extractor": ["b_extractorT1"],
@@ -103,6 +103,7 @@ class Executor:
         self.last_upgrade = None
         self.lock = threading.Lock()   # tick/目标设置/失败学习 共用（执行层独立线程）
         self.dmap = None               # DangerMap（pilot 注入）：敌人记忆/威胁热力
+        self.train_hist = {}           # 工厂id -> deque(发车时间)：q 缺失（如 mechFactoryT2）时的本地队列估计
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
@@ -238,6 +239,8 @@ class Executor:
                 act = cmd.get("action", "")
                 btype = act[2:] if act.startswith("b_") else act
                 self.issued_builds.append((btype, now + 45.0))  # 施工窗口期，防重复下单
+            if cmd["cmd"] == "train":
+                self.train_hist.setdefault(cmd["factory"], deque()).append(now)  # 本地队列估计用
             return True
 
         # 1) 建造者数量：低于目标且有钱就补（此前条件写反导致归零后永不补产）
@@ -277,7 +280,7 @@ class Executor:
         # 3.5) 战斗工程师：无存货且要扩厂时产1-2个（直接建T2厂，省升级时间）
         ce_count = sum(1 for u in own if u["t"] == "combatEngineer")
         if (len(ext_done) >= 2 and ce_count < 2 and funds >= 1500 and land_factories):
-            lf = next((u for u in land_factories if (u.get("q") or 0) < QUEUE_MAX), None)
+            lf = next((u for u in land_factories if self._q(u, now) < QUEUE_MAX), None)
             if lf and not self._bad("u_combatEngineer", now):
                 emit({"cmd": "train", "action": "u_combatEngineer", "factory": lf["id"]},
                      "train:ce", 10.0)
@@ -310,7 +313,7 @@ class Executor:
         #    按构成目标或默认优先级补队列；资金低于储备线且经济未达标时暂停
         econ_pending = (len(ext_done) + ext_inflight < ext_target) or (not land_factories)
         for fac in fac_producers:
-            if (fac.get("q") or 0) >= QUEUE_MAX:
+            if self._q(fac, now) >= QUEUE_MAX:
                 continue
             if funds < FUNDS_RESERVE and econ_pending:
                 continue
@@ -470,6 +473,16 @@ class Executor:
                     self.log("status", "⚙ LLM沉默，自动向地图中心推进侦察")
 
         return cmds
+
+    def _q(self, fac, now):
+        """工厂队列长度：q 字段缺失时（多标签工厂反射失败）用本地近 45s 发车数估计。"""
+        q = fac.get("q")
+        if q is not None:
+            return q
+        hist = self.train_hist.setdefault(fac["id"], deque())
+        while hist and now - hist[0] > 45:
+            hist.popleft()
+        return len(hist)
 
     def _pick_builder(self, idle_builders, for_factory=False):
         """盖工厂优先派战斗工程师（直接建 T2 厂省升级时间），否则第一个空闲建造者。"""
