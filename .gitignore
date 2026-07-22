@@ -8,6 +8,7 @@ decompile.log
 # 编译产物
 agent/classes/
 agent/dist/
+agent/lib/
 agent/sources.txt
 agent/manifest.txt
 tools/*.class
@@ -16,6 +17,7 @@ tools/vineflower.jar
 # 运行产物
 agent/logs/
 tools/pedia-dump.json
+tools/defense_sample.json
 bridge/__pycache__/
 bridge/activity.jsonl
 bridge/control.json

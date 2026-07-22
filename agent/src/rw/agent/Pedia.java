@@ -44,6 +44,7 @@ public final class Pedia {
                   .append(",\"building\":").append(t.j())
                   .append(",\"builder\":").append(t.l())
                   .append(",\"move\":\"").append(t.o() == null ? "?" : t.o().name()).append('"');
+                appendFootprint(sb, t);
                 try {
                     am sample = am.a(t);
                     if (sample != null) {
@@ -102,6 +103,34 @@ public final class Pedia {
             return d == null ? "" : d;
         } catch (Throwable ex) {
             return "";
+        }
+    }
+
+    /**
+     * 建筑占地导出：constructionFootprint（custom.l.cY，放置校验同款 Rect，闭区间
+     * 相对锚点格偏移），宽=c-a+1 格、高=d-b+1 格；非 custom 类型兜底 am.a(t).cd()。
+     * 槽位网格按此为每种建筑分配空间。
+     */
+    private static void appendFootprint(StringBuilder sb, as t) {
+        try {
+            android.graphics.Rect r = null;
+            if (t instanceof com.corrodinggames.rts.game.units.custom.l) {
+                r = ((com.corrodinggames.rts.game.units.custom.l) t).cY;
+            } else {
+                am sample = am.a(t);
+                if (sample != null) {
+                    r = sample.cd();
+                }
+            }
+            if (r == null) {
+                return;
+            }
+            sb.append(",\"fp\":{\"w\":").append(r.c - r.a + 1)
+              .append(",\"h\":").append(r.d - r.b + 1)
+              .append(",\"ox\":").append(r.a)
+              .append(",\"oy\":").append(r.b)
+              .append('}');
+        } catch (Throwable ignored) {
         }
     }
 

@@ -9,6 +9,10 @@ public final class AiState {
     public static volatile boolean panelVisible = true;
     /** 节拍覆盖（秒），0 = 自动（自适应） */
     public static volatile float intervalOverride = 0f;
+    /** 角色开关（设置面板）：总指挥/建造/战斗，默认全开 */
+    public static volatile boolean cmdCommander = true;
+    public static volatile boolean cmdBuild = true;
+    public static volatile boolean cmdCombat = true;
     /** 委托单位 id 池（游戏内[委托选中]按钮/框选添加） */
     public static final java.util.Set<Long> delegatedIds =
         java.util.Collections.synchronizedSet(new java.util.HashSet<Long>());
@@ -27,6 +31,9 @@ public final class AiState {
             + ",\"panel\":" + panelVisible
             + ",\"interval\":" + intervalOverride
             + ",\"controlAll\":" + controlAll
+            + ",\"cmdCommander\":" + cmdCommander
+            + ",\"cmdBuild\":" + cmdBuild
+            + ",\"cmdCombat\":" + cmdCombat
             + ",\"delegatedCount\":" + n
             + ",\"groups\":\"" + Commands.delegatedSlotsString() + "\"}");
     }

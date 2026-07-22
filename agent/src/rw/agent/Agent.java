@@ -29,6 +29,11 @@ public final class Agent {
         }
         Log.init(logPath);
         Log.info("premain ok, args=" + args);
+        try {
+            inst.addTransformer(new Hooks()); // 按键/滚轮 hook（聊天输入框用；失败自动降级）
+        } catch (Throwable t) {
+            Log.error("hooks register failed", t);
+        }
         NetServer.start();
         Thread t = new Thread(new Bootstrap(), "rw-agent-bootstrap");
         t.setDaemon(true);
