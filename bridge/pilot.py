@@ -23,6 +23,7 @@ import summarize
 import executor as exec_mod
 import spawns
 import danger as danger_mod
+import connmap
 
 try:  # Windows GBK 控制台打印 ✓/✗/⚙ 等字符会崩线程，统一改 UTF-8+替换
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -726,8 +727,9 @@ def main():
         executor = exec_mod.Executor(map_msg, pedia, log_activity)
         executor.auto_military = bool(cfg.get("auto_military", False))
 
-    # 地图识别：出生点解析（tmx）+ 动态危险区
+    # 地图识别：出生点解析（tmx）+ 动态危险区 + 陆地连通域
     danger_map = danger_mod.DangerMap()
+    conn_comp, conn_n = connmap.build_components(map_msg.get("rows", []))
     own_cc0 = next((u for u in (link.snapshot() or {}).get("own", []) if u["t"] == "commandCenter"), None)
     mine_spawn, enemy_spawns = spawns.friendly_spawns(
         map_msg.get("path", ""), (own_cc0["x"], own_cc0["y"]) if own_cc0 else None)
@@ -820,6 +822,7 @@ def main():
             failed_temp.clear()
             new_map = link.map_message()
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
+            conn_comp, conn_n = connmap.build_components((new_map or {}).get("rows", []))
             danger_map = danger_mod.DangerMap()
             own_cc0 = next((u for u in (new_map and link.snapshot() or {}).get("own", [])
                             if u["t"] == "commandCenter"), None)
@@ -922,9 +925,21 @@ def main():
             continue
         if executor is not None:
             front = danger_map.front_status()
+            conn_txt = ""
+            if conn_comp and snap.get("enemy") and getattr(smz, "home", None):
+                tw, th = map_msg["tileW"], map_msg["tileH"]
+                hc = connmap.comp_at(conn_comp, smz.home["x"], smz.home["y"], tw, th)
+                tgt = min(snap["enemy"], key=lambda e: (e["x"] - smz.home["x"]) ** 2 + (e["y"] - smz.home["y"]) ** 2)
+                tc = connmap.comp_at(conn_comp, tgt["x"], tgt["y"], tw, th)
+                if tc >= 0 and tc == hc:
+                    (wx, wy), dd = connmap.path_hint(conn_comp, hc, tgt["x"], tgt["y"], tw, th)
+                    conn_txt = f"【连通】最近敌区陆地可达：建议绕行点({int(wx)},{int(wy)})（距目标约{int(dd)}px）"
+                else:
+                    conn_txt = "【连通】最近敌区陆军不可达（被水/崖隔断），需两栖/空军/机甲或绕行他路"
             text += ("\n\n【战略格】o=我方 数字=敌数 X=混居 其余为地形\n" + strategic_grid(map_msg, snap)
                      + "\n【执行层】 " + executor.status_line(snap)
                      + (f"\n【前线】 {front}" if front != "unknown" else "")
+                     + (f"\n{conn_txt}" if conn_txt else "")
                      + "\n[系统提示] 本回合必须包含一个实质动作（attack/attack_nearest/harass/defend_home/expand/build_army）。")
             if alerts:
                 text += "\n⚠ 正在交战：本回合必须包含军事动词（attack/attack_nearest/harass/defend_home），不知道打哪就 attack_nearest，只查资料或只发展视为失误。"
