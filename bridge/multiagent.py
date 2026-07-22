@@ -11,6 +11,7 @@
 - 注意：本模块严禁 import pilot（pilot 以 __main__ 运行，import 会重执行 main）；pilot 的函数经 ctx 传入
 """
 import json
+import re
 import threading
 import time
 from collections import deque
@@ -33,14 +34,18 @@ APM_CAP = {"combat": 25, "build": 15}  # 每分钟（reflex 不计，与 pilot �
 
 
 def _train_domain(text):
-    """train 回执归属：军产（u_ 且非支援）归战斗域，支援单位与升级（无 u_ 前缀）归建造域。
-    注意 u_builderShip 是 u_builder 的超串，必须先判。"""
-    for a in ("u_builderShip", "u_builder", "u_combatEngineer", "u_mechEngineer", "u_fabricator"):
-        if a in text:
+    """train 回执归属：按"被 train 的动作"判域——失败回执的可用列表含 u_builder 等
+    干扰词（曾把战斗域的 u_heavyTank 回执误判给建造域，学习封禁全落空）。"""
+    m = re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", text)
+    if not m:
+        m = re.search(r"train\s+([A-Za-z0-9_]+)", text)
+    if m:
+        a = m.group(1)
+        if a in ("u_builderShip", "u_builder", "u_combatEngineer", "u_mechEngineer", "u_fabricator"):
             return "build"
-    if "u_" in text:
-        return "combat"
-    return "build"
+        if a.startswith("u_"):
+            return "combat"
+    return "build"  # 升级/无法识别默认建造域
 
 _QUERY_TOOL = {
     "type": "function",
@@ -143,6 +148,9 @@ class SharedState:
         self.enemy_spawns = ctx.get("enemy_spawns") or []
         self.plan = ""                # 作战计划书（总指挥维护）
         self.plan_ts = 0.0
+        self.site_blocks = {}         # 建造点位黑名单 (gx,gy)->解封时间（反射召回的敌区点，10 分钟）
+        self.requests = deque(maxlen=6)  # 跨域需求板（如 战斗→建造 的 T2 升级需求）
+        self.last_rally = None        # 上次集结点（同值去重，防每轮重发）
         self.pending = {"commander": deque(maxlen=8), "build": deque(maxlen=8),
                         "combat": deque(maxlen=8)}  # 玩家留言/系统提示，按路分发
         self.danger_map = ctx["danger_map"]
@@ -181,8 +189,8 @@ def _sys_commander(ctx, st):
 【经济】采集器目标数、建造重点（厂型与顺序）、是否上海军/实验厂
 【配兵】军队构成方针（主战/防空/远程比例与具体兵种，针对敌方构成；兵种克制不确定就 query 查武器数据）
 【攻防】姿态(attack/defend/expand)与主攻方向（坐标或方位），以及何时转攻
-【布局】厂区/防线/后勤的安排
-计划书要可被直接执行：给方向不给微操。只输出计划书本身，不要寒暄。"""
+【布局】写到坐标级可执行：厂区方位、防线弧（锚点坐标+每阶段座数+前推时机）、后勤安排、扩张方向
+计划书要可被直接执行：给方向不给微操。以稳为先——没有实质局势变化只微调；变更主攻方向必须在【攻防】里给一句局势理由。只输出计划书本身，不要寒暄。"""
 
 
 def _sys_build(ctx, st):
@@ -199,7 +207,7 @@ def _sys_build(ctx, st):
 【纪律】
 - 选址一律省略坐标：系统按布局落位（工厂在主基地侧翼成行、后勤建筑在主基地背后成排、海厂在近水、采集器在最近空闲资源点）。只有明确知道该建哪才给坐标。
 - 建造是有时间的：prog<1 是建造中，完工前工厂不能生产；建造者施工中(build@/repair→)不要派新活，用"空闲可派活"的建造者。
-- 资金纪律：资金 <700 时只建采集器；同类工厂最多 3 座（先满产/升级再扩）；每厂队列最多 2~3 个。
+- 资金纪律：资金 <700 时只建采集器；工厂按需扩建（队列长期≥2 且有钱就扩，别一口气盖一排，也别死守 3 座上限）；每厂队列最多 2~3 个。
 - 经济优先级：采集器(到计划书目标数) > 首座工厂 > 扩厂/升级 > 炮塔；战斗工程师 1~2 个（能直接建 T2 厂省升级）。
 - 支援单位生产（你的专属）：建造者保持 3~4 个（有≥2 个闲置就先派活再产）；水图且有空闲水池时产 1~2 个海上建造者去建水池采集器。
 - 升级时机：采集器达标且资金 >2600 开始升经济建筑，工厂资金 >4500 再升。
@@ -221,7 +229,7 @@ def _sys_combat(ctx, st):
 - 禁止军队闲置：构成成型且视野无敌情时，按计划书主攻方向推进/侦察；连续两轮不动是不允许的。
 - 小队残血或被围就 defend_home，别硬拼；撤退后补满再按计划书打回去。
 - 兵力没到临界（<6 个战斗单位）不决战，先在集结点蓄势。
-- 你只给方向，微观走位/集火由游戏AI完成；attack/harass 时纯水上单位会自动拆分走水路，纯防空会自动殿后。
+- 你只给方向，微观走位/集火由游戏AI完成；attack/harass 时纯水上单位会自动拆分走水路，纯防空单位随军行动（充当防空火力）。
 - 军产纪律：工厂是你的兵源——按目标构成用 train 持续补队列（每厂 2~3 个，别让工厂空转）；防空占比≤25%（防空是配角）；T2 厂只产 T2 兵（同价更强）。生产与战斗不冲突，有空就补。
 - 用 set_composition 针对敌方构成调兵（敌空军多补防空、敌龟缩补远程炮、敌盾厚上闪电系）；兵种武器数据拿不准用 query 查（对地/对空/伤害/射程都有）。
 - 严格按《作战计划书》的攻防小节执行；计划书明显过时（如主攻方向已被推平）时按现状决断并在 note 说明。"""
@@ -243,6 +251,13 @@ def _combat_status(ctx, st, snap):
 
 def _user_build(ctx, st, snap, text, receipts):
     parts = [text]
+    ex = ctx["exec_holder"].get("ex")
+    comp = (ex.army_goal.get("composition") if ex else None) or {}
+    if comp:
+        parts.append("战斗域目标构成（信息参考：工厂升级优先满足其 T2 需求）: "
+                     + ",".join(f"{k}:{v}" for k, v in comp.items()))
+    if st.requests:
+        parts.append("跨域需求板（按需处理）: " + " | ".join(list(st.requests)[-4:]))
     if st.plan:
         parts.append("【作战计划书】\n" + st.plan)
     if receipts:
@@ -304,6 +319,24 @@ def _drain(st, who):
     return out
 
 
+# ---------- 游戏内聊天台推送 ----------
+
+_push_last = {}
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿]")  # 游戏字体无 emoji 字形（推送前剥掉，防豆腐块）
+
+
+def _push_chat(ctx, who, text):
+    """往游戏内聊天台推一行（NDJSON overlay chat 通道）。限速 1s/路，断连静默。"""
+    now = time.time()
+    if now - _push_last.get(who, 0) < 1.0:
+        return
+    _push_last[who] = now
+    try:
+        ctx["link"].send({"cmd": "overlay", "who": who, "chat": _EMOJI_RE.sub("", str(text))})
+    except Exception:
+        pass
+
+
 # ---------- 指令翻译与守卫 ----------
 
 def _facs(snap):
@@ -354,13 +387,24 @@ def _translate_build(ctx, st, name, args, snap, g):
         if cmd.get("x") is not None and btype.startswith("extractor") \
                 and st.danger_map.danger(cmd["x"], cmd["y"], fresh):
             return None, f"✗ build {action}: 目标点在敌区（危险记忆），从空闲池里换一个安全点"
+        # 点位黑名单：近 10 分钟有建造者在此被反射召回（敌区），直接拦截换点
+        if cmd.get("x") is not None:
+            gkey = (int(cmd["x"] // 400), int(cmd["y"] // 400))
+            if snap_time < st.site_blocks.get(gkey, 0):
+                return None, f"✗ build {action}: 该点刚有建造者被敌区召回（10 分钟禁建），换其他位置"
         g["recent_builds"][btype] = snap_time
         return cmd, f"build({action})"
     if name == "train":
         action = str(args.get("action", ""))
         fid = int(args.get("factory", -1))
+        # LLM 常省略 u_ 前缀（heavyTank → u_heavyTank），先归一化再判域
+        if action and not action.startswith(("u_", "b_", "c_", "s_")) \
+                and ("u_" + action) in ctx["known_actions"]:
+            action = "u_" + action
         if action.startswith("u_") and action not in SUPPORT_PROD:
             return None, f"✗ train {action}: 战斗单位生产归战斗 agent（你只管建造者/工程师/机械师与升级）"
+        if snap_time < g.get("action_bad", {}).get(action, 0):
+            return None, f"✗ train {action}: 回执学习封禁中（刚被游戏判不可用），换别的或等解封"
         if action not in known:
             g["fail_perm"].add(("train", action))
             return None, f"✗ train action={action}: 非法ID，本局不要再试"
@@ -377,25 +421,27 @@ def _translate_build(ctx, st, name, args, snap, g):
 
 
 def _slot_for(ctx, st, snap, btype):
-    """布局槽位服务：给建造指令一个确定性落位（executor autopilot 关闭后照样可用）。"""
+    """布局槽位服务：给建造指令一个确定性落位（executor autopilot 关闭后照样可用）。
+    有槽位网格（fp 占地表）时按网格整齐落位。"""
     ex = ctx["exec_holder"].get("ex")
     cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter" and u.get("bld")), None)
     if not ex or not cc:
         return None
     if btype == "extractorT1" or btype.startswith("extractor"):
         return None  # 采集器交给 agent 资源点九宫格选址
+    occ = ex._occupancy(snap)
     if "actory" in btype.lower():
         if btype == "seaFactory":
             return ex.water_anchor(cc)
         facs = [u for u in _facs(snap) if u["t"] != "commandCenter"]
         land = [u for u in facs if u["t"] == "landFactory"]
         idx = sum(1 for u in facs if u["t"] != "seaFactory")
-        return ex.factory_slot(cc, idx, land)
+        return ex.factory_slot(cc, idx, land, occ=occ, btype=btype)
     if btype.startswith("fabricator") or "experimental" in btype.lower() or btype == "repairbay":
         idx = sum(1 for u in snap.get("own", []) if u.get("bld")
                   and (u["t"].startswith("fabricator") or "experimental" in u["t"].lower()
                        or u["t"] == "repairbay"))
-        return ex.misc_slot(cc, idx)
+        return ex.misc_slot(cc, idx, occ=occ, btype=btype)
     return None  # 炮塔等：agent 以主基地为锚螺旋选址
 
 
@@ -406,8 +452,14 @@ def _translate_combat(ctx, st, name, args, snap, g):
     if name == "train":  # 军产归战斗（构成是它定的，生产就归它管）；支援单位与升级归建造域
         action = str(args.get("action", ""))
         fid = int(args.get("factory", -1))
+        # LLM 常省略 u_ 前缀（heavyTank → u_heavyTank），先归一化再判域
+        if action and not action.startswith(("u_", "b_", "c_", "s_")) \
+                and ("u_" + action) in ctx["known_actions"]:
+            action = "u_" + action
         if action in SUPPORT_PROD or not action.startswith("u_"):
             return None, f"✗ train {action}: 支援单位/升级归建造 agent（你只管战斗单位生产）"
+        if time.time() < g.get("action_bad", {}).get(action, 0):
+            return None, f"✗ train {action}: 回执学习封禁中（刚被游戏判不可用），换别的或等解封"
         if action not in ctx["known_actions"]:
             g["fail_perm"].add(("train", action))
             return None, f"✗ train action={action}: 非法ID（必须原样取自动作表），本局不要再试"
@@ -435,11 +487,8 @@ def _translate_combat(ctx, st, name, args, snap, g):
             tgt = min(es, key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)
             cmd = {"cmd": "attackmove", "x": float(tgt["x"]), "y": float(tgt["y"])}
         else:
-            cx = cy = None
             cmd = {"cmd": "attackmove", "x": st.world_w / 2, "y": st.world_h / 2}  # 无敌情向图心推进
         _arm_attack(ctx, snap, cmd)
-        aa_c = (cx, cy) if cx is not None else (None, None)
-        ctx["aa_follow"](link, snap, cmd, aa_c[0], aa_c[1])
         return cmd, "attack_nearest()"
     if name == "defend_home":
         home = _home(snap)
@@ -455,6 +504,9 @@ def _translate_combat(ctx, st, name, args, snap, g):
     if name == "rally":
         rx = ctx["clamp"](float(args.get("x", 0)), 0, st.world_w)
         ry = ctx["clamp"](float(args.get("y", 0)), 0, st.world_h)
+        if st.last_rally and (rx - st.last_rally[0]) ** 2 + (ry - st.last_rally[1]) ** 2 < 100 ** 2:
+            return None, f"rally({rx:.0f},{ry:.0f})（未变，跳过）"  # 同值去重，防每轮重发烧 APM
+        st.last_rally = (rx, ry)
         facs = [u for u in _facs(snap) if u.get("prog", 1) >= 1]
         ex = ctx["exec_holder"].get("ex")
         if ex:
@@ -466,23 +518,28 @@ def _translate_combat(ctx, st, name, args, snap, g):
         ex = ctx["exec_holder"].get("ex")
         comp = args.get("composition") or {}
         if ex:
+            # 归一化后与现值相同则跳过（防每轮重设同一构成）
+            norm = {}
+            for k, v in comp.items():
+                key = str(k)
+                if key in ex.known_prod:
+                    norm[key] = int(v)
+                elif ("u_" + key) in ex.known_prod:
+                    norm["u_" + key] = int(v)
+            if norm == (ex.army_goal.get("composition") or {}):
+                return None, "set_composition（未变，跳过）"
             ex.set_army_goal(composition=comp)
         return None, f"set_composition({comp})"
     return None, None
 
 
 def _arm_attack(ctx, snap, cmd):
-    """attack/harass 共用：地面编队 + 海军拆分 + 纯防空殿后。"""
+    """attack/harass 共用：地面编队（含纯防空随军）+ 海军拆分。"""
     delegated = set(snap.get("delegated", []))
     gids = ctx["ground_combat_ids"](snap, delegated)
     if gids:
         cmd["units"] = gids
     ctx["naval_split"](ctx["link"], snap, cmd, gids, ctx["map_msg_holder"]["m"], ctx["naval_types"])
-    squad = [u for u in snap.get("own", []) if u["id"] in delegated and not u.get("bld")]
-    if squad:
-        cx = sum(u["x"] for u in squad) / len(squad)
-        cy = sum(u["y"] for u in squad) / len(squad)
-        ctx["aa_follow"](ctx["link"], snap, cmd, cx, cy)
 
 
 def _home(snap):
@@ -502,8 +559,9 @@ def _apm_ok(win, cap):
     return len(win) < cap
 
 
-def _drain_receipts(link, role):
-    """按指令域取回执（别的域留在队列）；train 无独立域，按动作细分（_train_domain）。"""
+def _drain_receipts(ctx, link, role):
+    """按指令域取回执（别的域留在队列）；train 无独立域，按动作细分（_train_domain）。
+    建造域回执同步喂 executor 老学习（动作封禁/池点判死）。"""
     mine, rest = [], deque(maxlen=20)
     with link.lock:
         while link.cmd_results:
@@ -513,7 +571,32 @@ def _drain_receipts(link, role):
                 else c in role["kinds"]
             (mine if hit else rest).append(r)
         link.cmd_results.extend(rest)
+    ex = ctx["exec_holder"].get("ex")
+    if ex and role["name"] == "build":
+        ex.on_cmd_results(list(mine))
     return [("✓ " if r.get("ok") else "✗ ") + (r.get("msg") or "") for r in mine]
+
+
+def _learn_receipts(role, receipts, g, st):
+    """失败回执自学习（executor 老机制的搬运）：
+    - "没有此动作: X" → 动作封 300s（防每分钟撞同一堵墙）
+    - "不可用（科技/条件不满足）: X" → 120s
+    战斗域 u_ 动作缺失 → 跨域需求板挂 T2 升级需求（建造域可见）。"""
+    now = time.time()
+    for r in receipts:
+        if r.startswith("✓ "):
+            continue
+        m = re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", r)
+        if m:
+            act = m.group(1)
+            # u_ 军产封 120s（工厂升级后要放行，别误伤新 T2 厂）；升级类 300s
+            g.setdefault("action_bad", {})[act] = now + (120 if act.startswith("u_") else 300)
+            if role["name"] == "combat" and act.startswith("u_"):
+                st.requests.append(f"战斗域需要工厂升级/科技以生产 {act}（回执：没有此动作）")
+            continue
+        m = re.search(r"不可用（科技/条件不满足）[:：]\s*([A-Za-z0-9_]+)", r)
+        if m:
+            g.setdefault("action_bad", {})[m.group(1)] = now + 120
 
 
 def _answer_queries(ctx, st, msg, snap, rounds_left):
@@ -564,14 +647,15 @@ def _agent_loop(ctx, st, role):
             if not snap or not snap.get("team") or snap["team"].get("ai"):
                 time.sleep(1.5)  # 无快照/AI 观战局（本地队由游戏AI控制）：不动作
                 continue
-            if not ctx["ai_enabled"]():
-                time.sleep(1.5)
+            if not ctx["ai_enabled"]() or not ctx["role_enabled"](role["name"]):
+                time.sleep(1.5)  # AI 总开关或本角色被设置面板关闭：不动作
                 continue
             if role["name"] != "commander" and not snap.get("delegated"):
                 time.sleep(1.5)  # 无委托单位：等玩家接管
                 continue
             text, alerts = smz.summarize(snap)
-            receipts = _drain_receipts(link, role)
+            receipts = _drain_receipts(ctx, link, role)
+            _learn_receipts(role, receipts, g, st)
             user = role["make_user"](ctx, st, snap, text, alerts, receipts)
             msgs = [system] + list(history) + [{"role": "user", "content": user}]
             msg = llm.chat(cfg["base_url"], ctx["api_key"], role["model"], msgs,
@@ -599,10 +683,13 @@ def _agent_loop(ctx, st, role):
                 msg = llm.chat(cfg["base_url"], ctx["api_key"], role["model"], msgs,
                                None, timeout=role["timeout"])
             if not calls and role["verbs"]:
-                # 无工具调用=空过：追问一次强制动作（chat 模型爱只分析不动手）
+                # 无工具调用=空过：升级 reasoner 追问（chat 分析癖的兜底，快慢阶梯的关键一跳）
+                retry_model = role.get("ladder_model") or role["model"]
+                if retry_model != role["model"]:
+                    ctx["log_activity"]("status", f"{role['icon']} {role['name']}: chat 空转，升级 reasoner")
                 msgs.append({"role": "user", "content":
                              "[系统强制] 本回合必须至少调用一个工具（指令或 note），不允许只回复文本。"})
-                msg = llm.chat(cfg["base_url"], ctx["api_key"], role["model"], msgs,
+                msg = llm.chat(cfg["base_url"], ctx["api_key"], retry_model, msgs,
                                role["tools"], timeout=role["timeout"])
                 calls = msg.get("tool_calls") or []
             executed, blocked, note_parts = [], [], []
@@ -612,6 +699,7 @@ def _agent_loop(ctx, st, role):
                     st.plan = plan
                     st.plan_ts = time.time()
                     ctx["log_activity"]("status", f"📋 总指挥更新作战计划书（{len(plan)}字）")
+                    _push_chat(ctx, "commander", "📋 " + plan)
                     print(f"[commander] 计划书已更新（{len(plan)}字）")
                     executed.append(f"计划书v{int(st.plan_ts) % 10000}")
                 elif plan:
@@ -648,7 +736,6 @@ def _agent_loop(ctx, st, role):
                 if cmd is not None:
                     if link.send(cmd):
                         apm.append(time.time())
-                        time.sleep(0.35)
                     else:
                         break
                 if desc and desc.startswith("✗"):
@@ -686,9 +773,18 @@ def _agent_loop(ctx, st, role):
                       f" 动作: {','.join(executed) or '无'}")
             ctx["log_activity"]("status",
                                 f"{role['icon']} {role['name']}: {', '.join(executed) or '无动作'}")
+            if executed or blocked:
+                line = ", ".join(executed + (["✗" + b for b in blocked] if blocked else []))
+                _push_chat(ctx, role["name"], f"{role['icon']} {line}")
+            elif note_parts:
+                # 空转可见性：思考/分析也上聊天台（ truncated ），让用户分得清"在想"还是"死了"
+                _push_chat(ctx, role["name"], f"{role['icon']} 💭 " + " ".join(note_parts)[:120])
+            else:
+                _push_chat(ctx, role["name"], f"{role['icon']} 观察中（无实质动作）")
         except llm.LlmError as e:
             print(f"[{role['name']}] LLM 调用失败: {e}")
             ctx["log_activity"]("error", f"{role['icon']} {role['name']} LLM失败: {e}")
+            _push_chat(ctx, "system", f"{role['icon']} {role['name']} LLM失败: {e}")
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -717,17 +813,17 @@ def _roles(ctx):
         {"name": "build", "icon": "🔨", "model": fast, "tools": BUILD_TOOLS,
          "kinds": BUILD_KINDS, "verbs": {"build", "train"}, "plan_sink": False, "apm_kind": "build",
          "stagger": 4.0, "cadence": lambda: float(cfg.get("build_interval_sec", 10)),
-         "timeout": int(cfg["timeout_sec"]),
+         "timeout": int(cfg["timeout_sec"]), "ladder_model": cfg["model"],  # 空转升 reasoner
          "make_system": _sys_build,
          "make_user": lambda c, s, snap, text, alerts, rc: _user_build(c, s, snap, text, rc),
          "translate": _translate_build},
-        {"name": "combat", "icon": "⚔", "model": cfg["model"], "tools": COMBAT_TOOLS,
-         # 战斗要果断：deepseek-chat 实测优柔寡断不敢进攻（config 注释），必须用 reasoner
+        {"name": "combat", "icon": "⚔", "model": fast, "tools": COMBAT_TOOLS,
+         # chat 快层（10-25s）+ reasoner 兜底（空转升级）：军事反应不再吃 reasoner 的 40-70s
          "kinds": COMBAT_KINDS, "verbs": {"attack", "harass", "attack_nearest", "defend_home",
                                           "rally", "set_composition", "stop", "train"},
          "plan_sink": False, "apm_kind": "combat",
          "stagger": 7.0, "cadence": lambda: float(cfg.get("combat_interval_sec", 6)),
-         "timeout": max(int(cfg["timeout_sec"]), 90),
+         "timeout": int(cfg["timeout_sec"]), "ladder_model": cfg["model"],  # 空转升 reasoner
          "make_system": _sys_combat,
          "make_user": _user_combat,
          "translate": _translate_combat},
@@ -737,6 +833,20 @@ def _roles(ctx):
 def start(ctx):
     """建共享状态 + 三个 agent 循环线程（daemon）。返回 SharedState。"""
     st = SharedState(ctx)
+    # 反射事件闭环：建造者召回 → 建造点位黑名单(10min)+建造待读；小队反射 → 战斗待读
+    reflex = ctx["reflex"]
+
+    def _on_recall(bid, tx, ty):
+        st.site_blocks[(int(tx // 400), int(ty // 400))] = time.time() + 600
+        st.pending["build"].append(
+            f"[系统通报] 你派往 ({int(tx)},{int(ty)}) 的建造者#{bid} 被系统反射召回（敌区），"
+            f"该点附近 10 分钟内禁止再建，请换安全位置。")
+
+    def _on_squad(text):
+        st.pending["combat"].append("[系统通报] " + text)
+
+    reflex.on_builder_recall = _on_recall
+    reflex.on_squad_reflex = _on_squad
     for role in _roles(ctx):
         threading.Thread(target=_agent_loop, args=(ctx, st, role),
                          daemon=True, name=f"rw-{role['name']}").start()
@@ -764,6 +874,9 @@ def supervisor_loop(ctx, st):
                         st.world_h = (new_map.get("tilesH", 0) or 0) * (new_map.get("tileH", 0) or 0)
                         ctx["map_msg_holder"]["m"] = new_map
                         st.plan = ""
+                        st.site_blocks.clear()
+                        st.requests.clear()
+                        st.last_rally = None
                         st.conn_comp, st.conn_n = connmap.build_components(new_map.get("rows", []))
                         st.danger_map = danger_mod.DangerMap()
                         own_cc0 = next((u for u in (link.snapshot() or {}).get("own", [])
@@ -775,6 +888,7 @@ def supervisor_loop(ctx, st):
                             st.danger_map.seed_bases(st.enemy_spawns)
                     ex = exec_mod.Executor(new_map, ctx["pedia"], ctx["log_activity"])
                     ex.autopilot = False
+                    ex.routine = bool(ctx["cfg"].get("routine_layer", True))  # 规则快层：例行+炮塔弧
                     ex.dmap = st.danger_map
                     ctx["exec_holder"]["ex"] = ex
                     ctx["reflex"].dmap = st.danger_map
@@ -797,6 +911,7 @@ def supervisor_loop(ctx, st):
                     msg = link.user_msgs.popleft()
                 st.broadcast(f"【玩家留言】（优先级最高，照做并说明怎么执行）: {msg}")
                 ctx["log_activity"]("chat", f"💬 玩家: {msg}")
+                _push_chat(ctx, "player", f"💬 {msg}")
         except Exception as e:
             print(f"[multiagent] 督导异常: {e}")
 

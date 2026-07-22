@@ -5,7 +5,8 @@ model = "deepseek-reasoner"   # 推理型：deepseek-chat 实测优柔寡断不�
 
 use_executor = true        # 执行层托管经济/生产/升级（false 回退纯 LLM 微操）；LLM_OFF=1 环境变量可跳过 LLM 纯跑执行层
 multi_agent = true         # 多 agent 架构：总指挥+建造/战斗三循环并行（建造也归 LLM；executor 退为执行内核只做跟踪/抢修/槽位）
-model_fast = "deepseek-chat"  # 建造/战斗 agent 用快模型（5-10s 级）；总指挥仍用上面的 model（reasoner）
+routine_layer = true       # 规则快层（多 agent 模式）：executor 例行执行（建造者维持/采集器补池/炮塔弧跟随集结点），2s 级
+model_fast = "deepseek-chat"  # 建造/战斗 agent 起步模型（空转自动升级 model=reasoner 兜底）
 commander_interval_sec = 50 # 总指挥节拍：多久修订一次《作战计划书》
 build_interval_sec = 10    # 建造 agent 节拍
 combat_interval_sec = 6    # 战斗 agent 节拍（警报时由 fast_interval_sec 兜底）

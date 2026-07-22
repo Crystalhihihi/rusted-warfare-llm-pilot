@@ -24,6 +24,9 @@ class Reflex:
         self.defend_cd = 0.0
         self.dmap = None              # DangerMap（pilot 注入）
         self.builder_recall_cd = {}   # 建造者id -> 召回冷却
+        # 事件钩子（multiagent 注入；pilot 单 LLM 模式留 None）
+        self.on_builder_recall = None  # fn(builder_id, tx, ty)：建造者赴险被召回（含目标点）
+        self.on_squad_reflex = None    # fn(text)：小队撤退/基地回防（通报战斗 agent）
 
     @staticmethod
     def _centroid(units):
@@ -55,6 +58,9 @@ class Reflex:
                 self.retreat_cd = now + RETREAT_COOL
                 if send({"cmd": "move", "x": hx, "y": hy}):
                     self.log("alert", f"⚡ 反射：小队受击撤退（血量 -{drop * 100:.0f}%）")
+                    if self.on_squad_reflex:
+                        self.on_squad_reflex(f"系统反射：小队受击已撤退回家（血量 -{drop * 100:.0f}%），"
+                                             f"{int(RETREAT_COOL)}s 冷却内勿立刻反扑")
         self.prev_hp = hp
         self.prev_ts = now
 
@@ -65,6 +71,9 @@ class Reflex:
                 self.defend_cd = now + DEFEND_COOL
                 if send({"cmd": "move", "x": hx, "y": hy}):
                     self.log("alert", f"⚡ 反射：基地遇袭回防（敌 {len(threat)} 个逼近）")
+                    if self.on_squad_reflex:
+                        self.on_squad_reflex(f"系统反射：基地遇袭已拉回小队回防（敌 {len(threat)} 个逼近），"
+                                             f"{int(DEFEND_COOL)}s 冷却内勿再外派")
 
         # 3) 建造者召回：赶路去危险区的建造者立即撤回（act=build@(x,y) 且目标点危险）
         if self.dmap is not None:
@@ -82,3 +91,5 @@ class Reflex:
                     self.builder_recall_cd[u["id"]] = now + 20.0
                     if send({"cmd": "move", "units": str(u["id"]), "x": hx, "y": hy}):
                         self.log("alert", f"⚡ 反射：召回赴险建造者#{u['id']}（目标点在敌区）")
+                        if self.on_builder_recall:
+                            self.on_builder_recall(u["id"], tx, ty)

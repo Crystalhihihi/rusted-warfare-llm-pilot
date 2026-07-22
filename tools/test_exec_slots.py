@@ -39,9 +39,9 @@ c1 = e1.tick(snap([cc, b1, b2, b3, bs, ext1, ext2], 5000))
 assert e1.is_naval_map() is True, "S1 应判为水图"
 fac = [c for c in c1 if c.get("action") == "b_landFactory"]
 assert len(fac) == 2, f"S1 应盖两座厂: {c1}"
-# front = (1000-1500,0)→(-1,0)，flank=(0,-1)：槽0=(1500,740) 槽1=(1500,570)
-assert (fac[0]["x"], fac[0]["y"]) == (1500.0, 740.0), f"S1 首厂槽位错: {fac[0]}"
-assert (fac[1]["x"], fac[1]["y"]) == (1500.0, 570.0), f"S1 次厂槽位错: {fac[1]}"
+# 网格槽位：front=(-1,0)，flank=(0,-1)，13 格起、fp 默认 2x2 贴死排
+assert (fac[0]["x"], fac[0]["y"]) == (1510.0, 750.0), f"S1 首厂槽位错: {fac[0]}"
+assert (fac[1]["x"], fac[1]["y"]) == (1510.0, 670.0), f"S1 次厂槽位错: {fac[1]}"
 wext = [c for c in c1 if c.get("action") == "b_extractorT1" and c["x"] == 200.0]
 assert wext and wext[0]["builder"] == bs["id"], f"S1 水池采集应派 builderShip: {c1}"
 land_ext = [c for c in c1 if c.get("action") == "b_extractorT1" and c["x"] == 1300.0]
@@ -82,5 +82,27 @@ ces3 = [U("combatEngineer", 1600, 1000), U("combatEngineer", 1610, 1000)]
 c4 = e3.tick(snap([cc3] + b3s + exts3 + facs3 + [fab] + ces3, 25000))
 exp = [c for c in c4 if c.get("action") == "b_experimentalLandFactory"]
 assert exp and (exp[0]["x"], exp[0]["y"]) == (2080.0, 1000.0), f"S3 实验厂后勤槽位错: {c4}"
-print("S3 OK:", [c for c in c4 if c["cmd"] == "build"])
+# ---- S4：规则快层（多 agent 模式：autopilot=False + routine=True） ----
+e4 = ex.Executor(mk_map(water_cols=0), {}, log)
+e4.autopilot = False
+e4.routine = True
+cc4 = U("commandCenter", 1500, 1000, bld=True, q=0)
+bs4 = [U("builder", 1500 + i * 10, 1000) for i in range(2)]
+ext4 = U("extractorT1", 1400, 1000, bld=True)
+fac4 = U("landFactory", 1500, 740, bld=True, q=2)
+own4 = [cc4] + bs4 + [ext4, fac4]
+snap4 = snap(own4, 5000)
+snap4["delegated"] = [u["id"] for u in own4]
+e4.set_army_goal(rally=(2000.0, 1000.0))
+c5 = e4.tick(snap4)
+kinds = [(c["cmd"], c.get("action")) for c in c5]
+assert ("train", "u_builder") in kinds, f"规则层应补建造者: {c5}"
+assert ("build", "b_extractorT1") in kinds, f"规则层应补采集器: {c5}"
+tur = [c for c in c5 if c.get("action") == "b_c_turret_t1"]
+assert tur and (tur[0]["x"], tur[0]["y"]) == (1810.0, 1110.0), f"防线弧网格位: {c5}"
+# 旁观铁律：无委托时规则层一拍都不动
+snap4_nd = snap(own4, 5000)
+snap4_nd["delegated"] = []
+assert e4.tick(snap4_nd) == [], "无委托时规则层必须旁观"
+print("S4 OK:", c5)
 print("ALL PASS")

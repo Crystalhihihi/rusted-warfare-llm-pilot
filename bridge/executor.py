@@ -99,12 +99,25 @@ class Executor:
                     self.action_tech["u_" + name] = u.get("tech", 1)
         self.econ_goal = dict(DEFAULT_ECON)
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
+        # 建筑占地表（pedia fp 字段）：类型名 -> (w, h, ox, oy)，槽位网格按此分配空间
+        self.fp = {}
+        for u in (pedia or {}).get("units", []):
+            f = u.get("fp")
+            if f:
+                try:
+                    self.fp[u["name"]] = (int(f.get("w", 1)), int(f.get("h", 1)),
+                                          int(f.get("ox", 0)), int(f.get("oy", 0)))
+                except (TypeError, ValueError):
+                    pass
         self.stance = "expand"
         self.action_bad = {}           # 动作 -> 解封时间（None=永久：ID不存在；限时=科技未达，120s重试）
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
+        self.issued_cells = {}         # 类型 -> [(x, y, 到期时间)] 在途建筑占位（槽位网格用）
         self.custom_builds = []        # LLM 指定建造队列 [(action, x, y)]
+        self.ext_pool_bad = {}         # (gx,gy) -> 解封时间：agent 判"找不到合法建造位置"的池（120s 跳过）
+        self._last_ext_xy = None       # (x, y, ts) 最近一次采集器下单（池失败归因用）
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
         self.last_upgrade = None
@@ -115,6 +128,7 @@ class Executor:
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
         self.autopilot = True           # False=多 agent 模式：只跑跟踪/抢修机械，经济生产决策归 LLM agent
+        self.routine = False            # 多 agent 模式的规则快层：例行（建造者/采集器/炮塔弧）2s 级执行
         self.naval = None               # 水图判定（lazy）：水域占比>=20% 或 水池>=2
         self.front_dir = None           # 布局前线方向（CC→图心单位向量），首个 CC 出现时定
         self._water_anchor = "?"        # 近水锚点缓存（None=无水域；"?"=未计算）
@@ -187,6 +201,12 @@ class Executor:
             if m:
                 self.action_bad[m.group(1)] = time.time() + 120  # 科技未达：120s 后重试
                 self.log("status", f"⚙ 动作科技未达，120s后重试: {m.group(1)}")
+            # 池点被占（agent 全盘拒绝）：归因到最近采集器下单点位，120s 跳过
+            if "找不到合法建造位置" in msg and self._last_ext_xy \
+                    and time.time() - self._last_ext_xy[2] < 10:
+                gx, gy = int(self._last_ext_xy[0] // 400), int(self._last_ext_xy[1] // 400)
+                self.ext_pool_bad[(gx, gy)] = time.time() + 120
+                self.log("status", f"⚙ 池点被占判死，120s跳过 ({self._last_ext_xy[0]:.0f},{self._last_ext_xy[1]:.0f})")
 
     # ---------- 主循环 ----------
     def tick(self, snap):
@@ -258,13 +278,20 @@ class Executor:
                 act = cmd.get("action", "")
                 btype = act[2:] if act.startswith("b_") else act
                 self.issued_builds.append((btype, now + 45.0))  # 施工窗口期，防重复下单
+                if cmd.get("x") is not None:
+                    self.issued_cells.setdefault(btype, []).append((cmd["x"], cmd["y"], now + 45.0))
             if cmd["cmd"] == "train":
                 self.train_hist.setdefault(cmd["factory"], deque()).append(now)  # 本地队列估计用
             return True
 
         if not self.autopilot:
-            # 多 agent 模式：经济/生产/升级决策归 LLM agent；本层只保留进度跟踪 + 抢修兜底
-            self._dispatch_rescue(own, emit, stalled, idle_builders, danger, now)
+            # 多 agent 模式：本层保留进度跟踪 + 抢修兜底；routine=True 时再加规则快层。
+            # 铁律：无委托单位=完全旁观（用户在手动玩/沙盒时，机器一拍都不许动）
+            if snap.get("delegated"):
+                self._dispatch_rescue(own, emit, stalled, idle_builders, danger, now)
+                if self.routine:
+                    self._routine_tick(snap, emit, now, own, funds, builders, idle_builders,
+                                       ext_done, factories, safe_pools, cc, mw, mh, danger)
             return cmds
 
         # 1) 建造者数量：低于目标且有钱就补（此前条件写反导致归零后永不补产）
@@ -294,7 +321,7 @@ class Executor:
             b = idle_builders[0]
             fcmd = {"cmd": "build", "action": "b_landFactory", "builder": b["id"]}
             if cc:  # 厂区槽位 0 号位：主基地侧翼（垂直于前线方向），不挡正面
-                sx, sy = self.factory_slot(cc, 0, [])
+                sx, sy = self.factory_slot(cc, 0, [], occ=self._occupancy(snap))
                 fcmd["x"], fcmd["y"] = float(sx), float(sy)
             emit(fcmd, f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
@@ -325,9 +352,10 @@ class Executor:
                 and funds >= 1400 and idle_builders and not self._bad(fac_action, now)):
             b = self._pick_builder(idle_builders, for_factory=True)
             fcmd = {"cmd": "build", "action": fac_action, "builder": b["id"]}
-            if cc:  # 厂区槽位：沿侧翼每 170px 一座成行（海厂不参与厂区编号）
+            if cc:  # 厂区槽位：沿侧翼密排成行（海厂不参与厂区编号）
                 idx = sum(1 for u in fac_producers if u["t"] != "seaFactory") + fac_inflight
-                sx, sy = self.factory_slot(cc, idx, land_factories)
+                sx, sy = self.factory_slot(cc, idx, land_factories,
+                                           occ=self._occupancy(snap), btype=fac_action[2:])
                 fcmd["x"], fcmd["y"] = float(sx), float(sy)
             emit(fcmd, f"build:fac:{b['id']}", 4.0)
             idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
@@ -580,19 +608,99 @@ class Executor:
                 self.log("status", f"⚙ {what}：{u['t']}#{u['id']} ← 建造者#{b['id']}")
                 idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
 
+    def _routine_tick(self, snap, emit, now, own, funds, builders, idle_builders,
+                      ext_done, factories, safe_pools, cc, mw, mh, danger):
+        """规则快层（多 agent 模式）：LLM 管决策，例行公事机器节拍执行。
+        只做参数内的例行——不盖新厂型、不改方向（那是 chat 建造层/计划书的事）。"""
+        # ① 建造者维持（<目标且有钱就补，CC 队列不满时）
+        if cc and len(builders) < self.econ_goal["builders"] and (cc.get("q") or 0) < QUEUE_MAX:
+            if funds >= 250:
+                emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
+        # ② 采集器补池（只去安全池，完工数达标即停；被 agent 判死的池 120s 跳过）
+        ext_inflight = sum(1 for t, _ in self.issued_builds if t.startswith("extractor"))
+        pools = [p for p in safe_pools
+                 if now >= self.ext_pool_bad.get((int(p["x"] // 400), int(p["y"] // 400)), 0)]
+        if (len(ext_done) < self.econ_goal["extractors"] and ext_inflight < 2
+                and funds >= EXTRACTOR_PRICE and idle_builders and pools):
+            b = idle_builders[0]
+            px, py = float(pools[0]["x"]), float(pools[0]["y"])
+            if emit({"cmd": "build", "action": "b_extractorT1", "builder": b["id"],
+                     "x": px, "y": py}, f"build:ext:{b['id']}", 4.0):
+                self._last_ext_xy = (px, py, now)
+            idle_builders = idle_builders[1:]
+        # ③ 防线工程（网格版：格距=建筑宽+3格，主通道留空；防空压后排对空侧不占弧尖）
+        land_factories = [u for u in factories if u["t"] != "commandCenter"]
+        turrets = [u for u in own if "turret" in u["t"].lower() and u.get("bld")]
+        t_inflight = sum(1 for t, _ in self.issued_builds if "turret" in t.lower())
+        enemy_air = any(k in e["t"].lower() for e in snap.get("enemy", [])
+                        for k in ("gunship", "jet", "bomber", "interceptor", "airship", "helicopter", "drone"))
+        n = len(turrets) + t_inflight
+        # 混编（方向敏感）：防空统一压主线后 3 格；每3座炮塔配1防空（敌空军每2配1）；每4座配1激光
+        if enemy_air and n % 2 == 1:
+            tur_action, need, back = "b_c_antiAirTurret", 1600, 3
+        elif n % 3 == 2:
+            tur_action, need, back = "b_c_antiAirTurret", 1600, 3
+        elif n % 4 == 3:
+            tur_action, need, back = "b_laserDefence", 2200, 0
+        else:
+            tur_action, need, back = "b_c_turret_t1", 1600, 0
+        t_cap = min(10, 2 + int(funds // 10000))  # 防线是大工程：2 座起步，资金每万 +1，上限 10
+        if (land_factories and funds >= need and n < t_cap
+                and idle_builders and not self._bad(tur_action, now) and cc and mw and mh):
+            anchor = self.army_goal.get("rally")
+            tx, ty = anchor if anchor else (mw / 2, mh / 2)
+            ax, ay = tx - cc["x"], ty - cc["y"]
+            alen = max(1.0, math.hypot(ax, ay))
+            occ = self._occupancy(snap)
+            btype = tur_action[2:]
+            idx = n
+            spot = self.defense_slot(cc, occ, btype, idx, (ax / alen, ay / alen), back)
+            if spot == "LANE":  # 主通道留空，跳一号
+                idx += 1
+                spot = self.defense_slot(cc, occ, btype, idx, (ax / alen, ay / alen), back)
+            if spot and spot != "LANE" and not danger(spot[0], spot[1], 500):
+                b = idle_builders[0]
+                emit({"cmd": "build", "action": tur_action, "builder": b["id"],
+                      "x": float(spot[0]), "y": float(spot[1])}, f"build:tur:{b['id']}", 6.0)
+                idle_builders = idle_builders[1:]
+        # 内圈维修湾（网格版：主线后 6 格）：≥2 座炮塔后配，cap 2
+        bays = sum(1 for u in own if u["t"] == "repairbay" and u.get("bld"))
+        bay_inflight = sum(1 for t, _ in self.issued_builds if t == "repairbay")
+        if (land_factories and n >= 2 and bays + bay_inflight < 2 and funds >= 2600
+                and idle_builders and not self._bad("b_repairbay", now) and cc and mw and mh):
+            anchor = self.army_goal.get("rally")
+            tx, ty = anchor if anchor else (mw / 2, mh / 2)
+            ax, ay = tx - cc["x"], ty - cc["y"]
+            alen = max(1.0, math.hypot(ax, ay))
+            occ = self._occupancy(snap)
+            spot = self.defense_slot(cc, occ, "repairbay", bays, (ax / alen, ay / alen), 6)
+            if spot and spot != "LANE" and not danger(spot[0], spot[1], 500):
+                b = idle_builders[0]
+                emit({"cmd": "build", "action": "b_repairbay", "builder": b["id"],
+                      "x": float(spot[0]), "y": float(spot[1])}, f"build:bay:{b['id']}", 8.0)
+
     # ---------- 布局槽位（全局长持方向，建筑成行成排而非螺旋散点） ----------
-    def factory_slot(self, cc, idx, existing):
-        """厂区槽位：0 号位在 CC 侧翼 260px（垂直前线），后续沿同侧每 170px 一座成行。"""
+    def factory_slot(self, cc, idx, existing, occ=None, btype="landFactory"):
+        """厂区槽位：0 号位在 CC 侧翼（垂直前线），后续沿同侧密排成行。
+        有占位图时走槽位网格（按 fp 格数贴死，整齐密集）；无则退回几何公式。"""
         fx, fy = self.front_dir or (0.0, 1.0)
         lx, ly = -fy, fx
         if idx > 0 and existing:  # 厂区方向跟随首厂所在侧（防 LLM 先盖厂后方向反转）
             if (existing[0]["x"] - cc["x"]) * lx + (existing[0]["y"] - cc["y"]) * ly < 0:
                 lx, ly = -lx, -ly
+        if occ is not None:
+            spot = self._row_slot(occ, btype, cc, idx, lx, ly, 0)  # 厂区贴死（用户密集造法）
+            if spot:
+                return spot
         return cc["x"] + lx * (260 + 170 * idx), cc["y"] + ly * (260 + 170 * idx)
 
-    def misc_slot(self, cc, idx):
-        """后勤槽位：主基地背后（背对前线）一排，每 170px 一座。"""
+    def misc_slot(self, cc, idx, occ=None, btype="fabricatorT1"):
+        """后勤槽位：主基地背后（背对前线）一排，1 格缝。"""
         fx, fy = self.front_dir or (0.0, 1.0)
+        if occ is not None:
+            spot = self._row_slot(occ, btype, cc, idx, -fx, -fy, 1)
+            if spot:
+                return spot
         return cc["x"] - fx * (240 + 170 * idx), cc["y"] - fy * (240 + 170 * idx)
 
     def is_naval_map(self):
@@ -624,6 +732,84 @@ class Executor:
                         best, bd = (wx, wy), d2
             self._water_anchor = best
         return self._water_anchor
+
+    # ---------- 槽位网格（以主基地锚定晶格，建筑按 fp 格数分配空间，整齐是规则不是运气） ----------
+    def _tw(self):
+        return (self.map.get("tileW") or 20), (self.map.get("tileH") or 20)
+
+    def _footprint(self, name):
+        return self.fp.get(name, (2, 2, -1, -1))  # 未知默认 2x2 居中（多数建筑如此）
+
+    def _mark_fp(self, occ, name, x, y):
+        tw, th = self._tw()
+        w, h, ox, oy = self._footprint(name)
+        gx, gy = int(x // tw), int(y // th)
+        for i in range(ox, ox + w):
+            for j in range(oy, oy + h):
+                occ.add((gx + i, gy + j))
+
+    def _occupancy(self, snap):
+        """占位图：己方/盟友建筑（按 fp）+ 在途下单（45s 窗口）。"""
+        occ = set()
+        for u in snap.get("own", []) + snap.get("allies", []):
+            if u.get("bld"):
+                self._mark_fp(occ, u["t"], u["x"], u["y"])
+        now = time.time()
+        for t, cells in self.issued_cells.items():
+            live = [(x, y, e) for x, y, e in cells if e > now]
+            self.issued_cells[t] = live
+            for x, y, _e in live:
+                self._mark_fp(occ, t, x, y)
+        return occ
+
+    def _cell_free(self, occ, name, gx, gy):
+        w, h, ox, oy = self._footprint(name)
+        return all((gx + i, gy + j) not in occ
+                   for i in range(ox, ox + w) for j in range(oy, oy + h))
+
+    def _cell_xy(self, gx, gy):
+        tw, th = self._tw()
+        return (gx + 0.5) * tw, (gy + 0.5) * th
+
+    def _row_slot(self, occ, btype, cc, idx, ox_dir, oy_dir, gap_cells):
+        """沿 (ox_dir,oy_dir) 方向按 fp宽+gap 格距密排的第 idx 个空位（厂区/特区用）。"""
+        tw, th = self._tw()
+        w, h, ox, oy = self._footprint(btype)
+        pitch = w + gap_cells
+        ccx, ccy = int(cc["x"] // tw), int(cc["y"] // th)
+        step = 0
+        for n in range(idx * 2 + 4):  # 顺排找空，被占顺延
+            if n * pitch > 60:
+                break
+            gx = int(round(ccx + ox_dir * (13 + n * pitch)))
+            gy = int(round(ccy + oy_dir * (13 + n * pitch)))
+            if self._cell_free(occ, btype, gx, gy):
+                if step == idx:
+                    return self._cell_xy(gx, gy)
+                step += 1
+        return None
+
+    def defense_slot(self, cc, occ, btype, index, axis, back=0):
+        """防线弧第 index 个空位：格距=建筑宽+3格（3 格缝，火力密集且全线可穿）；
+        back>0 放主线后 back 格（防空/火炮后排）；k=0 留空作主通道（≥2 格距宽）。"""
+        tw, th = self._tw()
+        w, h, ox, oy = self._footprint(btype)
+        pitch = w + 3
+        ccx, ccy = int(cc["x"] // tw), int(cc["y"] // th)
+        base = math.atan2(axis[1], axis[0])
+        k = (index + 1) // 2 * (1 if index % 2 else -1)  # 0,+1,-1,+2,-2... 两翼交替
+        if back == 0 and k == 0:
+            return "LANE"  # 主通道留空（调用方跳号）
+        for R in range(16, 34):
+            r = R - back
+            if r < 8:
+                break
+            ang = base + k * (pitch / R)
+            gx = int(round(ccx + math.cos(ang) * r))
+            gy = int(round(ccy + math.sin(ang) * r))
+            if self._cell_free(occ, btype, gx, gy):
+                return self._cell_xy(gx, gy)
+        return None
 
     # ---------- 生产决策 ----------
     def _next_production(self, fac, own):

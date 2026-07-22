@@ -591,7 +591,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 用法：建造者用 build(action,x,y) 盖建筑，action 必须用建造[b_]列表里的 ID；工厂用 train(action,factory) 生产，action 必须用生产[s_]列表里的 ID，factory 取"我方工厂"列表里的 id（带 # 的数字）；rally(x,y,factory) 设集结点。ID 区分大小写，不要自己编造。
 
 【规则】
-- 指令通过工具下达，进入游戏正常指令队列，与玩家鼠标点击同级（约0.2s排队延迟）。
+- 指令通过工具下达，进入游戏正常指令队列，与玩家手动操作同一条执行路径。
 - 你只指挥快照中"你的小队"（委托单位）。attack_unit 的目标 id 必须来自最新快照的可见敌人列表；train/rally 的 factory 必须是我方单位 id。
 - 每个用户消息是最新战场态势。你的回复必须包含至少一个工具调用——分析用 note 工具写（一两句话，不要长篇），content 留空或极短，重点是把决策变成工具调用。
 - 动作 ID 必须原样取自动作表（含 b_/u_/数字前缀）。如果某个 ID 被回执拒绝，严禁再次尝试同一个 ID——从回执附带的可用列表中另选一个。回执里的失败信息用于纠正，不要道歉，直接给下一步行动。
@@ -602,7 +602,7 @@ L = 岩浆（仅空军）     ^ = 悬崖阶梯（仅 OVER_CLIFF 兵种如机甲�
 - 兵种搭配（重要）：不要只生产单一兵种——看摘要里"我方其他部队"的构成，保持混合（如主战坦克/机甲 + 防空 + 远程/炮兵），敌方空军多就补防空，敌方龟缩就补远程。
 - 分开操作：move/attack_move/stop 都支持 ids 参数（逗号分隔的单位id），需要让不同单位去不同地方时，给每个单位单独下一条带 ids 的指令，不要对整队下一锅端指令。例：move(1000,500,222) 派 #222 去(1000,500)，move(3000,1000,323) 派 #323 去(3000,1000)。
 - 建造是有时间的：建筑出现≠完工（快照 prog<1 是建造中），完工前工厂不能生产、建筑没作用。**build 的坐标可以省略——系统会在主基地附近自动选址（采集器自动选最近的空闲资源点），除非你明确知道该建在哪，否则一律省略坐标。**
-- 资金纪律：资金<700 时只能建采集器（系统会拦截其他建造）；同类工厂最多 3 座（先满产/升级再扩）；每个工厂排队最多2~3个任务。
+- 资金纪律：资金<700 时只能建采集器（系统会拦截其他建造）；工厂按需扩建（队列长期≥2 且有钱就扩）；每个工厂排队最多2~3个任务。
 - 建造者纪律（重要）：摘要"建造者状态"里显示施工中(build@)的建造者**正在赶路或施工，绝对禁止再派任何新指令**——它会自己走到工地盖好，你要等它变回 idle（空闲）再派下一个活。重复派活会取消它原来的施工，导致什么都盖不成。一次只给一个建造者派一个活。想并行施工就用 builder 参数分别指定：build(b_extractorT1,x1,y1,builder=222) 和 build(b_landFactory,x2,y2,builder=530) 各干各的。
 - 建造者数量纪律（重要）：建造者总数没有硬性上限，但**只要有≥2个在闲置（状态行"空闲可派活"），系统就禁止再生产新的**——先把闲置的派去建采集器/工厂/炮塔，全部用起来后才能继续产。建筑选址在主基地一侧，不许派建造者深入敌方区域。
 - 小队空闲（没有进行中的任务）时，给出下一个任务目标，不要让它原地待命。
@@ -614,37 +614,16 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-# 只能对空的单位：地面进攻时从编队中剔除（留家防空，不拉去送死）
-AA_ONLY = {"missileTank", "mechMissile", "mechHeavyMissile",
-           "interceptor", "c_interceptor", "heavyInterceptor",
-           "aaBeamGunship", "aaBeamGunship_afterburn"}
-
-
 # 不上前线的非战斗单位（建造者 + 战斗工程师：能造但打不动，造一堆拿去打架纯送）
 CIVIL = ("uilder", "abricator", "combatEngineer")
 
 
 def ground_combat_ids(snap, squad_ids):
-    """地面攻击应包含的单位 id：非建筑、非建造者/工程师、非纯防空。"""
+    """地面攻击应包含的单位 id：非建筑、非建造者/工程师。
+    纯防空单位随军行动（充当防空火力，蹲家纯浪费——用户裁决，不再剔除）。"""
     return ",".join(str(u["id"]) for u in snap.get("own", [])
                     if u["id"] in squad_ids and not u.get("bld")
-                    and not any(k in u["t"] for k in CIVIL)
-                    and u["t"] not in AA_ONLY)
-
-
-def aa_follow(link, snap, cmd, cx, cy):
-    """纯防空单位不当炮灰也不蹲家：move 到攻击目标后撤 500px 的后排，罩住空域。"""
-    if cx is None:
-        return
-    aa = [str(u["id"]) for u in snap.get("own", [])
-          if u["id"] in set(snap.get("delegated", [])) and not u.get("bld") and u["t"] in AA_ONLY]
-    if not aa:
-        return
-    tx, ty = cmd["x"], cmd["y"]
-    dx, dy = tx - cx, ty - cy
-    d = max(1.0, (dx * dx + dy * dy) ** 0.5)
-    bx, by = tx - dx / d * 500, ty - dy / d * 500
-    link.send({"cmd": "move", "x": bx, "y": by, "units": ",".join(aa)})
+                    and not any(k in u["t"] for k in CIVIL))
 
 
 def nearest_water(map_msg, x, y, max_px=2500):
@@ -906,6 +885,7 @@ def main():
             threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
                              daemon=True, name="rw-executor").start()
         executor.autopilot = False
+        executor.routine = bool(cfg.get("routine_layer", True))  # 规则快层：例行+炮塔弧跟随集结点
         import multiagent
         return multiagent.run({
             "link": link, "cfg": cfg, "api_key": api_key, "pedia": pedia,
@@ -916,11 +896,13 @@ def main():
             "mine_spawn": mine_spawn, "enemy_spawns": enemy_spawns,
             "log_activity": log_activity, "answer_query": answer_query,
             "strategic_grid": strategic_grid, "ground_combat_ids": ground_combat_ids,
-            "naval_split": naval_split, "aa_follow": aa_follow,
+            "naval_split": naval_split,
             "nearest_water": nearest_water, "clamp": clamp,
             "pedia_production_table": pedia_production_table, "downsample": downsample,
             "ai_enabled": lambda: not (link.ai_control_state()
                                        and not link.ai_control_state().get("enabled", True)),
+            "role_enabled": lambda name: (link.ai_control_state() or {}).get(
+                "cmd" + name.capitalize(), True),  # 设置面板的角色开关（缺省=开）
         })
 
     while True:
@@ -1199,9 +1181,8 @@ def main():
                     cmd = {"cmd": "attackmove", "x": world_w / 2, "y": world_h / 2}  # 无敌情就向图中心推进
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
-                    cmd["units"] = gids  # 地面进攻只带能打地面的
+                    cmd["units"] = gids  # 地面进攻只带能打地面的（含纯防空随军）
                 naval_split(link, snap, cmd, gids, map_msg, naval_types)
-                aa_follow(link, snap, cmd, cx, cy)
             elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
@@ -1211,11 +1192,6 @@ def main():
                 if gids:
                     cmd["units"] = gids
                 naval_split(link, snap, cmd, gids, map_msg, naval_types)
-                squad_u = [u for u in snap.get("own", []) if u["id"] in set(snap.get("delegated", [])) and not u.get("bld")]
-                if squad_u:
-                    cx = sum(u["x"] for u in squad_u) / len(squad_u)
-                    cy = sum(u["y"] for u in squad_u) / len(squad_u)
-                    aa_follow(link, snap, cmd, cx, cy)
             elif executor is not None and name == "defend_home":
                 executor.last_military_order = time.time()
                 if getattr(smz, "home", None):
@@ -1293,15 +1269,7 @@ def main():
                     pending_notes.append(f"✗ build {act}: 资金仅{funds_now:.0f}<700，先留钱建采集器恢复经济，别的不许盖")
                     print(f"[pilot] 守卫：资金 {funds_now:.0f}，拒绝非采集器建造 {act}")
                     continue
-                # 系统守卫：同类工厂上限（防工厂刷屏）
-                if "actory" in act or "Factory" in act:
-                    fac_type = act.split("_", 1)[1] if "_" in act else act
-                    same = sum(1 for u in snap.get("own", []) if u.get("bld") and u["t"] == fac_type)
-                    if same >= 3:
-                        block_temp(call_key)
-                        pending_notes.append(f"✗ build {act}: 已有{same}座{fac_type}，先让它们满产/升级，不许再建同类")
-                        print(f"[pilot] 守卫：{fac_type} 已有 {same} 座，拒绝刷屏")
-                        continue
+                # 同类工厂数量不设硬上限（用户裁决：按需扩建，死守 3 座是蠢思路）
                 cmd = {"cmd": "build", "action": act}
                 if args.get("x") is not None and args.get("y") is not None:
                     cmd["x"] = clamp(float(args["x"]), 0, world_w)
@@ -1368,7 +1336,7 @@ def main():
                 cmd_times.append(time.time())
                 args_txt = ",".join(str(v) for v in args.values())
                 executed.append(f"{name}({args_txt})")
-                time.sleep(random.uniform(0.3, 0.5))  # 拟人操作间隔
+                # 拟人操作间隔已去除：LLM 思考时间本身就是天然节拍（用户裁决）
             else:
                 print("[pilot] 发送失败（连接断开）")
                 break

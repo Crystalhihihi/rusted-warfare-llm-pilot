@@ -26,7 +26,7 @@ PEDIA = {"units": [
     {"name": "extractorT1", "price": 700, "tech": 1, "building": True, "builder": False,
      "move": "NONE", "hp": 800, "builds": []},
     {"name": "landFactory", "price": 700, "tech": 1, "building": True, "builder": False,
-     "move": "NONE", "hp": 2000, "builds": ["u_c_tank", "u_missileTank"]},
+     "move": "NONE", "hp": 2000, "builds": ["u_c_tank", "u_missileTank", "u_heavyTank"]},
     {"name": "c_tank", "price": 400, "tech": 1, "building": False, "builder": False,
      "move": "LAND", "hp": 210, "builds": []},
     {"name": "missileTank", "price": 700, "tech": 2, "building": False, "builder": False,
@@ -125,10 +125,10 @@ ctx = {
     "log_activity": lambda k, t: None,
     "answer_query": pilot.answer_query, "strategic_grid": pilot.strategic_grid,
     "ground_combat_ids": pilot.ground_combat_ids, "naval_split": pilot.naval_split,
-    "aa_follow": pilot.aa_follow, "nearest_water": pilot.nearest_water,
     "clamp": pilot.clamp, "pedia_production_table": pilot.pedia_production_table,
     "downsample": pilot.downsample,
     "ai_enabled": lambda: True,
+    "role_enabled": lambda name: True,
 }
 
 st = multiagent.start(ctx)
@@ -151,4 +151,40 @@ assert roles_seen == {"commander", "build", "combat"}, f"三循环都应跑过: 
 print("sent:", link.sent)
 print("plan:", st.plan[:60])
 print("composition:", ex.army_goal)
+
+# ---- 闭环规则 1：点位黑名单（反射召回点 10 分钟禁建） ----
+st.site_blocks[(int(1500 // 400), int(1400 // 400))] = time.time() + 600
+g1 = {"fail_perm": set(), "fail_temp": {}, "recent_builds": {}}
+cmd, desc = multiagent._translate_build(
+    ctx, st, "build", {"action": "b_extractorT1", "x": 1510, "y": 1410}, SNAP, g1)
+assert cmd is None and "禁建" in (desc or ""), f"黑名单点应拦截: {cmd} {desc}"
+
+# ---- 闭环规则 2：失败回执自学习（300s 封禁 + 跨域需求板） ----
+g2 = {"fail_perm": set(), "fail_temp": {}, "recent_builds": {}}
+multiagent._learn_receipts({"name": "combat"},
+                           ["✗ train: 该工厂没有此动作: u_heavyTank；可用: u_c_tank"], g2, st)
+assert g2["action_bad"].get("u_heavyTank", 0) > time.time(), "失败动作应封 300s"
+cmd, desc = multiagent._translate_combat(ctx, st, "train", {"action": "u_heavyTank", "factory": 3}, SNAP, g2)
+assert cmd is None and "封禁" in (desc or ""), f"封禁动作应拦截: {cmd} {desc}"
+assert any("u_heavyTank" in r for r in st.requests), "需求板应挂 T2 升级需求"
+
+# ---- 闭环规则 3：同值去重（rally 坐标未变跳过） ----
+r1 = multiagent._translate_combat(ctx, st, "rally", {"x": 1700, "y": 1200}, SNAP, g2)
+r2 = multiagent._translate_combat(ctx, st, "rally", {"x": 1705, "y": 1205}, SNAP, g2)
+assert "跳过" in (r2[1] or ""), f"同值 rally 应跳过: {r1} {r2}"
+
+# ---- u_ 前缀归一化（LLM 省略前缀不再被误判拦截） ----
+g3 = {"fail_perm": set(), "fail_temp": {}, "recent_builds": {}}
+cmd, desc = multiagent._translate_combat(ctx, st, "train", {"action": "heavyTank", "factory": 3}, SNAP, g3)
+assert cmd and cmd["action"] == "u_heavyTank", f"u_ 前缀应归一化: {cmd} {desc}"
+
+# ---- train 回执分域（失败回执的可用列表不得污染判域） ----
+assert multiagent._train_domain("该工厂没有此动作: u_heavyTank；可用: c_1,u_builder,u_scout") == "combat"
+assert multiagent._train_domain("landFactory train u_c_tank") == "combat"
+assert multiagent._train_domain("commandCenter train u_builder") == "build"
+assert multiagent._train_domain("seaFactory train u_builderShip") == "build"
+assert multiagent._train_domain("landFactory train 110") == "build"
+assert multiagent._train_domain("动作当前不可用（科技/条件不满足）: extractorT2_0") == "build"
+
+print("闭环规则 ALL PASS")
 print("ALL PASS")
