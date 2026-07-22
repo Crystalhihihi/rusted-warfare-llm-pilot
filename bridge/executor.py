@@ -189,8 +189,9 @@ class Executor:
         def danger(x, y, r=600):
             return any((e["x"] - x) ** 2 + (e["y"] - y) ** 2 < r * r for e in enemies)
 
-        ccx = cc["x"] if cc else 0
-        ccy = cc["y"] if cc else 0
+        _cc = next((u for u in own if u["t"] == "commandCenter" and u.get("bld")), None)
+        ccx = _cc["x"] if _cc else 0
+        ccy = _cc["y"] if _cc else 0
         safe_pools = sorted(
             (p for p in self.resources
              if not p.get("w") and not danger(p["x"], p["y"])
