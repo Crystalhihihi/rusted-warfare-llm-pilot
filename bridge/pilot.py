@@ -593,11 +593,15 @@ AA_ONLY = {"missileTank", "mechMissile", "mechHeavyMissile",
            "aaBeamGunship", "aaBeamGunship_afterburn"}
 
 
+# 不上前线的非战斗单位（建造者 + 战斗工程师：能造但打不动，造一堆拿去打架纯送）
+CIVIL = ("uilder", "abricator", "combatEngineer")
+
+
 def ground_combat_ids(snap, squad_ids):
-    """地面攻击应包含的单位 id：非建筑、非建造者、非纯防空。"""
+    """地面攻击应包含的单位 id：非建筑、非建造者/工程师、非纯防空。"""
     return ",".join(str(u["id"]) for u in snap.get("own", [])
                     if u["id"] in squad_ids and not u.get("bld")
-                    and "uilder" not in u["t"] and "abricator" not in u["t"]
+                    and not any(k in u["t"] for k in CIVIL)
                     and u["t"] not in AA_ONLY)
 
 

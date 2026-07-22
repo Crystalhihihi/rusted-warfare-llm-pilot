@@ -274,7 +274,15 @@ class Executor:
             emit(fcmd, f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
-        # 4) 工厂扩建：军力目标+资金双驱动（此前太保守导致资金爆表）；厂型跟随军队构成
+        # 3.5) 战斗工程师：无存货且要扩厂时产1-2个（直接建T2厂，省升级时间）
+        ce_count = sum(1 for u in own if u["t"] == "combatEngineer")
+        if (len(ext_done) >= 2 and ce_count < 2 and funds >= 1500 and land_factories):
+            lf = next((u for u in land_factories if (u.get("q") or 0) < QUEUE_MAX), None)
+            if lf and not self._bad("u_combatEngineer", now):
+                emit({"cmd": "train", "action": "u_combatEngineer", "factory": lf["id"]},
+                     "train:ce", 10.0)
+
+        # 4) 工厂扩建：军力目标+资金双驱动；厂型跟随军队构成；优先派战斗工程师盖（直接T2省升级）
         army_total = sum((self.army_goal["composition"] or {}).values())
         fac_want = max(2, 1 + army_total // 10)
         if funds > 8000:
@@ -290,13 +298,13 @@ class Executor:
         fac_inflight = sum(1 for t, _ in self.issued_builds if "actory" in t)
         if (len(ext_done) >= 2 and len(fac_producers) + fac_inflight < fac_want
                 and funds >= 1400 and idle_builders and not self._bad(fac_action, now)):
-            b = idle_builders[0]
+            b = self._pick_builder(idle_builders, for_factory=True)
             fcmd = {"cmd": "build", "action": fac_action, "builder": b["id"]}
             if land_factories:  # 向首厂聚拢，形成厂区而非散点
                 fcmd["x"] = float(land_factories[0]["x"]) + 120
                 fcmd["y"] = float(land_factories[0]["y"]) + 120
             emit(fcmd, f"build:fac:{b['id']}", 4.0)
-            idle_builders = idle_builders[1:]
+            idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
 
         # 4.4) 生产调度（提到炮塔/升级之前：军力是之本，防止被经济动作饿死）
         #    按构成目标或默认优先级补队列；资金低于储备线且经济未达标时暂停
@@ -421,9 +429,14 @@ class Executor:
         try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
                      and "turret" in u["t"].lower()], 1500)  # 轨C：炮塔（最便宜升级700起）
 
-        # 7) 集结点（army_goal 指定时，每厂设一次；emit 成功才登记，失败下拍重试）
+        # 7) 集结点（army_goal 指定时，每厂设一次；敌占区自动后撤到主基地）
         if self.army_goal["rally"]:
             rx, ry = self.army_goal["rally"]
+            if danger(rx, ry, 500) and cc:
+                self.army_goal["rally"] = (float(cc["x"]), float(cc["y"]))
+                self.rallied.clear()
+                rx, ry = self.army_goal["rally"]
+                self.log("status", "⚙ 集结点已沦陷，自动后撤到主基地")
             # 集结点落在敌人 500px 内 = 让部队排队送死，本拍跳过并告知
             if any((e["x"] - rx) ** 2 + (e["y"] - ry) ** 2 < 500 ** 2 for e in snap.get("enemy", [])):
                 self.log("status", "⚙ 集结点距敌人过近已跳过（LLM 选点不慎，需重设）")
@@ -457,6 +470,14 @@ class Executor:
                     self.log("status", "⚙ LLM沉默，自动向地图中心推进侦察")
 
         return cmds
+
+    def _pick_builder(self, idle_builders, for_factory=False):
+        """盖工厂优先派战斗工程师（直接建 T2 厂省升级时间），否则第一个空闲建造者。"""
+        if for_factory and idle_builders:
+            ce = next((u for u in idle_builders if u["t"] == "combatEngineer"), None)
+            if ce:
+                return ce
+        return idle_builders[0] if idle_builders else None
 
     # ---------- 生产决策 ----------
     def _next_production(self, fac, own):
