@@ -140,7 +140,10 @@ class Executor:
         self.stance = str(stance)
 
     def queue_build(self, action, x=None, y=None):
-        """LLM 指定建造（build_building 动词）：进入自定义建造队列，下拍执行。"""
+        """LLM 指定建造（build_building 动词）：归一化 b_ 前缀后进入建造队列。"""
+        action = str(action)
+        if not action.startswith(("b_", "u_", "c_")):
+            action = "b_" + action  # LLM 常省略 b_ 前缀（landFactory → b_landFactory）
         self.custom_builds.append((action, x, y))
 
     def _bad(self, act, now):
