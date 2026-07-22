@@ -372,6 +372,7 @@ class AgentLink:
         self.cmd_results = deque(maxlen=20)
         self.sock = None
         self.connected = threading.Event()
+        self.user_msgs = deque(maxlen=10)  # 玩家经游戏内 /s 发来的留言
         threading.Thread(target=self._run, daemon=True, name="pilot-link").start()
 
     def _run(self):
@@ -412,6 +413,12 @@ class AgentLink:
                             elif t == "pedia":
                                 self.pedia = msg
                                 print(f"[link] 百科已载入 ({len(msg.get('units', []))} 类)")
+                            elif t == "userMsg":
+                                txt = str(msg.get("text", "")).strip()
+                                if txt:
+                                    self.user_msgs.append(txt)  # 外层已持锁，不可再加（threading.Lock 不可重入）
+                                    print(f"[userMsg] 玩家留言: {txt}")
+                                    log_activity("note", f"💬 玩家留言: {txt}")
                             elif t == "aiControl":
                                 self.ai_control = msg
                                 print(f"[aiControl] enabled={msg.get('enabled')} interval={msg.get('interval')} groups={msg.get('groups')}")
@@ -830,6 +837,13 @@ def main():
             pass
 
         snap = link.snapshot()
+        # 玩家留言（/s）：注入本轮 LLM 输入，优先级最高
+        with link.lock:
+            umsgs = list(link.user_msgs)
+            link.user_msgs.clear()
+        if umsgs:
+            pending_notes.append("【玩家留言】（人类玩家的直接指示，优先级最高，照做并说明怎么执行）:\n"
+                                 + "\n".join("- " + m for m in umsgs))
         if snap is None or not snap.get("team") or snap["team"].get("ai"):
             time.sleep(1)
             continue

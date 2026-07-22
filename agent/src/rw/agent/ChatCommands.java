@@ -80,6 +80,15 @@ public final class ChatCommands {
     }
 
     private static void handle(String text) {
+        // "/s 内容"：玩家直接给 AI 留言，转发桥接，进下一轮 LLM 输入
+        if (text.startsWith("/s ")) {
+            String msg = text.substring(3).trim();
+            if (!msg.isEmpty()) {
+                NetServer.send("{\"type\":\"userMsg\",\"text\":\"" + Commands.esc(msg) + "\"}");
+                echo("已转告AI: " + msg);
+            }
+            return;
+        }
         if (!text.startsWith("/ai")) {
             return;
         }
