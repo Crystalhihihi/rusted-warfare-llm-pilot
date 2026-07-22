@@ -73,6 +73,8 @@ class Summarizer:
                 taken += 1
             elif any(abs(u["x"] - p["x"]) < 200 and abs(u["y"] - p["y"]) < 200 for u in enemies):
                 hostile.append(p)
+            elif getattr(self, "danger_filter", None) and self.danger_filter(p["x"], p["y"], snap):
+                hostile.append(p)  # 记忆威胁（敌人离开视野仍危险，勿去）
             elif p.get("w"):
                 free_water.append(p)
             else:

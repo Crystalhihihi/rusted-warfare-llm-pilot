@@ -4,7 +4,12 @@ api_key_env = "DEEPSEEK_API_KEY"      # 从环境变量读 key，不写进文件
 model = "deepseek-reasoner"   # 推理型：deepseek-chat 实测优柔寡断不敢进攻；reasoner 决策果断（输出含思维链，单次略贵）
 
 use_executor = true        # 执行层托管经济/生产/升级（false 回退纯 LLM 微操）；LLM_OFF=1 环境变量可跳过 LLM 纯跑执行层
-strategy_interval_sec = 25 # 战略层节拍：执行层托管时 LLM 每隔多少秒决策一次（警报时自动加速到 fast_interval_sec）
+multi_agent = true         # 多 agent 架构：总指挥+建造/战斗三循环并行（建造也归 LLM；executor 退为执行内核只做跟踪/抢修/槽位）
+model_fast = "deepseek-chat"  # 建造/战斗 agent 用快模型（5-10s 级）；总指挥仍用上面的 model（reasoner）
+commander_interval_sec = 50 # 总指挥节拍：多久修订一次《作战计划书》
+build_interval_sec = 10    # 建造 agent 节拍
+combat_interval_sec = 6    # 战斗 agent 节拍（警报时由 fast_interval_sec 兜底）
+strategy_interval_sec = 25 # 单 LLM 模式战略层节拍（multi_agent=false 时用）
 auto_military = false      # LLM 沉默 90s 时执行层是否自动用兵（默认 false：军事决策完全归 LLM）
 
 interval_sec = 4.0        # 基础节拍（秒）；自适应模式下为无威胁时的参考值

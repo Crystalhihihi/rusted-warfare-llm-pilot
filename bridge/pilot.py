@@ -895,6 +895,34 @@ def main():
         threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
                          daemon=True, name="rw-executor").start()
 
+    # 多 agent 架构（config multi_agent=true）：总指挥+建造/战斗三循环并行，
+    # executor 退为执行内核（autopilot=False：只跟踪进度/抢修兜底/槽位服务）。
+    # LLM_OFF=1 时不进此分支（executor 保持全托管，留作基准对照）。
+    if cfg.get("multi_agent", False) and not llm_off:
+        if executor is None:  # multi_agent 依赖 executor 机械层，强制补齐
+            executor = exec_mod.Executor(map_msg, pedia, log_activity)
+            executor.dmap = danger_map
+            exec_holder["ex"] = executor
+            threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
+                             daemon=True, name="rw-executor").start()
+        executor.autopilot = False
+        import multiagent
+        return multiagent.run({
+            "link": link, "cfg": cfg, "api_key": api_key, "pedia": pedia,
+            "map_msg": map_msg, "map_msg_holder": {"m": map_msg},
+            "known_actions": known_actions, "naval_types": naval_types,
+            "exec_holder": exec_holder, "reflex": reflex,
+            "danger_map": danger_map, "conn_comp": conn_comp, "conn_n": conn_n,
+            "mine_spawn": mine_spawn, "enemy_spawns": enemy_spawns,
+            "log_activity": log_activity, "answer_query": answer_query,
+            "strategic_grid": strategic_grid, "ground_combat_ids": ground_combat_ids,
+            "naval_split": naval_split, "aa_follow": aa_follow,
+            "nearest_water": nearest_water, "clamp": clamp,
+            "pedia_production_table": pedia_production_table, "downsample": downsample,
+            "ai_enabled": lambda: not (link.ai_control_state()
+                                       and not link.ai_control_state().get("enabled", True)),
+        })
+
     while True:
         # 新对局检测：地图消息版本变化 → 清空 LLM 上下文与摘要器状态
         mv = getattr(link, "map_version", 0)
