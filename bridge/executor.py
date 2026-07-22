@@ -114,6 +114,7 @@ class Executor:
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
+        self.autopilot = True           # False=多 agent 模式：只跑跟踪/抢修机械，经济生产决策归 LLM agent
         self.naval = None               # 水图判定（lazy）：水域占比>=20% 或 水池>=2
         self.front_dir = None           # 布局前线方向（CC→图心单位向量），首个 CC 出现时定
         self._water_anchor = "?"        # 近水锚点缓存（None=无水域；"?"=未计算）
@@ -260,6 +261,11 @@ class Executor:
             if cmd["cmd"] == "train":
                 self.train_hist.setdefault(cmd["factory"], deque()).append(now)  # 本地队列估计用
             return True
+
+        if not self.autopilot:
+            # 多 agent 模式：经济/生产/升级决策归 LLM agent；本层只保留进度跟踪 + 抢修兜底
+            self._dispatch_rescue(own, emit, stalled, idle_builders, danger, now)
+            return cmds
 
         # 1) 建造者数量：低于目标且有钱就补（此前条件写反导致归零后永不补产）
         if cc and len(builders) < self.econ_goal["builders"] and (cc.get("q") or 0) < QUEUE_MAX:
@@ -461,21 +467,8 @@ class Executor:
             else:
                 break
 
-        # 4.8) 烂尾续建：>60s 无进展的建筑，派最近的空闲建造者 resume（repair 路点）救场；
-        #      敌区烂尾不救（别送建造者），同一建筑 45s 内不重复派
-        for u in stalled:
-            if not idle_builders:
-                break
-            if now < self.resume_cd.get(u["id"], 0):
-                continue
-            if danger(u["x"], u["y"], 500):
-                continue
-            b = min(idle_builders, key=lambda q: (q["x"] - u["x"]) ** 2 + (q["y"] - u["y"]) ** 2)
-            if emit({"cmd": "resume", "builder": b["id"], "target": u["id"]},
-                    f"resume:{u['id']}", 15.0):
-                self.resume_cd[u["id"]] = now + 45.0
-                self.log("status", f"⚙ 烂尾续建：{u['t']}#{u['id']} ← 建造者#{b['id']}")
-                idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
+        # 4.8) 抢修：烂尾(>60s 无进展)与受损建筑(hp<85%)，派最近的空闲建造者 resume
+        self._dispatch_rescue(own, emit, stalled, idle_builders, danger, now)
 
         # 5) 建筑升级双轨：采集器绝对优先（经济是根本），工厂并行不挤占；优先于常规补兵
         def try_upgrade(units, need):
@@ -563,6 +556,29 @@ class Executor:
             if ce:
                 return ce
         return idle_builders[0] if idle_builders else None
+
+    def _dispatch_rescue(self, own, emit, stalled, idle_builders, danger, now):
+        """抢修派工：烂尾(>60s 无进展)与受损建筑(hp<85%)，派最近的空闲建造者 resume——
+        repair 路点对未完工=续建、对已完工受损=修理（游戏右键同款路径）。
+        敌区不救（别送建造者），同一建筑 45s 内不重复派。"""
+        rescue = [(0, u) for u in stalled]
+        rescue += [(1, u) for u in own
+                   if u.get("bld") and not _constructing(u)
+                   and u["hp"] < u.get("maxHp", u["hp"]) * 0.85]
+        for kind, u in rescue:
+            if not idle_builders:
+                break
+            if now < self.resume_cd.get(u["id"], 0):
+                continue
+            if danger(u["x"], u["y"], 500):
+                continue
+            b = min(idle_builders, key=lambda q: (q["x"] - u["x"]) ** 2 + (q["y"] - u["y"]) ** 2)
+            if emit({"cmd": "resume", "builder": b["id"], "target": u["id"]},
+                    f"resume:{u['id']}", 15.0):
+                self.resume_cd[u["id"]] = now + 45.0
+                what = "烂尾续建" if kind == 0 else "修理受损"
+                self.log("status", f"⚙ {what}：{u['t']}#{u['id']} ← 建造者#{b['id']}")
+                idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
 
     # ---------- 布局槽位（全局长持方向，建筑成行成排而非螺旋散点） ----------
     def factory_slot(self, cc, idx, existing):

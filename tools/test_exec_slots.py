@@ -13,9 +13,9 @@ def mk_map(water_cols=0, w=100, h=100):
             "resources": [{"x": 1300, "y": 1000}, {"x": 200, "y": 1000, "w": True}]}
 
 _uid = [0]
-def U(t, x, y, bld=False, prog=None, act=None, q=None):
+def U(t, x, y, bld=False, prog=None, act=None, q=None, hp=100, maxHp=100):
     _uid[0] += 1
-    u = {"id": _uid[0], "t": t, "x": x, "y": y, "hp": 100, "maxHp": 100}
+    u = {"id": _uid[0], "t": t, "x": x, "y": y, "hp": hp, "maxHp": maxHp}
     if bld: u["bld"] = True
     if prog is not None: u["prog"] = prog
     if act is not None: u["act"] = act
@@ -60,12 +60,15 @@ builders = [U("builder", 1500, 1000), U("builder", 1510, 1000), U("builder", 152
 exts = [U("extractorT1", 1400 + i * 50, 1000, bld=True) for i in range(4)]
 facs = [U("landFactory", 1500, 740 - i * 170, bld=True, q=2) for i in range(2)]
 tur = U("turret", 1300, 900, bld=True, prog=0.5)
+dmg = U("extractorT1", 1460, 1100, bld=True, hp=400, maxHp=800)  # 受损 50%，应触发修理
 e2.prog_seen[tur["id"]] = (0.5, time.time() - 61)  # 61s 无进展 = 烂尾
 ces = [U("combatEngineer", 1600, 1000, act="idle"), U("combatEngineer", 1610, 1000, act="idle")]
-c3 = e2.tick(snap([cc2] + builders + exts + facs + [tur] + ces, 1800))
+c3 = e2.tick(snap([cc2] + builders + exts + facs + [tur, dmg] + ces, 1800))
 assert e2.is_naval_map() is False, "S2 不应判为水图"
 res = [c for c in c3 if c["cmd"] == "resume"]
-assert res and res[0]["target"] == tur["id"], f"S2 应派烂尾续建: {c3}"
+res_targets = {c["target"] for c in res}
+assert tur["id"] in res_targets, f"S2 应派烂尾续建: {c3}"
+assert dmg["id"] in res_targets, f"S2 应派受损修理: {c3}"
 print("S2 OK:", c3)
 
 # ---- S3：高资金，后勤槽位连排（fabricator 已建占0号，新fab占1号，实验厂应占2号） ----

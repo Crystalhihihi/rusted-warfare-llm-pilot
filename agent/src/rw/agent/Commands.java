@@ -178,8 +178,8 @@ public final class Commands {
                     reply(false, cmd, "target not found/dead");
                     return;
                 }
-                if (t.cm >= 1.0f) {
-                    reply(false, cmd, "target 已完工，无需续建");
+                if (t.cm >= 1.0f && t.cu >= t.cv) {
+                    reply(false, cmd, "target 完好，无需续建/修理");
                     return;
                 }
                 boolean isBuilder = false;
