@@ -177,6 +177,8 @@ class Executor:
         cmds = []
         own = snap.get("own", [])
         funds = (snap.get("team") or {}).get("funds", 0)
+        mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
+        mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
 
         builders = [u for u in own if _is_builder(u)]
         idle_builders = [u for u in builders if not _busy(u)]
@@ -240,8 +242,13 @@ class Executor:
         if (len(ext_done) >= 2 and len(fac_producers) + any_fac_inflight < 1
                 and funds >= max(FUNDS_RESERVE, 700) and idle_builders):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"]},
-                 f"build:lf:{b['id']}", 4.0)
+            fcmd = {"cmd": "build", "action": "b_landFactory", "builder": b["id"]}
+            if cc and mw and mh:  # 厂区落在主基地侧翼（垂直于前线方向），不挡正面
+                dx, dy = mw / 2 - cc["x"], mh / 2 - cc["y"]
+                d = max(1.0, math.hypot(dx, dy))
+                fcmd["x"] = float(cc["x"] - dy / d * 260)
+                fcmd["y"] = float(cc["y"] + dx / d * 260)
+            emit(fcmd, f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
         # 4) 工厂扩建：军力目标+资金双驱动（此前太保守导致资金爆表）；厂型跟随军队构成
@@ -293,12 +300,13 @@ class Executor:
             tcmd = {"cmd": "build", "action": tur_action, "builder": b["id"]}
             mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
             mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
-            if cc and mw and mh:  # 朝地图中心方向逐座前移：第1座260px，之后每座再+160（防线前推稳定领土）
+            if cc and mw and mh:  # 防线弧形前推：朝地图中心逐座前移并左右展开（不再挤一条线）
                 dx, dy = mw / 2 - cc["x"], mh / 2 - cc["y"]
                 d = max(1.0, math.hypot(dx, dy))
                 off = min(900, 260 + len(turrets) * 160)
-                tcmd["x"] = float(cc["x"] + dx / d * off)
-                tcmd["y"] = float(cc["y"] + dy / d * off)
+                lat = 130 if len(turrets) % 2 else -130
+                tcmd["x"] = float(cc["x"] + dx / d * off - dy / d * lat)
+                tcmd["y"] = float(cc["y"] + dy / d * off + dx / d * lat)
             emit(tcmd, f"build:tur:{b['id']}", 6.0)
             idle_builders = idle_builders[1:]
 
@@ -349,6 +357,11 @@ class Executor:
             bcmd = {"cmd": "build", "action": action, "builder": b["id"]}
             if bx is not None and by is not None:
                 bcmd["x"], bcmd["y"] = float(bx), float(by)
+            elif cc and mw and mh:  # 无锚点：落在主基地后方（背对前线一侧）
+                dx, dy = cc["x"] - mw / 2, cc["y"] - mh / 2
+                d = max(1.0, math.hypot(dx, dy))
+                bcmd["x"] = float(cc["x"] + dx / d * 220)
+                bcmd["y"] = float(cc["y"] + dy / d * 220)
             if emit(bcmd, f"build:custom:{b['id']}", 6.0):
                 self.custom_builds.pop(0)
                 idle_builders = idle_builders[1:]
