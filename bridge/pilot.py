@@ -591,7 +591,7 @@ def ground_combat_ids(snap, squad_ids):
                     and u["t"] not in AA_ONLY)
 
 
-def aa_follow(snap, cmd, cx, cy):
+def aa_follow(link, snap, cmd, cx, cy):
     """纯防空单位不当炮灰也不蹲家：move 到攻击目标后撤 500px 的后排，罩住空域。"""
     if cx is None:
         return
@@ -1024,7 +1024,7 @@ def main():
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
                     cmd["units"] = gids  # 地面进攻只带能打地面的
-                aa_follow(snap, cmd, cx, cy)
+                aa_follow(link, snap, cmd, cx, cy)
             elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
                 cmd = {"cmd": "attackmove",
@@ -1037,7 +1037,7 @@ def main():
                 if squad_u:
                     cx = sum(u["x"] for u in squad_u) / len(squad_u)
                     cy = sum(u["y"] for u in squad_u) / len(squad_u)
-                    aa_follow(snap, cmd, cx, cy)
+                    aa_follow(link, snap, cmd, cx, cy)
             elif executor is not None and name == "defend_home":
                 executor.last_military_order = time.time()
                 if getattr(smz, "home", None):

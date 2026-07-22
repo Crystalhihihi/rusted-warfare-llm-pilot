@@ -22,9 +22,9 @@ BUILDER_BUILD = {  # 建造者建造动作的静态优先级（按局面分支�
 # 工厂生产的静态默认优先级（生产动作 ID，按 pedia 过滤后生效）
 DEFAULT_PROD = {
     "landFactory": ["u_c_tank", "u_missileTank", "u_c_artillery", "u_plasmaTank", "u_heavyTank"],
-    "airFactory": ["u_lightGunship", "u_c_interceptor", "u_gunShip"],
+    "airFactory": ["u_heavyInterceptor", "u_c_interceptor", "u_gunShip", "u_bomber"],
     "seaFactory": ["u_gunBoat", "u_missileShip", "u_battleShip"],
-    "mechFactory": ["u_c_mech", "u_mech"],
+    "mechFactory": ["u_mechGun", "u_mechMissile", "u_mechArtillery", "u_mechBunker"],
 }
 # 各目标默认配置
 DEFAULT_ECON = {"extractors": 4, "builders": 3, "max_factories": 2}
@@ -461,9 +461,11 @@ class Executor:
             if not tech_ok(act):
                 continue
             return act
-        # 静态表没有时退回百科里第一个可用的
+        # 静态表没有时退回百科里第一个可用的（建造者/侦察兵不算生产，防兜底刷民夫）
         if avail:
             for act in sorted(avail):
+                if act in ("u_builder", "u_scout"):
+                    continue
                 if not self._bad(act, now) and tech_ok(act):
                     return act
         return None
