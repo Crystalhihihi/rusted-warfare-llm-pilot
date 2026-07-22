@@ -212,6 +212,21 @@ STRAT_TOOLS = [
 ]
 
 
+def _atk_tag(u):
+    """紧凑攻击标签：地/空/双/无（无=有武器数据但不武装）；无 atk 数据返回 None。"""
+    atk = u.get("atk")
+    if not atk:
+        return None
+    g, a = atk.get("g"), atk.get("a")
+    if g and a:
+        return "双"
+    if a:
+        return "空"
+    if g:
+        return "地"
+    return "无"
+
+
 def answer_query(topic, arg, map_msg, pedia, snap):
     """目录式资料应答器：全部本地数据生成，不调 LLM，答案紧凑。"""
     import tactics_guide
@@ -227,6 +242,14 @@ def answer_query(topic, arg, map_msg, pedia, snap):
         ans = (f"{u['name']}({u.get('display', '')}): ${u.get('price', '?')} T{u.get('tech', '?')} "
                f"建筑={u.get('building')} 建造者={u.get('builder')} 移动={u.get('move', '?')} "
                f"hp={u.get('hp', '?')} 动作[{','.join(builds[:24])}]")
+        atk = u.get("atk")
+        if atk:
+            if (atk.get("g") or atk.get("a")) and not atk.get("dmg"):
+                # 硬编码单位伤害在发射时注入，类型级读不到——标未知而非 0，防 LLM 误判"没伤害"
+                ans += f" 武器[{_atk_tag(u)} 伤害未知 射程={atk.get('rng', '?')} 门数={atk.get('n', '?')}]"
+            else:
+                ans += (f" 武器[{_atk_tag(u)} 单轮dmg={atk.get('dmg', '?')} dps={atk.get('dps', '?')}"
+                        f" 射程={atk.get('rng', '?')} 门数={atk.get('n', '?')}]")
         note = tactics_guide.GUIDE.get(u["name"])
         return ans + (f"\n战术: {note}" if note else "")
     if topic == "guide":
@@ -244,7 +267,8 @@ def answer_query(topic, arg, map_msg, pedia, snap):
             else:
                 mv = (u.get("move") or "").upper()
                 g = "空军" if "AIR" in mv else ("海军" if ("SEA" in mv or "WATER" in mv) else "陆军")
-            groups[g].append(f"{name}(${u.get('price', '?')},T{u.get('tech', '?')})")
+            tag = _atk_tag(u)
+            groups[g].append(f"{name}(${u.get('price', '?')},T{u.get('tech', '?')}{',' + tag if tag else ''})")
         return "\n".join(f"{k}({len(v)}): " + ",".join(v[:40]) for k, v in groups.items() if v)
     if topic == "map_overview":
         rows = map_msg.get("rows", [])
@@ -320,7 +344,10 @@ def _capability_brief(pedia):
 
     def with_tech(action):
         ut = by_name.get(action[2:]) if action.startswith("u_") else None
-        return f"{action}(T{ut['tech']})" if ut else action
+        if not ut:
+            return action
+        tag = _atk_tag(ut)
+        return f"{action}(T{ut['tech']}{',' + tag if tag else ''})"
 
     rows = []
     for name in ("commandCenter", "builder", "landFactory", "airFactory", "seaFactory", "mechFactory"):
@@ -620,6 +647,49 @@ def aa_follow(link, snap, cmd, cx, cy):
     link.send({"cmd": "move", "x": bx, "y": by, "units": ",".join(aa)})
 
 
+def nearest_water(map_msg, x, y, max_px=2500):
+    """目标点 max_px 半径内最近的水域 tile（世界坐标）；没有则 None。"""
+    rows = map_msg.get("rows") or []
+    if not rows:
+        return None
+    tw, th = map_msg.get("tileW") or 1, map_msg.get("tileH") or 1
+    h, w = len(rows), len(rows[0])
+    cx, cy = int(x / tw), int(y / th)
+    r = max(1, int(max_px / tw))
+    best, bd = None, None
+    for ty in range(max(0, cy - r), min(h, cy + r + 1)):
+        row = rows[ty]
+        for tx in range(max(0, cx - r), min(w, cx + r + 1)):
+            if row[tx] != "~":
+                continue
+            d2 = ((tx + 0.5) * tw - x) ** 2 + ((ty + 0.5) * th - y) ** 2
+            if bd is None or d2 < bd:
+                best, bd = ((tx + 0.5) * tw, (ty + 0.5) * th), d2
+    return best
+
+
+def naval_split(link, snap, cmd, gids, map_msg, naval_types):
+    """目标附近有水域时，把纯水上单位从地面进攻里拆出来派往目标最近水域——
+    不再跟着陆军卡在岸边看戏；纯海军编队则整个进攻改走水路。无水域时不动。"""
+    if not naval_types or not gids:
+        return
+    nids = {str(u["id"]) for u in snap.get("own", [])
+            if u["id"] in set(snap.get("delegated", [])) and not u.get("bld") and u["t"] in naval_types}
+    if not nids:
+        return
+    wspot = nearest_water(map_msg, cmd["x"], cmd["y"])
+    if not wspot:
+        return
+    gset = [i for i in gids.split(",") if i and i not in nids]
+    if gset:
+        cmd["units"] = ",".join(gset)
+        link.send({"cmd": "attackmove", "units": ",".join(nids),
+                   "x": float(wspot[0]), "y": float(wspot[1])})
+    else:
+        cmd["units"] = ",".join(nids)
+        cmd["x"], cmd["y"] = float(wspot[0]), float(wspot[1])
+
+
 def executor_worker(link, holder, cmd_times):
     """执行层独立线程：每 2s 跑一拍，不再被 LLM 调用阻塞（指令饿死的根治）。"""
     while True:
@@ -698,6 +768,9 @@ def main():
     known_actions = set()
     for pu in (pedia or {}).get("units", []):
         known_actions.update(pu.get("builds", []))
+    # 纯水上单位类型（攻击陆地目标时拆分走水路；OVER_CLIFF_WATER 的两栖单位不算）
+    naval_types = {u["name"] for u in (pedia or {}).get("units", [])
+                   if (u.get("move") or "").upper() in ("WATER", "SEA")}
     world_w = map_msg["tilesW"] * map_msg["tileW"]
     world_h = map_msg["tilesH"] * map_msg["tileH"]
 
@@ -718,8 +791,17 @@ def main():
         print("[delegate] 已创建 delegation.json（默认委托 9 队，可编辑热更新）")
 
     use_exec = cfg.get("use_executor", True)
-    system = {"role": "system", "content": (build_strategy_prompt(map_msg, pedia, cfg, user_groups)
-                                            if use_exec else build_system_prompt(map_msg, pedia, cfg, user_groups))}
+
+    def make_system(map_m, mine, foes):
+        # 系统提示内含地图尺寸/资源点/出生点——换新图必须重建，否则 LLM 全程看旧图
+        content = (build_strategy_prompt(map_m, pedia, cfg, user_groups)
+                   if use_exec else build_system_prompt(map_m, pedia, cfg, user_groups))
+        if mine or foes:
+            content += (f"\n【出生点（开局房间公开信息）】我方≈{mine}；敌方: "
+                        + ",".join(f"({int(x)},{int(y)})" for x, y in foes)
+                        + "。敌方主力大概率从这些方向来，扩张/防线方向据此判断。")
+        return {"role": "system", "content": content}
+
     print(f"[pilot] 地图 {map_msg['tilesW']}x{map_msg['tilesH']} 已载入，LLM={cfg['model']}，委托编队={sorted(user_groups)}")
     if user_groups != {9}:  # 默认 9 队由 agent 侧兜底，不强行覆盖游戏内 /ai groups 设置
         link.send({"cmd": "delegate", "groups": ",".join(str(group_to_slot(g)) for g in sorted(user_groups))})
@@ -742,10 +824,7 @@ def main():
         print(f"[map] 出生点: 我方{mine_spawn} 敌方{enemy_spawns}")
     if executor is not None:
         executor.dmap = danger_map
-    if mine_spawn or enemy_spawns:
-        system["content"] += (f"\n【出生点（开局房间公开信息）】我方≈{mine_spawn}；敌方: "
-                              + ",".join(f"({int(x)},{int(y)})" for x, y in enemy_spawns)
-                              + "。敌方主力大概率从这些方向来，扩张/防线方向据此判断。")
+    system = make_system(map_msg, mine_spawn, enemy_spawns)
     # 反射层：受击撤退/基地回防/建造者召回（纯规则，始终启用）
     import reflex as reflex_mod
     reflex = reflex_mod.Reflex(log_activity)
@@ -825,6 +904,10 @@ def main():
             failed_perm.clear()
             failed_temp.clear()
             new_map = link.map_message()
+            if new_map:  # LLM 看到的地图/战略格/坐标钳制全部切到新图
+                map_msg = new_map
+                world_w = map_msg["tilesW"] * map_msg["tileW"]
+                world_h = map_msg["tilesH"] * map_msg["tileH"]
             smz = summarize.Summarizer((new_map or {}).get("resources", []))
             conn_comp, conn_n = connmap.build_components((new_map or {}).get("rows", []))
             danger_map = danger_mod.DangerMap()
@@ -840,6 +923,7 @@ def main():
                 executor.dmap = danger_map
                 exec_holder["ex"] = executor
             reflex.dmap = danger_map
+            system = make_system(map_msg, mine_spawn, enemy_spawns)
             print("[pilot] 检测到新对局，上下文已重置")
             log_activity("status", "新对局开始，AI 上下文已重置")
             continue
@@ -1088,6 +1172,7 @@ def main():
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
                     cmd["units"] = gids  # 地面进攻只带能打地面的
+                naval_split(link, snap, cmd, gids, map_msg, naval_types)
                 aa_follow(link, snap, cmd, cx, cy)
             elif executor is not None and name in ("attack", "harass"):
                 executor.last_military_order = time.time()
@@ -1097,6 +1182,7 @@ def main():
                 gids = ground_combat_ids(snap, set(snap.get("delegated", [])))
                 if gids:
                     cmd["units"] = gids
+                naval_split(link, snap, cmd, gids, map_msg, naval_types)
                 squad_u = [u for u in snap.get("own", []) if u["id"] in set(snap.get("delegated", [])) and not u.get("bld")]
                 if squad_u:
                     cx = sum(u["x"] for u in squad_u) / len(squad_u)

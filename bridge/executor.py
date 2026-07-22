@@ -21,15 +21,16 @@ BUILDER_BUILD = {  # 建造者建造动作的静态优先级（按局面分支�
 }
 # 纯防空单位：默认生产时限制在军队 25% 以内（防空是配角不是主角）
 AA_PROD = {"u_missileTank", "u_c_interceptor", "u_heavyInterceptor",
-           "u_mechMissile", "u_mechHeavyMissile", "u_aaBeamGunship"}
+           "u_mechMissile", "u_mechHeavyMissile", "u_aaBeamGunship", "u_heavyAAShip"}
 AA_PROD_NAMES = {"missileTank", "interceptor", "c_interceptor", "heavyInterceptor",
-                 "mechMissile", "mechHeavyMissile", "aaBeamGunship", "aaBeamGunship_afterburn"}
+                 "mechMissile", "mechHeavyMissile", "aaBeamGunship", "aaBeamGunship_afterburn",
+                 "heavyAAShip"}
 AA_RATIO = 0.25
 # 工厂生产的静态默认优先级（生产动作 ID，按 pedia 过滤后生效）
 DEFAULT_PROD = {
     "landFactory": ["u_c_tank", "u_missileTank", "u_c_artillery", "u_plasmaTank", "u_heavyTank"],
     "airFactory": ["u_heavyInterceptor", "u_c_interceptor", "u_gunShip", "u_bomber"],
-    "seaFactory": ["u_gunBoat", "u_missileShip", "u_battleShip"],
+    "seaFactory": ["u_gunBoat", "u_missileShip", "u_battleShip", "u_heavyBattleship", "u_heavyAAShip"],
     "mechFactory": ["u_mechGun", "u_mechMissile", "u_mechArtillery", "u_mechBunker"],
 }
 # 各目标默认配置
@@ -113,6 +114,11 @@ class Executor:
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
         self.auto_military = False      # 默认关闭：军事决策完全归 LLM（config 可开）
+        self.naval = None               # 水图判定（lazy）：水域占比>=20% 或 水池>=2
+        self.front_dir = None           # 布局前线方向（CC→图心单位向量），首个 CC 出现时定
+        self._water_anchor = "?"        # 近水锚点缓存（None=无水域；"?"=未计算）
+        self.resume_cd = {}             # 烂尾建筑id -> 续建派工冷却时间
+        self._wext_issued = 0.0         # 水池建造下单窗口（45s 内不再派第二单）
         self.start_ts = time.time()
 
     # ---------- LLM 目标接口 ----------
@@ -192,7 +198,8 @@ class Executor:
         mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
 
         builders = [u for u in own if _is_builder(u)]
-        idle_builders = [u for u in builders if not _busy(u)]
+        # 海上建造者只走水池调度（它上不了岸，陆地派活只会反复被可达性拒绝）
+        idle_builders = [u for u in builders if not _busy(u) and u["t"] != "builderShip"]
 
         # 危险区：可见敌人 + 记忆威胁（敌人离开视野仍算危险，由 DangerMap 提供）
         enemies = snap.get("enemy", [])
@@ -205,6 +212,11 @@ class Executor:
         _cc = next((u for u in own if u["t"] == "commandCenter" and u.get("bld")), None)
         ccx = _cc["x"] if _cc else 0
         ccy = _cc["y"] if _cc else 0
+        # 布局前线方向（CC→图心）：全局长持，工厂槽位/后勤槽位/防线都以此定向
+        if _cc and mw and mh and self.front_dir is None:
+            fdx, fdy = mw / 2 - _cc["x"], mh / 2 - _cc["y"]
+            fd = max(1.0, math.hypot(fdx, fdy))
+            self.front_dir = (fdx / fd, fdy / fd)
         safe_pools = sorted(
             (p for p in self.resources
              if not p.get("w") and not danger(p["x"], p["y"])
@@ -275,11 +287,9 @@ class Executor:
                 and funds >= max(FUNDS_RESERVE, 700) and idle_builders):
             b = idle_builders[0]
             fcmd = {"cmd": "build", "action": "b_landFactory", "builder": b["id"]}
-            if cc and mw and mh:  # 厂区落在主基地侧翼（垂直于前线方向），不挡正面
-                dx, dy = mw / 2 - cc["x"], mh / 2 - cc["y"]
-                d = max(1.0, math.hypot(dx, dy))
-                fcmd["x"] = float(cc["x"] - dy / d * 260)
-                fcmd["y"] = float(cc["y"] + dx / d * 260)
+            if cc:  # 厂区槽位 0 号位：主基地侧翼（垂直于前线方向），不挡正面
+                sx, sy = self.factory_slot(cc, 0, [])
+                fcmd["x"], fcmd["y"] = float(sx), float(sy)
             emit(fcmd, f"build:lf:{b['id']}", 4.0)
             idle_builders = idle_builders[1:]
 
@@ -309,9 +319,10 @@ class Executor:
                 and funds >= 1400 and idle_builders and not self._bad(fac_action, now)):
             b = self._pick_builder(idle_builders, for_factory=True)
             fcmd = {"cmd": "build", "action": fac_action, "builder": b["id"]}
-            if land_factories:  # 向首厂聚拢，形成厂区而非散点
-                fcmd["x"] = float(land_factories[0]["x"]) + 120
-                fcmd["y"] = float(land_factories[0]["y"]) + 120
+            if cc:  # 厂区槽位：沿侧翼每 170px 一座成行（海厂不参与厂区编号）
+                idx = sum(1 for u in fac_producers if u["t"] != "seaFactory") + fac_inflight
+                sx, sy = self.factory_slot(cc, idx, land_factories)
+                fcmd["x"], fcmd["y"] = float(sx), float(sy)
             emit(fcmd, f"build:fac:{b['id']}", 4.0)
             idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
 
@@ -353,6 +364,12 @@ class Executor:
                 emit(tcmd, f"build:tur:{b['id']}", 6.0)
                 idle_builders = idle_builders[1:]
 
+        # 后勤建筑计数（fabricator/实验厂/维修湾）：misc 槽位按此排号，在主基地背后成排
+        misc_n = (sum(1 for u in own if u.get("bld") and (u["t"].startswith("fabricator")
+                      or "experimental" in u["t"].lower() or u["t"] == "repairbay"))
+                  + sum(1 for t, _ in self.issued_builds
+                        if t.startswith("fabricator") or "experimental" in t.lower() or t == "repairbay"))
+
         # 4.55) 僵局经济：资源点被占完、或采集器达标且资金爆表(≥15000)时，
         #      造资源制造仪发展额外经济（≤2座）——此前条件过严永远不会触发
         if funds >= 2500:
@@ -367,28 +384,62 @@ class Executor:
             if stalemate and fab_count + fab_inflight < fab_cap and idle_builders \
                     and not self._bad("b_fabricatorT1", now):
                 b = idle_builders[0]
-                emit({"cmd": "build", "action": "b_fabricatorT1", "builder": b["id"]},
-                     f"build:fab:{b['id']}", 8.0)
-                idle_builders = idle_builders[1:]
+                fbcmd = {"cmd": "build", "action": "b_fabricatorT1", "builder": b["id"]}
+                if cc:
+                    sx, sy = self.misc_slot(cc, misc_n)
+                    fbcmd["x"], fbcmd["y"] = float(sx), float(sy)
+                if emit(fbcmd, f"build:fab:{b['id']}", 8.0):
+                    misc_n += 1
+                    idle_builders = idle_builders[1:]
 
-        # 4.6) 高盈余战略建筑：实验厂（≥20000 且 ≥2 陆厂，限1座）与海军厂（水图才造）
+        # 4.6) 高盈余战略建筑：实验厂（≥20000 且 ≥2 陆厂，限1座）与海军厂（水图才造，锚定近水）
         exp_count = sum(1 for u in own if "experimental" in u["t"].lower() and u.get("bld"))
         exp_inflight = sum(1 for t, _ in self.issued_builds if "experimental" in t.lower())
         if (funds >= 20000 and len(land_factories) >= 2 and exp_count + exp_inflight < 1
                 and idle_builders and not self._bad("b_experimentalLandFactory", now)):
             b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_experimentalLandFactory", "builder": b["id"]},
-                 f"build:exp:{b['id']}", 8.0)
-            idle_builders = idle_builders[1:]
-        water_pools = sum(1 for p in self.resources if p.get("w"))
+            excmd = {"cmd": "build", "action": "b_experimentalLandFactory", "builder": b["id"]}
+            if cc:
+                sx, sy = self.misc_slot(cc, misc_n)
+                excmd["x"], excmd["y"] = float(sx), float(sy)
+            if emit(excmd, f"build:exp:{b['id']}", 8.0):
+                misc_n += 1
+                idle_builders = idle_builders[1:]
         sea_count = sum(1 for u in fac_producers if u["t"] == "seaFactory")
         sea_inflight = sum(1 for t, _ in self.issued_builds if t == "seaFactory")
-        if (water_pools >= 2 and len(ext_done) >= 2 and sea_count + sea_inflight < 1
+        if (self.is_naval_map() and len(ext_done) >= 2 and sea_count + sea_inflight < 1
                 and funds >= 1500 and idle_builders and not self._bad("b_seaFactory", now)):
-            b = idle_builders[0]
-            emit({"cmd": "build", "action": "b_seaFactory", "builder": b["id"]},
-                 f"build:sea:{b['id']}", 8.0)
-            idle_builders = idle_builders[1:]
+            wa = cc and self.water_anchor(cc)
+            if wa:  # 无水域锚点就不盖——海厂乱落位等于白盖
+                b = idle_builders[0]
+                emit({"cmd": "build", "action": "b_seaFactory", "builder": b["id"],
+                      "x": float(wa[0]), "y": float(wa[1])},
+                     f"build:sea:{b['id']}", 8.0)
+                idle_builders = idle_builders[1:]
+
+        # 4.65) 海上经济（水图限定）：海厂产 builderShip（≤2），派它去空闲水池建采集器；
+        #      同一时刻只派一单（45s 窗口），防两船抢同一池
+        if self.is_naval_map():
+            friendly = own + snap.get("allies", [])
+            free_water = [p for p in self.resources if p.get("w") and not danger(p["x"], p["y"])
+                          and not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
+                                      for u in friendly if u.get("bld"))]
+            bships = [u for u in own if u["t"] == "builderShip"]
+            sea_done = [u for u in fac_producers if u["t"] == "seaFactory"]
+            if free_water and sea_done and len(bships) < 2 and funds >= 600 \
+                    and not self._bad("u_builderShip", now):
+                sf = next((u for u in sea_done if self._q(u, now) < QUEUE_MAX), None)
+                if sf:
+                    emit({"cmd": "train", "action": "u_builderShip", "factory": sf["id"]},
+                         "train:bship", 15.0)
+            idle_bs = [u for u in bships if not _busy(u)]
+            if idle_bs and free_water and funds >= EXTRACTOR_PRICE and now >= self._wext_issued:
+                nb = idle_bs[0]
+                p = min(free_water, key=lambda q: (q["x"] - nb["x"]) ** 2 + (q["y"] - nb["y"]) ** 2)
+                if emit({"cmd": "build", "action": "b_extractorT1", "builder": nb["id"],
+                         "x": float(p["x"]), "y": float(p["y"])},
+                        f"build:wext:{nb['id']}", 8.0):
+                    self._wext_issued = now + 45.0
 
         # 4.7) LLM 指定建造（build_building 队列）：海厂/机甲厂/维修湾/实验厂等战略建筑
         while self.custom_builds and idle_builders and funds >= 500:
@@ -400,16 +451,31 @@ class Executor:
             bcmd = {"cmd": "build", "action": action, "builder": b["id"]}
             if bx is not None and by is not None:
                 bcmd["x"], bcmd["y"] = float(bx), float(by)
-            elif cc and mw and mh:  # 无锚点：落在主基地后方（背对前线一侧）
-                dx, dy = cc["x"] - mw / 2, cc["y"] - mh / 2
-                d = max(1.0, math.hypot(dx, dy))
-                bcmd["x"] = float(cc["x"] + dx / d * 220)
-                bcmd["y"] = float(cc["y"] + dy / d * 220)
+            elif cc:  # 无锚点：后勤槽位（主基地背后一排，不挡正面不挤厂区）
+                sx, sy = self.misc_slot(cc, misc_n)
+                bcmd["x"], bcmd["y"] = float(sx), float(sy)
             if emit(bcmd, f"build:custom:{b['id']}", 6.0):
                 self.custom_builds.pop(0)
+                misc_n += 1
                 idle_builders = idle_builders[1:]
             else:
                 break
+
+        # 4.8) 烂尾续建：>60s 无进展的建筑，派最近的空闲建造者 resume（repair 路点）救场；
+        #      敌区烂尾不救（别送建造者），同一建筑 45s 内不重复派
+        for u in stalled:
+            if not idle_builders:
+                break
+            if now < self.resume_cd.get(u["id"], 0):
+                continue
+            if danger(u["x"], u["y"], 500):
+                continue
+            b = min(idle_builders, key=lambda q: (q["x"] - u["x"]) ** 2 + (q["y"] - u["y"]) ** 2)
+            if emit({"cmd": "resume", "builder": b["id"], "target": u["id"]},
+                    f"resume:{u['id']}", 15.0):
+                self.resume_cd[u["id"]] = now + 45.0
+                self.log("status", f"⚙ 烂尾续建：{u['t']}#{u['id']} ← 建造者#{b['id']}")
+                idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
 
         # 5) 建筑升级双轨：采集器绝对优先（经济是根本），工厂并行不挤占；优先于常规补兵
         def try_upgrade(units, need):
@@ -498,6 +564,51 @@ class Executor:
                 return ce
         return idle_builders[0] if idle_builders else None
 
+    # ---------- 布局槽位（全局长持方向，建筑成行成排而非螺旋散点） ----------
+    def factory_slot(self, cc, idx, existing):
+        """厂区槽位：0 号位在 CC 侧翼 260px（垂直前线），后续沿同侧每 170px 一座成行。"""
+        fx, fy = self.front_dir or (0.0, 1.0)
+        lx, ly = -fy, fx
+        if idx > 0 and existing:  # 厂区方向跟随首厂所在侧（防 LLM 先盖厂后方向反转）
+            if (existing[0]["x"] - cc["x"]) * lx + (existing[0]["y"] - cc["y"]) * ly < 0:
+                lx, ly = -lx, -ly
+        return cc["x"] + lx * (260 + 170 * idx), cc["y"] + ly * (260 + 170 * idx)
+
+    def misc_slot(self, cc, idx):
+        """后勤槽位：主基地背后（背对前线）一排，每 170px 一座。"""
+        fx, fy = self.front_dir or (0.0, 1.0)
+        return cc["x"] - fx * (240 + 170 * idx), cc["y"] - fy * (240 + 170 * idx)
+
+    def is_naval_map(self):
+        """水图判定：水域占比≥20% 或 水池≥2。结果缓存（地图不变）。"""
+        if self.naval is None:
+            rows = self.map.get("rows") or []
+            total = sum(len(r) for r in rows) or 1
+            water = sum(r.count("~") for r in rows)
+            self.naval = water / total >= 0.20 or self._water_pools() >= 2
+        return self.naval
+
+    def _water_pools(self):
+        return sum(1 for p in self.resources if p.get("w"))
+
+    def water_anchor(self, cc):
+        """离 CC 最近的水域 tile（世界坐标），海厂锚点；无水域返回 None。结果缓存。"""
+        if self._water_anchor == "?":
+            rows = self.map.get("rows") or []
+            tw = self.map.get("tileW") or 1
+            th = self.map.get("tileH") or 1
+            best, bd = None, None
+            for ty, row in enumerate(rows):
+                for tx, ch in enumerate(row):
+                    if ch != "~":
+                        continue
+                    wx, wy = (tx + 0.5) * tw, (ty + 0.5) * th
+                    d2 = (wx - cc["x"]) ** 2 + (wy - cc["y"]) ** 2
+                    if bd is None or d2 < bd:
+                        best, bd = (wx, wy), d2
+            self._water_anchor = best
+        return self._water_anchor
+
     # ---------- 生产决策 ----------
     def _next_production(self, fac, own):
         now = time.time()
@@ -561,6 +672,7 @@ class Executor:
         idle_b = sum(1 for u in builders if not _busy(u))
         ext = sum(1 for u in own if u["t"].startswith("extractor") and u.get("bld") and not _constructing(u))
         facs = sum(1 for u in own if _is_factory(u) and not _constructing(u))
-        stalled_txt = f" 烂尾{getattr(self, 'last_stalled', 0)}座(请手动补盖)" if getattr(self, "last_stalled", 0) else ""
+        stalled_txt = f" 烂尾{getattr(self, 'last_stalled', 0)}座(续建已派)" if getattr(self, "last_stalled", 0) else ""
+        naval_txt = " 水图" if self.naval else ""
         return (f"执行层: 池{ext}/{self.econ_goal['extractors']} 厂{facs} "
-                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}{stalled_txt}")
+                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}{naval_txt}{stalled_txt}")
