@@ -19,6 +19,12 @@ BUILDER_BUILD = {  # 建造者建造动作的静态优先级（按局面分支�
     "extractor": ["b_extractorT1"],
     "landFactory": ["b_landFactory"],
 }
+# 纯防空单位：默认生产时限制在军队 25% 以内（防空是配角不是主角）
+AA_PROD = {"u_missileTank", "u_c_interceptor", "u_heavyInterceptor",
+           "u_mechMissile", "u_mechHeavyMissile", "u_aaBeamGunship"}
+AA_PROD_NAMES = {"missileTank", "interceptor", "c_interceptor", "heavyInterceptor",
+                 "mechMissile", "mechHeavyMissile", "aaBeamGunship", "aaBeamGunship_afterburn"}
+AA_RATIO = 0.25
 # 工厂生产的静态默认优先级（生产动作 ID，按 pedia 过滤后生效）
 DEFAULT_PROD = {
     "landFactory": ["u_c_tank", "u_missileTank", "u_c_artillery", "u_plasmaTank", "u_heavyTank"],
@@ -525,13 +531,18 @@ class Executor:
                     best, best_deficit = action, deficit
             if best:
                 return best
-        # 默认优先级模式
+        # 默认优先级模式（防空单位占比超 25% 就跳过，防空是配角）
+        combat_units = [u for u in own if not u.get("bld")]
+        aa_now = sum(1 for u in combat_units if u["t"] in AA_PROD_NAMES)
+        aa_full = bool(combat_units) and aa_now >= max(1, len(combat_units) * AA_RATIO)
         for act in DEFAULT_PROD.get(ftype, []):
             if self._bad(act, now):
                 continue
             if avail is not None and act not in avail:
                 continue
             if not tech_ok(act):
+                continue
+            if aa_full and act in AA_PROD:
                 continue
             return act
         # 静态表没有时退回百科里第一个可用的（建造者/侦察兵不算生产，防兜底刷民夫）
