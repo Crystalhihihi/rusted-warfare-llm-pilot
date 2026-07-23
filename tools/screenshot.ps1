@@ -1,5 +1,6 @@
 # Capture primary screen to a PNG (for overlay UI visual verification).
 param([string]$Out = "D:\ttttttt\tools\screen.png")
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $b = [System.Drawing.Bitmap]::new([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,
                                   [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)

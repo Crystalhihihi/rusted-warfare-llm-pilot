@@ -195,6 +195,72 @@ public final class Commands {
                 c.a((y) b);
                 c.b(t); // repair 路点：建造者会自己走进施工距离续建，完工/目标死亡游戏自动清路点
                 reply(true, cmd, "builder#" + b.eh + " resume " + t.r().i() + "#" + t.eh);
+            } else if ("buildq".equals(cmd)) {
+                // 队列建造（UI shift 拉条同款机制）：第 1 条起全部 e=true 追加进 y.g 路点数组，
+                // 游戏 av.c→av.d 改写 + 完工 ax() 自动推进，建造者连干 N 个建筑
+                Float bid = numVal(line, "builder");
+                String items = strVal(line, "items"); // "b_x@x,y;b_y@x,y;..."
+                if (bid == null || items == null) {
+                    reply(false, cmd, "missing builder/items");
+                    return;
+                }
+                am b = w.a(bid.longValue(), false);
+                if (b == null || b.bV || b.bX != team) {
+                    reply(false, cmd, "builder not found/dead");
+                    return;
+                }
+                boolean isBuilder = false;
+                try {
+                    isBuilder = b.r().l();
+                } catch (Throwable ignored) {
+                }
+                if (!isBuilder) {
+                    reply(false, cmd, "指定的 builder 不是建造者");
+                    return;
+                }
+                if (!ensureActionReflect()) {
+                    reply(false, cmd, "action reflection unavailable");
+                    return;
+                }
+                int queued = 0;
+                StringBuilder skipped = new StringBuilder();
+                for (String it : items.split(";")) {
+                    String[] pa = it.split("@");
+                    if (pa.length != 2) {
+                        continue;
+                    }
+                    String[] xy = pa[1].split(",");
+                    if (xy.length != 2) {
+                        continue;
+                    }
+                    as type = resolveType(pa[0]);
+                    if (type == null) {
+                        skipped.append(pa[0]).append('?').append(' ');
+                        continue;
+                    }
+                    float px;
+                    float py;
+                    try {
+                        px = Float.parseFloat(xy[0]);
+                        py = Float.parseFloat(xy[1]);
+                    } catch (NumberFormatException nfe) {
+                        continue;
+                    }
+                    try {
+                        if (placementError(type, px, py, team) != null) {
+                            skipped.append(pa[0]).append("@(").append((int) px).append(",").append((int) py).append(") ");
+                            continue; // 校验不过跳过该点，不影响队列其它路点
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    e c = engine.cf.b(team);
+                    c.e = true; // 追加模式：不清队列，路点进队尾（e.java:13）
+                    c.a((y) b);
+                    c.a(px, py, type, 1);
+                    queued++;
+                }
+                reply(true, cmd, "builder#" + b.eh + " buildq x" + queued
+                    + (skipped.length() > 0 ? "（跳过: " + skipped + "）" : ""));
             } else if ("delegate".equals(cmd)) {
                 String groups = strVal(line, "groups");
                 if (groups == null) {

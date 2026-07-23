@@ -1,50 +1,57 @@
 # Rusted Warfare LLM Pilot — 项目进度与现状评估（交接文档）
 
-> 更新时间：2026-07-22。适用读者：新窗口/新人接手。本文件如实记录当前进展、真人实测评价与下一步计划。
-> 当前版本：**v3.0**（多 agent 架构：总指挥/建造/战斗三循环 + 规则快层 + 反射层；v2=三层架构已成历史）
+> 更新时间：2026-07-23。适用读者：新窗口/新人接手。本文件如实记录当前进展、真人实测评价、**未实测清单**与下一步计划。
+> 当前版本：**v3.1**（LLM 出计划/工单，确定性层执行，事件定召唤；v2=三层架构、v3.0=多 agent 轮询，均成历史）
 
 ## 一、项目是什么
 
 把大语言模型接入即时战略游戏《铁锈战争》（Rusted Warfare）：
-Java javaagent 挂在游戏 JVM 上实时提取战况（快照/NDJSON/TCP 41234），
-Python 桥接层把战况交给 LLM 决策，指令经游戏原生命令队列回注执行。
-**仅限单机研究，严禁多人对战。**
+Java javaagent 挂游戏 JVM 实时提取战况（快照/NDJSON/TCP 41234），Python 桥接层决策，指令经游戏原生命令队列回注。
+**仅限单机研究，严禁多人对战。**（RW 本体 libRocket 鼠标处理有 latent bug，与 agent 无关，已鉴定）
 
-架构（v3.0 当前生效形态）：
+## 二、架构（v3.1 当前生效形态）
 
 ```
-总指挥 LLM（reasoner ~50s/次）：只产出《作战计划书》（阶段/经济/配兵/攻防/布局）
-建造 agent（chat 快层，空转升 reasoner）：经济建设与支援单位
-战斗 agent（chat 快层 + reasoner 兜底）：军工生产与攻防
-规则快层 executor（2s/拍）：例行经济/防线网格弧/抢修（无委托时完全旁观）
-反射层 reflex（纯规则毫秒级）：受击撤退/基地回防/赴险召回
-游戏内 UI（agent 内嵌）：AI 聊天台（可打字）/委托面板/角色设置面板（三角色开关）
+LLM 层（DeepSeek，3 个角色，全部事件触发，非轮询）：
+  总指挥（reasoner ~50s）：只产出《作战计划书》（阶段/经济/配兵/攻防/布局）
+  建造规划员（chat 单模型）：被召唤时产出《建造工单》（未来 2~3 分钟有序任务序列）
+  战斗（chat 起步+空转升 reasoner）：进攻/防守/集结/配兵/军工构成
+确定性层（零 token）：
+  BuilderManager（executor 内嵌 2s/拍）：工单调度——按序派任务、buildq 拉条、完成推进
+  规则快层（executor routine）：采集器补给/工厂扩建升级/生产排队/防线网格弧/抢修/前线哨戒/判死黑名单
+  反射层 reflex（毫秒级）：受击撤退/基地回防/赴险召回
+  领土控制图 powergrid：战力标签（dps×hp/100 分对地/对空）+ 400px 格安全值/占领状态/安稳判定
+游戏内 UI（agent 内嵌）：AI 聊天台（可打字）/委托面板/设置面板（三角色开关）/主栏
 ```
 
-## 二、怎么跑起来
+**核心方法论（调研实锤，见下）**：LLM 出计划/工单（JSON），确定性层按拍执行，事件决定何时召唤 LLM。
+文献共识（TextStarCraft II/SwarmBrain/LLM-PySC2/HFTBench）：没有任何工作能让 LLM 在真实时钟下反应更快，
+全部智慧是"让 LLM 更少被需要"——事件触发、宏微分离、动作队列、超时默认动作。
+实测耗时数据（tools/analyze_pace.py）：chat 单轮 42~48s、commander 112s、轮询制有效吞吐仅 ~2.8 动作/分钟——这是 v3.1 的直接动机。
 
-1. 双击 `rw-ai.bat`（一键：带 agent 起游戏 + 起桥接）
-2. 游戏里开遭遇战（自己是玩家），点 overlay 面板的「全队接管」
-3. 对 AI 下指令：游戏聊天框输入 `/s your message`（仅英文，游戏聊天框不支持中文）
+## 三、怎么跑起来
 
-变体：`LLM_OFF=1 python bridge/pilot.py` 纯执行层零 token；`bridge/config.toml` 换模型/节拍。
+1. `bash agent/build.sh`（JDK 11+，自动下载 ASM shade）
+2. `bridge/secret.toml` 填 DeepSeek key
+3. `rw-ai.bat`（一键：游戏+桥接）；`tools/run-bridge.bat` 只重启桥接（不动游戏）
+4. 游戏内开遭遇战 → 点 overlay「全队接管」→ 聊天台可直接打字指挥
+5. 数据面：`bridge/activity.jsonl`（活动流）、`bridge/pilot.log`（LLM 调用时序/并发）、`tools/match_metrics.py`（对局度量，存 metrics_history.jsonl）、`tools/analyze_pace.py`（耗时分析）
 
-## 三、已建成的能力
+## 四、已建成的能力（v3.1 全景）
 
-- **数据链路**：快照（0.5s）/单位百科/ASCII 地图/资源点/建造进度/生产队列/单位忙闲
-- **公平性**：战争迷雾过滤，只传本队视野内信息；指令走游戏正常队列并限速
-- **执行层**：BO 开局、多建造者并行施工、工厂扩建（军力+资金双驱动）、科技过滤（T2 厂只产 T2 兵）、防空占比上限 25%、危险区建造管控（敌区 600px 不派建造者）；槽位化选址（厂区沿侧翼成行/后勤建筑主基地背后成排/海厂锚定最近水域）；烂尾建筑自动续建（resume 指令走 repair 路点，与右键未完工建筑同路径）、受损建筑自动修理（hp<85% 同一路径派工）
-- **海军链路**（2026-07-22 新建）：水图判定（水域≥20% 或水池≥2）→ 近水海厂 → 海军生产（含 T2 重战列舰/防空舰）→ builderShip 水池采集；进攻时纯水上单位自动拆分打目标附近水域（naval_split），不再跟陆军卡岸边
-- **游戏内 UI**（2026-07-22）：主栏 + AI 聊天台（可拖动/缩放/面板内打字，ASM hook 抑制游戏快捷键）+ 委托面板（单位图标/聚合血条）+ 设置面板（总指挥/建造/战斗三角色独立开关）
-- **槽位网格**（2026-07-22）：Pedia 导出建筑占地 fp（constructionFootprint），executor 按 fp 分配空间——厂区贴死密排、防线弧格距=建筑宽+3 格（用户实战甜点：2x2→100px）、防空压后排不占弧尖、主通道留空、内圈维修湾；整齐是规则不是 LLM 运气
-- **规则快层与阶梯**（2026-07-22）：executor 限定复活（例行经济/防线工程/抢修，2s 级）；战斗 chat 快层 + 空转升 reasoner 兜底；计划书【布局】写到坐标级；用户防线示例提取成模板（分层/配比/阵型字典）
-- **LLM 工具**：战略动词 + query 资料目录（roster 全单位花名册/单位详情/价格表/地图三类/战术手册/基地位置），每轮最多 2 次查询
-- **战术手册**：玩家经验沉淀（兵种定位/克制/建筑用法/空军原则，bridge/tactics_guide.py，可持续增补）
-- **地图理解**：tmx 出生点解析（公平公开信息）、陆地连通域分析（敌区可达性+绕行点）、动态危险区（敌人位置记忆 90s 半衰+前线趋势）、agent 不可达绕行点建议
-- **玩家留言通道**：/s → agent → 桥接 → 注入下一轮 LLM 输入（优先级最高）
-- **一键启动**：rw-ai.bat
+- **数据链路**：快照 0.5s（含 income/expense 收支速率，游戏 UI"(+26)"同款 `team.b()/a()`）、Pedia（价格/科技/血量/移动/武器 atk/建筑占地 fp）、ASCII 地图/资源点/出生点 tmx 解析/战争迷雾过滤
+- **游戏内 UI**：主栏+AI 聊天台（拖动/缩放/增量 wrap 防卡/面板内打字，ASM hook 织入 keyPressed/keyReleased/mouseWheelMoved 抑制游戏快捷键，libRocket 弹窗让行）+ 委托面板（单位图标/聚合血条）+ 设置面板（三角色开关）+ 主栏按钮
+- **建造工单系统**：LLM 出 JSON 工单 → BuilderManager 按序调度（资金累计闸门/槽位现场解析 pool:k/factory:k/defense:k/misc:k/water、完成推进、90s 烂尾重派）→ **buildq 原生拉条**（`e` 命令对象 `e=true` 追加模式，e.java:13，游戏 y.g[] 路点队列完工 ax() 自动推进，与玩家 shift 拉条同路径，队列上限 29）
+- **槽位网格**：fp 占地表驱动——厂区贴死密排、防线弧格距=建筑宽+3 格（用户实战甜点：2x2→100px）、防空压后排不占弧尖、主通道留空、内圈维修湾、后勤成排、海厂近水；占位图含在途/判死格
+- **战力与领土**：powergrid 战力标签（对地/对空分开，防空车对地=0）、安全值=军力×1.0+建筑×1.5+离家加成−威胁热力、占领四类（军+建筑/纯军队/纯建筑/未控）、安稳判定（≥30 且持续 20s）——采集器只去安稳池或近家 600px
+- **收入率经济观**：快照 income/expense 全链路——摘要"资金 X (收入+Y/s 支出-Z/s)"、制造仪触发=收入<8、实验厂=收入≥15、prompt 硬规则"看收入不看余额、不许编造原因"
+- **海军链路**：水图判定→近水海厂→海军生产（T1/T2）→builderShip 水池采集；进攻 naval_split 拆水路；**海厂集结点自动落最近水域、海军回防去近家水域**（rally 按厂分水域）
+- **防线圈豁免**：防守类建筑（炮塔/防空/激光/维修湾/墙）离家 ≤1200px 内危险/召回黑名单照盖（防线挨打正是该盖时）；扩张类照禁（治开局乱跑）
+- **协调闭环**：反射召回→点位黑名单(10min)+规则层池判死（不可达永久）；失败回执自学习（300s/120s 封禁）；同值去重（rally/构成）；需求板（战斗 T2 需求→建造可见）；跨域回执判域（train 按动作归属，u_builderShip 超串先判）；计划书按变更注入（省 ~700 字×2 路/轮）
+- **LLM 工具**：query 目录（roster/单位详情/价格表/地图/战术手册/基地），每路查询预算 1（总指挥 4），查询螺旋强制纯文本输出
+- **离线测试**：tools/test_exec_slots.py（槽位/防线/工单/规则层）、tools/test_multiagent.py（mock LLM 三循环+闭环规则）、tools/analyze_pace.py（耗时统计）
 
-## 四、修过的关键 bug（历史教训，别再犯）
+## 五、修过的关键 bug（历史教训，别再犯）
 
 | bug | 教训 |
 |---|---|
@@ -57,79 +64,79 @@ Python 桥接层把战况交给 LLM 决策，指令经游戏原生命令队列�
 | T3 加强/取消死循环烧钱 | 终态建筑与回退动作要排除出升级轨 |
 | bat 文件含中文，cmd 解析崩溃 | Windows 批处理必须纯 ASCII |
 | executor 引用未定义 cc，每拍崩静默 | tick 异常要暴露，不能裸吞 |
-| 换局后 map_msg/system 不更新，LLM 全程看旧图 | 换局重置必须覆盖所有地图下游状态（系统提示/世界尺寸/战略格/query），make_system() 统一重建 |
-| builderShip 被当陆地建造者乱派反复失败 | `"uilder" in t` 这类隐性子串匹配要显式枚举例外（海上建造者只走水池调度） |
+| 换局后 map_msg/system 不更新，LLM 全程看旧图 | 换局重置必须覆盖所有地图下游状态，make_system() 统一重建 |
+| builderShip 被当陆地建造者乱派反复失败 | `"uilder" in t` 这类隐性子串匹配要显式枚举例外 |
+| query 应答后 break，commander 永远没机会产出正式回复 | query 循环必须"应答→再调用拿真正决策" |
+| 回执可用列表含 u_builder，战斗域回执误判给建造域 | train 回执按"被 train 的动作"判域，不能按文本含啥 |
+| LLM 省略 u_ 前缀（heavyTank）被误判拦截 | 动作 ID 先归一化再判守卫 |
+| 战斗/建造 chat 空转，升级 reasoner 也只是继续空转 | 分析癖模型要用"空过违规+强制动作"，升级路径要按角色需要配 |
+| 规则层无视价格每 2s 刷"funds < price"失败 | 生产/建造必须先过 pedia 价格感知 |
+| 工单资金闸门查错键（"b_x" vs pedia 的 "u_x"） | 价格表键格式统一 `u_` 前缀，测试钉死 |
+| 三个建造者挤同一个池 | 池选择去重：在途池 40px 内不重派 |
+| 热重启杀不干净出双桥接；awk 误杀游戏进程 | 杀桥接按命令行匹配 pilot.py；度量器也连 41234 别误杀 |
+| 防线挨打不敢盖炮塔（危险一刀切） | 判定分家：扩张类危险照禁，防守类防线圈(≤1200px)豁免 |
+| LANE 主通道撞 0 号弧位导致任务误判 failed | defense_slot 返 LANE 时调用方跳号重试 |
 
-## 五、真人实测评价（用户原话结论）
+## 六、真人实测评价（用户原话史）
 
-**"完全不可用，目前仅供娱乐。"**
+- 早期："完全不可用，目前仅供娱乐"（慢/乱/配兵混/无海军）
+- 中期："和脑瘫玩游戏一样""建造 ai 似乎和死了一样""感觉他们是抢活干"
+- 用户核心洞察（已被采纳进架构）：
+  - "玩家建造优势=规划+工单队列（拉一长条连干），不是一个一个点" → 建造工单系统+buildq
+  - "防线挨打就不去造了是吧？" → 防线圈豁免
+  - "远征军队打头阵，安稳了才能盖；占领分纯军/纯建筑/军+建筑不同安全值" → powergrid 控制图
+  - "用钱看每秒收入不是余额" → income/expense 全链路
+  - "游戏原生 AI 建造就傻逼（有钱就造到点升级），写死不如它" → 不写死模板，LLM 出规划、规则层执行
 
-1. **反应慢**：平均 1 分钟 1 个动作。LLM API 单轮 17~25 秒，实际决策被延迟拖死。
-2. **无规划发展**：乱造东西；前线一激烈注意力全在战斗上，只有前期无战事时才零星修点东西，且毫无规划乱七八糟。
-3. **单位作用混淆**：不会合理配兵；截至目前未见过建造海军单位。
+## 七、未实测清单（已构建未验证，接手后逐条过）
 
-## 六、根因分析（为什么是现在这样）
+1. **buildq 原生拉条**（新指令）：jar 已带，javac 过，机制有反编译铁证；未进游戏实测。验证：建造者是否连干多个落点
+2. **建造工单全链路**（LLM set_work_order→BuilderManager 调度）：离线测试过，未实测
+3. **战斗事件触发 + 规则层产兵**：稳态期零 LLM 是否影响军备节奏
+4. **powergrid 安稳闸门**：采集器是否只在安稳池落地（观察是否有"该去不去"或"不该去硬去"）
+5. **income/expense 字段**：单位是否为 /s（快照数值与游戏 UI"(+N)"对账）
+6. **海厂水域集结点**：船是否泊近家水面而非上岸
+7. **设置面板三开关**（AgentPanel）：真机点击验证
+8. **防线圈豁免**：家里挨打时炮塔是否照盖
+9. **LLM 调用时序日志**（pilot.log）：验证三角色并发（回答"是不是顺序执行"）
 
-- **慢的根源不是指令链，是决策模型本身**：单轮 API 17-25s × 每轮信息量有限，再加模型犹豫（reasoner 也爱先查资料），有效动作频率天然低。执行层是毫秒级的，瓶颈全在 LLM。
-- **乱的根源是"规划粒度"不匹配**：执行层只认固定模板（采集器/工厂/炮塔），真正的基地布局规划（厂区/防线/前线前推节奏）刚起步；LLM 给的是 verbs 不是 plan，没有"这局我要打成什么样"的持久作战计划。
-- **配兵混淆的根源**：构成由 LLM 定，但 LLM 对单位强弱的认知全靠战术手册文本；**武器属性（对地/对空/伤害/射程）还没从游戏里提取**，AI 不知道谁打得动谁，只能照手册教条。
-- **海军未见的根源**：没有 naval 逻辑（水图检测、海军生产与运用）——只有海厂自动建造（水图≥2池），生产与运用还是空白。
+## 八、下一步计划（按优先级）
 
-## 七、下一步计划（按优先级）
+1. **逐项实测上表**（先 1/2/5）——有异常直接回来看对应模块
+2. **战斗条件计划队列**：LLM 出 {"序列":["集结到R","兵力>X攻B","遇伏撤C"],"失效":[...]}，规则层按拍执行监测失效（文献 CoS 动作队列同款，已完成事件触发，计划队列是下一步）
+3. **计划书参数化**：自由文本 → 结构化字段（采集器目标/构成表/主攻方向/防线方向），规则层强制消费（治"计划书没人听"）
+4. **防线弧锚点改安全值等高线**（防线跟实控边界走）；远征事件（池被军队打下→召唤建造规划员）
+5. **评测闭环**：固定图 vs 内置 AI 记胜率（match_metrics 已备；回放 .replay 格式社区已逆向可解析，见 rw_analysis）
+6. **1v9 最高难度路线**：Impossible=3.64x 收入、套路固定，龟缩-反核-多线牵制策略蒸馏成规则
 
-### 提速方案 A：多 agent 协作（用户提出，主攻方向）——✅ 已实现（2026-07-22）
-
-把单一 LLM 拆成"总指挥 + 两个专业 agent"，用并行换墙钟时间、用窄上下文换单次延迟。落地形态（`bridge/multiagent.py`，config `multi_agent=true` 启用）：
-
-```
-        ┌─ 总指挥 agent（慢循环 50s，model=reasoner）
-        │   职责：地图局势/地形/建造布局分析
-        │   产出：《作战计划书》（阶段/经济/配兵/攻防/布局 五小节，持久共享文档）
-        ▼ 计划书下发（SharedState，非 agent 互相聊天）
-   ┌────┴────┐
-   ▼         ▼
-建造 agent   战斗 agent（并行异步各跑各的，model_fast=deepseek-chat）
-10s/次       6s/次（警报 2.5s）
-build/train  attack/harass/defend/rally/set_composition
-```
-
-- **用户决策：建造也归 LLM**。executor 退为执行内核（`autopilot=False`）：只做进度跟踪/抢修兜底（resume 仍自动）/选址槽位服务（build 指令缺坐标时按槽位填充）。`LLM_OFF=1` 时 executor 保持全托管，留作基准对照。
-- **协调纪律**：共享状态=快照摘要+计划书+目标构成（战斗 set_composition → executor.army_goal → 建造 prompt 可见）；APM 配额隔离（战斗 25/min、建造 15/min）；回执按指令域（build/train/resume vs move/attackmove/...）归属各循环；reflex 由督导线程驱动，不受 LLM 阻塞。
-- **新对局**：map_version 换代号 generation，三循环各自重建系统提示/摘要器/历史；executor 同步换新实例。
-- 离线验证：`tools/test_multiagent.py`（mock llm.chat 跑真实三循环：指令路由/计划书/构成共享全过）。待真人实测。
-- **成本纪律**：总指挥慢速低频（它最贵）；专业 agent 系统提示静态（缓存友好）；reflex/executor 继续免费兜底，不增 token。
-- **风险**：总 token 量约为单 LLM 的 1.5-2 倍（三个系统提示），需要用窄 prompt 和缓存压回来；建造/战斗指令域已切干净（工具集不同），但战斗 agent 定的构成建造 agent 不执行时需要观察。
-
-### 提速方案 B（保守并行线）：单 LLM 瘦身 + 执行层扩权
-
-继续现在的路：执行层接管配兵默认模板和默认攻防节奏，LLM 只做"改变计划"级别的决策，调用频率降到 60s+ 一次，用稳定换速度。（单 LLM 路径保留：config `multi_agent=false`）
-
-### 其余优先级
-
-2. **持久作战计划书**：无论 A/B，"这局要打成什么样"都要落成持久文档（总指挥产出或战略层维护），替代每轮现场发挥。
-3. ~~**武器属性提取**~~（已完成 2026-07-22，已起游戏实测）：Pedia 导出 `atk`（对地/对空/单轮伤害/dps/射程/门数，走实体统一接口 `y.ag()/af()/q(i)/b(i)/m()/bl()`），roster/生产表/unit 详情均已带攻击标签。实测 173 单位：97 个有完整数值。已知限制：12 个硬编码单位（tank/artillery/helicopter/airShip/megaTank/ladybug/tankDestroyer/mammothTank/experimentalTank/experimentalHoverTank/modularSpider×2）伤害在发射时注入读不到，bridge 显示"伤害未知"而非 0；tree/spreadingFire 非 y 实例无 atk。诊断工具：agent 参数 `dumpPedia=<path>` 无需开战即可导出百科（Bootstrap.tryDumpPedia）。
-4. ~~**海军逻辑**~~（已完成 2026-07-22）：水图判定（水域≥20%/水池≥2）→ 近水海厂 → 海军生产（T1 炮艇/导弹舰/战列舰，T2 重战列舰/防空舰）→ builderShip 水池采集；进攻时纯水上单位 naval_split 拆分打目标附近水域。特殊开局未充分测试，待真人实测。
-5. **地图档案深化**：地图拓扑（走廊/隘口/分矿路线）一次性分析长期持有（总指挥的输入）。
-
-## 八、文件结构速查
+## 九、文件结构速查
 
 ```
-agent/src/rw/agent/   Java javaagent（快照/指令/百科/地图/绕行点/聊天命令/overlay按钮）
-bridge/pilot.py       主循环：LLM 战略层、query 目录、工具调度、玩家留言
-bridge/executor.py    执行层：经济/生产/升级/选址/危险区（独立线程）
-bridge/reflex.py      反射层：撤退/回防/建造者召回
-bridge/summarize.py   快照摘要（LLM 每轮看到的战场文本）
-bridge/danger.py      动态危险区（威胁记忆/前线趋势）
-bridge/connmap.py     陆地连通域分析
-bridge/spawns.py      tmx 出生点解析
-bridge/tactics_guide.py 战术手册（玩家经验，随时增补）
-bridge/config.toml    模型/节拍/开关（use_executor、auto_military=false）
-rw-ai.bat             一键启动（游戏+桥接）
+agent/src/rw/agent/   javaagent（快照/指令/百科/地图/绕行点/聊天命令/overlay UI/ASM hook）
+  Snapshot.java       快照（含 income/expense 收支速率）
+  Pedia.java          百科（价格/科技/hp/武器 atk/占地 fp/动作表；dumpPedia=<path> 免开战导出）
+  Commands.java       指令分发（build/train/rally/resume/buildq 拉条/delegate/move/attack 等）
+  Hooks.java          ASM transformer（按键/滚轮拦截）；OverlayInput.java 输入胶水
+  Ui/ChatPanel/DelegPanel/AgentPanel/OverlayData.java  游戏内 UI
+bridge/
+  multiagent.py       编排器：三角色事件触发循环/翻译守卫/工单通道/需求板/回执判域/聊天推送
+  executor.py         执行内核：BuilderManager 工单调度+规则快层（例行/防线/生产/升级/哨戒/抢修/判死）+槽位网格
+  powergrid.py        战力标签+领土控制图（安全值/占领状态/安稳判定/战力概况）
+  reflex.py           反射层（事件钩子回灌黑名单）
+  summarize.py        摘要（含真实收入率）；danger.py 威胁热力；connmap.py 连通域；spawns.py 出生点
+  llm.py              OpenAI 兼容客户端（调用时序日志→pilot.log）
+  config.toml         multi_agent/routine_layer/model(_fast)/三路节拍/超时
+tools/
+  match_metrics.py    对局度量器（结果存 metrics_history.jsonl）；analyze_pace.py 耗时分析
+  test_exec_slots.py / test_multiagent.py  离线回归；gui_step.py GUI 驱动（慎用，曾触发游戏 libRocket 崩溃）
+rw-ai.bat             一键启动；tools/run-bridge.bat 只重启桥接
 ```
 
-## 九、给接手者的提醒
+## 十、给接手者的提醒
 
-- 每次改完先看 `bridge/activity.jsonl`（⚙ 执行层指令、💬 留言、✗ 失败回执）和 `agent/logs/agent.log`，先找"没生成"还是"没送达"。
-- 推送前跑密钥检查：`secret.toml` 永不入库。
-- 所有 bat 保持纯 ASCII。
-- 提交规范：`feat:/fix:/docs:` 前缀，一条说清一件事。
+- 排查顺序：`bridge/activity.jsonl`（⚙ 规则层/🔨 建造/⚔ 战斗/📋 指挥/✗ 失败）→ `bridge/pilot.log`（LLM 时序）→ `agent/logs/agent.log`（回执原文）。先找"没生成"还是"没送达"。
+- 游戏暂停时快照不流动，三循环会对着冻结状态空转——看数据先看 tick 动不动。
+- 所有 bat 纯 ASCII；`secret.toml` 永不入库；提交规范 `feat:/fix:/docs:` 一条说清一件事。
+- 杀桥接进程按命令行匹配 `pilot.py`（match_metrics.py 也是 41234 客户端，别误杀；游戏 JVM 也会被 awk 误抓，别误杀）。
+- jar 被运行中的游戏锁定，重打包需先关游戏；可打包到 `dist/rw-agent-new.jar` 再换名。
+- 上下文压缩后本文件是唯一权威状态源，改完大事先更新本文件。

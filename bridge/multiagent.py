@@ -70,8 +70,14 @@ _NOTE_TOOL = {
 
 BUILD_TOOLS = [
     {"type": "function", "function": {
+        "name": "set_work_order",
+        "description": "下发建造工单（你的主要职责）：一组有序建造任务，规则层调度建造者连续施工（完成一个自动接下一个，不用你逐个点）。tasks 是 [{action, slot, note?}]，按执行顺序排，覆盖未来 2~3 分钟。slot 用规格不写坐标：pool:k=第k近安全池 | factory:k=厂区槽位k | defense:k=防线弧位k | misc:k=后勤槽位k | water=近水 | [x,y]=精确坐标（极少用）。",
+        "parameters": {"type": "object",
+                       "properties": {"tasks": {"type": "array", "items": {"type": "object"}}},
+                       "required": ["tasks"]}}},
+    {"type": "function", "function": {
         "name": "build",
-        "description": "命令建造者建造建筑。action 是建造动作ID（形如 b_extractorT1，必须取自动作表）。坐标尽量省略——系统按布局槽位落位（工厂侧翼成行/后勤主基地背后/海厂近水/采集器最近空闲池）。builder 可指定建造者id，省略时系统自动派空闲的。",
+        "description": "单点建造（工单之外的临时纠正用，优先用 set_work_order）。action 是建造动作ID（形如 b_extractorT1）。坐标省略时系统按槽位落位。",
         "parameters": {"type": "object",
                        "properties": {"action": {"type": "string"},
                                       "x": {"type": "number"}, "y": {"type": "number"},
@@ -148,6 +154,7 @@ class SharedState:
         self.enemy_spawns = ctx.get("enemy_spawns") or []
         self.plan = ""                # 作战计划书（总指挥维护）
         self.plan_ts = 0.0
+        self.plan_seen = {}           # 角色 -> 已见计划书版本（全文只在更新时注入，省延迟）
         self.site_blocks = {}         # 建造点位黑名单 (gx,gy)->解封时间（反射召回的敌区点，10 分钟）
         self.requests = deque(maxlen=6)  # 跨域需求板（如 战斗→建造 的 T2 升级需求）
         self.last_rally = None        # 上次集结点（同值去重，防每轮重发）
@@ -197,21 +204,29 @@ def _sys_build(ctx, st):
     m = st.map_msg or {}
     tw = (m.get("tilesW", 0) or 0) * (m.get("tileW", 0) or 0)
     th = (m.get("tilesH", 0) or 0) * (m.get("tileH", 0) or 0)
-    return f"""你是《Rusted Warfare》的建造 agent，只管经济建设：采集器/工厂/炮塔/战略建筑/建筑升级 + 支援单位生产（建造者/战斗工程师/机械师/制造者/海上建造者）。战斗单位生产与军事调动归战斗 agent，别碰。
+    return f"""你是《Rusted Warfare》的建造规划员。你不搬砖——规则层（2 秒一拍）负责施工调度、采集器补给、工厂扩建升级、防线炮塔、抢修。你的活是**出规划**：
+
+【首要职责：set_work_order】
+被召唤时给一份覆盖未来 2~3 分钟的有序建造工单，规则层会调度建造者连续施工（完成一个自动接下一个，像玩家拉一长条）。工单原则：
+- 序列即规划：先经济（采集器 pool:k 从近到远）、再产能（factory:k）、再防线（defense:k）与大建筑（misc:k/water）
+- 每份工单 4~10 项，别贪多；阶段要匹配计划书【阶段】（开局=池+厂，扩张=池+厂+防线，中盘=升级链+战略建筑）
+- slot 一律用规格（pool:k/factory:k/defense:k/misc:k/water），系统按槽位网格+实时占位解析落位，别写坐标
+- 之前失败过的点位系统在黑名单里，你规划的规格会自动避让，不用管
+
+【次要职责】
+- 支援单位生产：建造者保持 3~4 个（CC 生产）；水图产 1~2 个海上建造者（建水池采集器）
+- 临时纠正：规则层方向明显错时用 build 单点纠正（极少用）
+- 需求板/计划书里有你的活就干；没有就用 note 说明等待
 
 【坐标】世界 {tw:.0f}x{th:.0f} 像素。你只看得见本队视野内信息。
-【动作ID规则】建造=b_类型名（如 b_extractorT1）；生产=u_类型名（如 u_c_tank、u_builder）；升级=动作表 升级[...] 里的ID（对建筑用 train）。ID 区分大小写，严禁编造，拿不准用 query 查。
+【动作ID规则】建造=b_类型名；生产=u_类型名；升级=动作表 升级[...] 里的ID（对建筑用 train）。ID 区分大小写，严禁编造，拿不准用 query 查。
 【生产/建造动作表（生产者: 合法动作ID，兵种带 科技,攻击 标签：地/空/双/无）】
 {ctx["pedia_production_table"](ctx["pedia"])}
 
 【纪律】
-- 选址一律省略坐标：系统按布局落位（工厂在主基地侧翼成行、后勤建筑在主基地背后成排、海厂在近水、采集器在最近空闲资源点）。只有明确知道该建哪才给坐标。
-- 建造是有时间的：prog<1 是建造中，完工前工厂不能生产；建造者施工中(build@/repair→)不要派新活，用"空闲可派活"的建造者。
-- 资金纪律：资金 <700 时只建采集器；工厂按需扩建（队列长期≥2 且有钱就扩，别一口气盖一排，也别死守 3 座上限）；每厂队列最多 2~3 个。
-- 经济优先级：采集器(到计划书目标数) > 首座工厂 > 扩厂/升级 > 炮塔；战斗工程师 1~2 个（能直接建 T2 厂省升级）。
-- 支援单位生产（你的专属）：建造者保持 3~4 个（有≥2 个闲置就先派活再产）；水图且有空闲水池时产 1~2 个海上建造者去建水池采集器。
-- 升级时机：采集器达标且资金 >2600 开始升经济建筑，工厂资金 >4500 再升。
-- 没活干（缺钱/建造者都在施工/目标全达成）时用 note 说明等待理由，不要硬造东西浪费钱。
+- 资金纪律：决策看收入率不看余额（摘要"收入+X/s 支出-Y/s"是游戏原生数据）——收入 <5 先补采集器链；余额高但收入低同样是穷；大建筑（实验厂/核弹系）只在收入 ≥15 时考虑。资金 <700 只留作采集器；每厂队列最多 2~3 个。
+- 不许编造原因：资金/收入/单位/警报全部来自快照，没看到的别瞎说（摘要没写"采集器被打了"就是没有）。
+- 战斗单位生产与军事调动归战斗 agent，别碰。
 - 严格按《作战计划书》的经济小节执行；计划书与现状冲突时在 note 里指出。"""
 
 
@@ -229,7 +244,7 @@ def _sys_combat(ctx, st):
 - 禁止军队闲置：构成成型且视野无敌情时，按计划书主攻方向推进/侦察；连续两轮不动是不允许的。
 - 小队残血或被围就 defend_home，别硬拼；撤退后补满再按计划书打回去。
 - 兵力没到临界（<6 个战斗单位）不决战，先在集结点蓄势。
-- 你只给方向，微观走位/集火由游戏AI完成；attack/harass 时纯水上单位会自动拆分走水路，纯防空单位随军行动（充当防空火力）。
+- 你只给方向，微观走位/集火由游戏AI完成；attack/harass 时纯水上单位会自动拆分走水路，纯防空单位随军行动（充当防空火力）；海厂集结点自动落到最近水域、海军回防自动去近家水域（海军的坐标系统会按地图水域处理，不用你想）。
 - 军产纪律：工厂是你的兵源——按目标构成用 train 持续补队列（每厂 2~3 个，别让工厂空转）；防空占比≤25%（防空是配角）；T2 厂只产 T2 兵（同价更强）。生产与战斗不冲突，有空就补。
 - 用 set_composition 针对敌方构成调兵（敌空军多补防空、敌龟缩补远程炮、敌盾厚上闪电系）；兵种武器数据拿不准用 query 查（对地/对空/伤害/射程都有）。
 - 严格按《作战计划书》的攻防小节执行；计划书明显过时（如主攻方向已被推平）时按现状决断并在 note 说明。"""
@@ -237,8 +252,60 @@ def _sys_combat(ctx, st):
 
 # ---------- 每轮用户文本 ----------
 
+def _build_event(ctx, st, snap, alerts, now, g):
+    """建造 LLM 召唤条件：它是规划员不是搬砖的——只在需要新规划时召唤。"""
+    with st.lock:
+        if st.pending["build"]:
+            return "待读消息"
+    if st.plan_ts > g.get("plan_ts_fired", 0):
+        g["plan_ts_fired"] = st.plan_ts
+        return "计划书更新"
+    if st.requests:
+        return "需求板新单"
+    ex = ctx["exec_holder"].get("ex")
+    if ex:
+        if not ex.work_order:
+            return "无工单待规划"
+        open_n = sum(1 for t in ex.work_order if t["status"] in ("pending", "assigned"))
+        if open_n == 0:
+            return "工单执行完毕"
+    if now - g.get("last_fire", 0) > 180:
+        return "心跳"
+    return None
+
+
+def _combat_event(ctx, st, snap, alerts, now, g):
+    """战斗 LLM 召唤条件（事件触发替代固定节拍轮询——文献共识：稳态期零调用）。
+    返回触发原因或 None。心跳兜底 90s（防漏报导致长期不召唤）。"""
+    if alerts:
+        return "警报: " + alerts[0]
+    with st.lock:
+        if st.pending["combat"]:
+            return "待读消息"
+    if st.plan_ts > g.get("plan_ts_fired", 0):
+        g["plan_ts_fired"] = st.plan_ts
+        return "计划书更新"
+    ex = ctx["exec_holder"].get("ex")
+    comp = (ex.army_goal.get("composition") if ex else None) or {}
+    if comp:
+        # 兵力达标事件：构成缺口全补满且 60s 未召唤 → 该按计划书行动了
+        from collections import Counter
+        counts = Counter(u["t"] for u in snap.get("own", []) if not u.get("bld"))
+        deficit = sum(max(0, tgt - counts.get(a[2:] if a.startswith("u_") else a, 0))
+                      for a, tgt in comp.items())
+        if deficit == 0 and now - g.get("last_fire", 0) > 60:
+            return "兵力达标"
+    # 心跳/蓄势：军队未成气候(<6)且无敌情时不召唤——规则层产兵蓄势即可，
+    # 几个兵就拉出去打等于喂敌（此前心跳无脑召唤导致小兵送死循环）
+    army_n = sum(1 for u in snap.get("own", []) if not u.get("bld"))
+    enemies_n = len(snap.get("enemy", []))
+    if now - g.get("last_fire", 0) > 90 and (army_n >= 6 or enemies_n > 0):
+        return "心跳"
+    return None
+
+
 def _combat_status(ctx, st, snap):
-    """军队构成现状 vs 目标（战斗循环用，也给建造循环看目标）。"""
+    """军队构成现状 vs 目标（战斗循环用，也给建造循环看目标），附战力概况。"""
     from collections import Counter
     own = snap.get("own", [])
     counts = Counter(u["t"] for u in own if not u.get("bld"))
@@ -246,7 +313,18 @@ def _combat_status(ctx, st, snap):
     comp = (ex.army_goal.get("composition") if ex else None) or {}
     now = ",".join(f"{k}x{v}" for k, v in counts.most_common(8)) or "无"
     tgt = ",".join(f"{k}:{v}" for k, v in comp.items()) or "（未设，用 set_composition 定）"
-    return f"我军构成: {now}\n目标构成: {tgt}"
+    pw = ("\n" + ex.control.overview(snap)) if ex else ""
+    return f"我军构成: {now}\n目标构成: {tgt}{pw}"
+
+
+def _plan_block(st, who):
+    """计划书注入：只在更新后给全文（每轮全文 ~700 字纯属烧延迟），未变给一行提示。"""
+    if not st.plan:
+        return None
+    if st.plan_seen.get(who) == st.plan_ts:
+        return "（作战计划书未变，按上版执行）"
+    st.plan_seen[who] = st.plan_ts
+    return "【作战计划书】\n" + st.plan
 
 
 def _user_build(ctx, st, snap, text, receipts):
@@ -258,8 +336,9 @@ def _user_build(ctx, st, snap, text, receipts):
                      + ",".join(f"{k}:{v}" for k, v in comp.items()))
     if st.requests:
         parts.append("跨域需求板（按需处理）: " + " | ".join(list(st.requests)[-4:]))
-    if st.plan:
-        parts.append("【作战计划书】\n" + st.plan)
+    pb = _plan_block(st, "build")
+    if pb:
+        parts.append(pb)
     if receipts:
         parts.append("最近回执: " + " | ".join(receipts[-6:]))
     pend = _drain(st, "build")
@@ -279,8 +358,9 @@ def _user_combat(ctx, st, snap, text, alerts, receipts):
     rally = ex.army_goal.get("rally") if ex else None
     if rally:
         parts.append(f"集结点: ({rally[0]:.0f},{rally[1]:.0f})")
-    if st.plan:
-        parts.append("【作战计划书】\n" + st.plan)
+    pb = _plan_block(st, "combat")
+    if pb:
+        parts.append(pb)
     if receipts:
         parts.append("最近回执: " + " | ".join(receipts[-6:]))
     pend = _drain(st, "combat")
@@ -352,9 +432,28 @@ def _idle_builders(snap):
 
 
 def _translate_build(ctx, st, name, args, snap, g):
-    """build agent 的 build/train → 原子指令。返回 (cmd, desc) 或 (None, 拦截原因)。"""
+    """build agent 的工单/建造/生产 → 原子指令。返回 (cmd, desc) 或 (None, 拦截原因)。"""
     known = ctx["known_actions"]
     snap_time = time.time()
+    if name == "set_work_order":
+        ok, bad = [], 0
+        for t in (args.get("tasks") or [])[:24]:
+            a = str((t or {}).get("action", ""))
+            if not a:
+                bad += 1
+                continue
+            if not a.startswith(("b_", "u_", "c_")):
+                a = "b_" + a
+            if a not in known:
+                bad += 1
+                continue
+            ok.append({"action": a, "slot": (t or {}).get("slot"), "note": str((t or {}).get("note", ""))})
+        if not ok:
+            return None, f"✗ set_work_order: 全部{len(args.get('tasks') or [])}项动作ID非法（必须原样取自动作表）"
+        ex = ctx["exec_holder"].get("ex")
+        if ex:
+            ex.set_work_order(ok)
+        return None, (f"set_work_order({len(ok)}项已下发" + (f"，丢弃非法{bad}项" if bad else "") + "）")
     if name == "build":
         action = str(args.get("action", ""))
         if action.startswith("s_"):
@@ -363,6 +462,9 @@ def _translate_build(ctx, st, name, args, snap, g):
             g["fail_perm"].add(("build", action))
             return None, f"✗ build action={action}: 非法ID（必须原样取自动作表），本局不要再试"
         btype = action[2:] if action.startswith("b_") else action
+        funds_now = (snap.get("team") or {}).get("funds", 0)
+        if funds_now < 700:
+            return None, f"✗ build {action}: 资金仅{funds_now:.0f}<700，先留钱建采集器恢复经济，别的不许盖"
         if snap_time - g["recent_builds"].get(btype, 0) < 30:
             return None, f"✗ build {action}: 30s 内已下过单（防重复），等它出现再补"
         cmd = {"cmd": "build", "action": action}
@@ -387,11 +489,17 @@ def _translate_build(ctx, st, name, args, snap, g):
         if cmd.get("x") is not None and btype.startswith("extractor") \
                 and st.danger_map.danger(cmd["x"], cmd["y"], fresh):
             return None, f"✗ build {action}: 目标点在敌区（危险记忆），从空闲池里换一个安全点"
-        # 点位黑名单：近 10 分钟有建造者在此被反射召回（敌区），直接拦截换点
+        # 点位黑名单：近 10 分钟有建造者在此被反射召回（敌区）。
+        # 防守类建筑在防线圈(≤1200px)内豁免——防线挨打正是该盖的时候（黑名单初衷是治远征乱跑）
         if cmd.get("x") is not None:
             gkey = (int(cmd["x"] // 400), int(cmd["y"] // 400))
             if snap_time < st.site_blocks.get(gkey, 0):
-                return None, f"✗ build {action}: 该点刚有建造者被敌区召回（10 分钟禁建），换其他位置"
+                cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter"), None)
+                near_home = cc and (cmd["x"] - cc["x"]) ** 2 + (cmd["y"] - cc["y"]) ** 2 <= 1200 ** 2
+                is_defense = btype.startswith(("c_turret", "c_antiAirTurret", "laserDefence", "repairbay", "wall"))
+                if not (is_defense and near_home):
+                    return None, f"✗ build {action}: 该点刚有建造者被敌区召回（10 分钟禁建），换其他位置"
+            g["recent_build_xy"] = (cmd["x"], cmd["y"], snap_time)  # 选址失败回执归因用
         g["recent_builds"][btype] = snap_time
         return cmd, f"build({action})"
     if name == "train":
@@ -496,7 +604,23 @@ def _translate_combat(ctx, st, name, args, snap, g):
             return None, "defend_home(找不到主基地)"
         cmd = {"cmd": "move", "x": float(home["x"]), "y": float(home["y"])}
         gids = ctx["ground_combat_ids"](snap, delegated)
-        if gids:
+        nids = set()
+        if gids and ctx["naval_types"]:
+            nids = {str(u["id"]) for u in snap.get("own", [])
+                    if u["id"] in delegated and not u.get("bld") and u["t"] in ctx["naval_types"]}
+        if nids:
+            # 海军回防不去陆地家：改去近家水域（海军要水不要地）
+            gset = [i for i in gids.split(",") if i and i not in nids]
+            cmd["units"] = ",".join(gset)
+            ex = ctx["exec_holder"].get("ex")
+            cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter"), None)
+            wa = ex.water_anchor(cc) if ex and cc else None
+            if wa:
+                link.send({"cmd": "move", "units": ",".join(nids),
+                           "x": float(wa[0]), "y": float(wa[1])})
+            else:
+                cmd["units"] = gids  # 无水域：全员回家（海军将就上岸）
+        elif gids:
             cmd["units"] = gids
         return cmd, "defend_home()"
     if name == "stop":
@@ -511,24 +635,47 @@ def _translate_combat(ctx, st, name, args, snap, g):
         ex = ctx["exec_holder"].get("ex")
         if ex:
             ex.set_army_goal(rally=(rx, ry))
-        for fac in facs[:6]:  # 每厂一条，集结点统一
-            link.send({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry})
+        map_m = ctx["map_msg_holder"]["m"]
+        cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter"), None)
+        sea_spot = None
+        for fac in facs[:6]:  # 每厂一条，集结点统一；海厂自动改落最近水域（海军要水不要地）
+            if fac["t"] == "seaFactory":
+                if sea_spot is None:
+                    sea_spot = (ctx["nearest_water"](map_m, rx, ry)
+                                or (ex.water_anchor(cc) if ex and cc else None))
+                if sea_spot:
+                    link.send({"cmd": "rally", "factory": fac["id"],
+                               "x": float(sea_spot[0]), "y": float(sea_spot[1])})
+            else:
+                link.send({"cmd": "rally", "factory": fac["id"], "x": rx, "y": ry})
         return None, f"rally({rx:.0f},{ry:.0f})→{len(facs)}厂"
     if name == "set_composition":
         ex = ctx["exec_holder"].get("ex")
         comp = args.get("composition") or {}
         if ex:
-            # 归一化后与现值相同则跳过（防每轮重设同一构成）
-            norm = {}
+            # 科技过滤：构成本厂当前可产的才算数（没 T2 厂要 heavyTank = 生产死锁，先升级再谈）
+            avail = set()
+            for u in _facs(snap):
+                if u.get("prog", 1) >= 1:
+                    avail |= ex.factory_actions.get(u["t"], set())
+            norm, dropped = {}, []
             for k, v in comp.items():
                 key = str(k)
-                if key in ex.known_prod:
-                    norm[key] = int(v)
-                elif ("u_" + key) in ex.known_prod:
-                    norm["u_" + key] = int(v)
+                act = key if key in ex.known_prod else ("u_" + key if ("u_" + key) in ex.known_prod else None)
+                if act is None:
+                    dropped.append(key)
+                elif avail and act not in avail:
+                    dropped.append(f"{key}(本厂暂无此动作/科技未达)")
+                else:
+                    norm[act] = int(v)
             if norm == (ex.army_goal.get("composition") or {}):
+                if dropped:
+                    return None, f"set_composition（未变，跳过）；已丢弃不可产项: {','.join(dropped)}"
                 return None, "set_composition（未变，跳过）"
-            ex.set_army_goal(composition=comp)
+            ex.set_army_goal(composition=norm if norm else comp)
+            if dropped:
+                st.requests.append(f"战斗域需要工厂升级以生产: {','.join(dropped)}")
+                return None, f"set_composition({norm})；已丢弃不可产项: {','.join(dropped)}（升级已挂需求板）"
         return None, f"set_composition({comp})"
     return None, None
 
@@ -597,6 +744,11 @@ def _learn_receipts(role, receipts, g, st):
         m = re.search(r"不可用（科技/条件不满足）[:：]\s*([A-Za-z0-9_]+)", r)
         if m:
             g.setdefault("action_bad", {})[m.group(1)] = now + 120
+        # 选址失败签名（水域/隔断/找不到合法位置）：归因本循环最近带坐标建造，600s 禁建
+        if ("无法靠近" in r or "找不到合法建造位置" in r):
+            rb = g.get("recent_build_xy")
+            if rb and rb[0] is not None and now - rb[2] < 60:
+                st.site_blocks[(int(rb[0] // 400), int(rb[1] // 400))] = now + 600
 
 
 def _answer_queries(ctx, st, msg, snap, rounds_left):
@@ -654,9 +806,19 @@ def _agent_loop(ctx, st, role):
                 time.sleep(1.5)  # 无委托单位：等玩家接管
                 continue
             text, alerts = smz.summarize(snap)
+            reason = None
+            if role.get("event_driven"):
+                event_fn = _build_event if role["name"] == "build" else _combat_event
+                reason = event_fn(ctx, st, snap, alerts, time.time(), g)
+                if reason is None:
+                    time.sleep(2.0)  # 稳态期：零 LLM 调用，规则层+反射层自理
+                    continue
+                g["last_fire"] = time.time()
             receipts = _drain_receipts(ctx, link, role)
             _learn_receipts(role, receipts, g, st)
             user = role["make_user"](ctx, st, snap, text, alerts, receipts)
+            if reason:
+                user += f"\n\n【召唤原因】{reason}（事件触发模式：无事不召唤，被召唤就给出决断）"
             msgs = [system] + list(history) + [{"role": "user", "content": user}]
             msg = llm.chat(cfg["base_url"], ctx["api_key"], role["model"], msgs,
                            role["tools"], timeout=role["timeout"])
@@ -811,9 +973,11 @@ def _roles(ctx):
          "make_user": lambda c, s, snap, text, alerts, rc: _user_commander(c, s, snap, text, rc),
          "translate": lambda *a: (None, None)},
         {"name": "build", "icon": "🔨", "model": fast, "tools": BUILD_TOOLS,
-         "kinds": BUILD_KINDS, "verbs": {"build", "train"}, "plan_sink": False, "apm_kind": "build",
+         "kinds": BUILD_KINDS, "verbs": {"build", "train", "set_work_order"}, "plan_sink": False,
+         "apm_kind": "build", "event_driven": True,
          "stagger": 4.0, "cadence": lambda: float(cfg.get("build_interval_sec", 10)),
-         "timeout": int(cfg["timeout_sec"]), "ladder_model": cfg["model"],  # 空转升 reasoner
+         "timeout": int(cfg["timeout_sec"]),  # 无 ladder：基线已被规则层覆盖，空转不升级（省 reasoner 费）
+         "query_rounds": 1,  # 查询癖压缩（价格表就在 prompt 里，一轮够查）
          "make_system": _sys_build,
          "make_user": lambda c, s, snap, text, alerts, rc: _user_build(c, s, snap, text, rc),
          "translate": _translate_build},
@@ -821,23 +985,45 @@ def _roles(ctx):
          # chat 快层（10-25s）+ reasoner 兜底（空转升级）：军事反应不再吃 reasoner 的 40-70s
          "kinds": COMBAT_KINDS, "verbs": {"attack", "harass", "attack_nearest", "defend_home",
                                           "rally", "set_composition", "stop", "train"},
-         "plan_sink": False, "apm_kind": "combat",
+         "plan_sink": False, "apm_kind": "combat", "event_driven": True,
          "stagger": 7.0, "cadence": lambda: float(cfg.get("combat_interval_sec", 6)),
          "timeout": int(cfg["timeout_sec"]), "ladder_model": cfg["model"],  # 空转升 reasoner
+         "query_rounds": 1,  # 查询压缩：战斗要的是决断不是资料
          "make_system": _sys_combat,
          "make_user": _user_combat,
          "translate": _translate_combat},
     ]
 
 
+def _cmd_brief(cmd):
+    """规则层指令的紧凑可读形式（聊天台显示用）。"""
+    c = cmd.get("cmd")
+    if c == "build":
+        return f"盖 {cmd.get('action')}@({cmd.get('x', '?')},{cmd.get('y', '?')})"
+    if c == "train":
+        return f"产 {cmd.get('action')} @厂#{cmd.get('factory')}"
+    if c == "resume":
+        return f"抢修 #{cmd.get('target')} ← 建造者#{cmd.get('builder')}"
+    if c == "rally":
+        return f"集结点 ({cmd.get('x')},{cmd.get('y')})"
+    return str(cmd)[:60]
+
+
 def start(ctx):
     """建共享状态 + 三个 agent 循环线程（daemon）。返回 SharedState。"""
     st = SharedState(ctx)
+    # 规则层动作上聊天台（看得见才有"在干活"的体感）
+    ex0 = ctx["exec_holder"].get("ex")
+    if ex0:
+        ex0.on_action = lambda c: _push_chat(ctx, "system", "⚙ " + _cmd_brief(c))
     # 反射事件闭环：建造者召回 → 建造点位黑名单(10min)+建造待读；小队反射 → 战斗待读
     reflex = ctx["reflex"]
 
     def _on_recall(bid, tx, ty):
         st.site_blocks[(int(tx // 400), int(ty // 400))] = time.time() + 600
+        ex = ctx["exec_holder"].get("ex")
+        if ex:  # 规则层同步禁建（此前只有 LLM 路径被拦，规则层照往同一敌区池派人）
+            ex.ext_pool_bad[(int(tx // 400), int(ty // 400))] = time.time() + 600
         st.pending["build"].append(
             f"[系统通报] 你派往 ({int(tx)},{int(ty)}) 的建造者#{bid} 被系统反射召回（敌区），"
             f"该点附近 10 分钟内禁止再建，请换安全位置。")
@@ -890,6 +1076,7 @@ def supervisor_loop(ctx, st):
                     ex.autopilot = False
                     ex.routine = bool(ctx["cfg"].get("routine_layer", True))  # 规则快层：例行+炮塔弧
                     ex.dmap = st.danger_map
+                    ex.on_action = lambda c: _push_chat(ctx, "system", "⚙ " + _cmd_brief(c))
                     ctx["exec_holder"]["ex"] = ex
                     ctx["reflex"].dmap = st.danger_map
                     smz = summarize.Summarizer(new_map.get("resources", []))

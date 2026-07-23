@@ -86,11 +86,13 @@ assert exp and (exp[0]["x"], exp[0]["y"]) == (2080.0, 1000.0), f"S3 实验厂后
 e4 = ex.Executor(mk_map(water_cols=0), {}, log)
 e4.autopilot = False
 e4.routine = True
+e4.econ_goal["builders"] = 4  # 让①补建造者在本场景也触发
 cc4 = U("commandCenter", 1500, 1000, bld=True, q=0)
-bs4 = [U("builder", 1500 + i * 10, 1000) for i in range(2)]
+bs4 = [U("builder", 1500 + i * 10, 1000) for i in range(3)]
 ext4 = U("extractorT1", 1400, 1000, bld=True)
+ext4b = U("extractorT1", 1450, 1050, bld=True)
 fac4 = U("landFactory", 1500, 740, bld=True, q=2)
-own4 = [cc4] + bs4 + [ext4, fac4]
+own4 = [cc4] + bs4 + [ext4, ext4b, fac4]
 snap4 = snap(own4, 5000)
 snap4["delegated"] = [u["id"] for u in own4]
 e4.set_army_goal(rally=(2000.0, 1000.0))
@@ -100,9 +102,42 @@ assert ("train", "u_builder") in kinds, f"规则层应补建造者: {c5}"
 assert ("build", "b_extractorT1") in kinds, f"规则层应补采集器: {c5}"
 tur = [c for c in c5 if c.get("action") == "b_c_turret_t1"]
 assert tur and (tur[0]["x"], tur[0]["y"]) == (1810.0, 1110.0), f"防线弧网格位: {c5}"
+fac5 = [c for c in c5 if c.get("action") == "b_landFactory"]
+assert fac5 and (fac5[0]["x"], fac5[0]["y"]) == (1510.0, 670.0), f"规则层应网格扩厂: {c5}"
 # 旁观铁律：无委托时规则层一拍都不动
 snap4_nd = snap(own4, 5000)
 snap4_nd["delegated"] = []
 assert e4.tick(snap4_nd) == [], "无委托时规则层必须旁观"
-print("S4 OK:", c5)
+# ---- S5：建造工单（BuilderManager）调度 ----
+e5 = ex.Executor(mk_map(water_cols=0), {}, log)
+e5.autopilot = False
+e5.routine = True
+cc5 = U("commandCenter", 1500, 1000, bld=True, q=0)
+bs5 = [U("builder", 1500 + i * 10, 1000) for i in range(3)]
+ext5 = U("extractorT1", 1400, 1000, bld=True)
+own5 = [cc5] + bs5 + [ext5]
+snap5 = snap(own5, 5000)
+snap5["delegated"] = [u["id"] for u in own5]
+e5.set_work_order([
+    {"action": "b_extractorT1", "slot": "pool:0"},
+    {"action": "b_landFactory", "slot": "factory:0"},
+    {"action": "b_c_turret_t1", "slot": "defense:0"},
+])
+c6 = e5.tick(snap5)
+bq = [c for c in c6 if c["cmd"] == "buildq"]
+assert bq and bq[0]["items"].count(";") == 2, f"3 项任务应打包成 1 条 buildq: {c6}"
+# 完成推进：建筑出现 → 任务变 done，队列继续
+ext_new = U("extractorT1", 1300, 1000, bld=True, prog=0.4)
+fac_new = U("landFactory", 1510, 750, bld=True, prog=1.0)
+snap5b = snap(own5 + [ext_new, fac_new], 5000)
+snap5b["delegated"] = snap5["delegated"]
+e5.tick(snap5b)
+st = {t["action"]: t["status"] for t in e5.work_order}
+assert st["b_extractorT1"] == "done", f"采集任务应完成: {st}"
+# 资金闸门：资金 0 时停派（有序攒钱）
+e5.price["u_airFactory"] = 1000
+e5.set_work_order([{"action": "b_airFactory", "slot": "factory:1"}])
+c7 = e5.tick(snap(own5 + [ext_new], 0) | {"delegated": snap5["delegated"]})
+assert not any(c.get("action") == "b_airFactory" for c in c7), f"资金0不应派单: {c7}"
+print("S5 OK:", c6, st)
 print("ALL PASS")

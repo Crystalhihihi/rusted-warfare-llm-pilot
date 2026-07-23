@@ -146,15 +146,21 @@ class Summarizer:
         self.prev_enemy_ids = enemy_ids
 
         # ---- income estimate ----
-        income = ""
-        if self.prev_funds is not None and self.prev_tick is not None and tick > self.prev_tick:
-            dtick = tick - self.prev_tick
-            if dtick > 0:
-                rate = (funds - self.prev_funds) / dtick * 60  # 每秒
-                income = f" (净变化 {rate:+.0f}/s)"
-        if tick - (self.prev_tick or 0) >= 300:
-            self.prev_funds = funds
-            self.prev_tick = tick
+        # 优先用游戏原生收支速率（快照 income/expense 字段）；旧快照没有就退回差分估计
+        inc = team.get("income")
+        exp = team.get("expense")
+        if inc is not None:
+            income = f" (收入+{inc:.0f}/s 支出-{exp or 0:.0f}/s)"
+        else:
+            income = ""
+            if self.prev_funds is not None and self.prev_tick is not None and tick > self.prev_tick:
+                dtick = tick - self.prev_tick
+                if dtick > 0:
+                    rate = (funds - self.prev_funds) / dtick * 60  # 每秒
+                    income = f" (净变化 {rate:+.0f}/s)"
+            if tick - (self.prev_tick or 0) >= 300:
+                self.prev_funds = funds
+                self.prev_tick = tick
 
         # ---- text ----
         lines = [f"tick={tick} 时间={tick // 3600}:{(tick // 60) % 60:02d}"]

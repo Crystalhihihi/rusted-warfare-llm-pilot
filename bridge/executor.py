@@ -15,6 +15,8 @@ import threading
 import time
 from collections import Counter, deque
 
+import powergrid
+
 BUILDER_BUILD = {  # 建造者建造动作的静态优先级（按局面分支使用）
     "extractor": ["b_extractorT1"],
     "landFactory": ["b_landFactory"],
@@ -101,6 +103,8 @@ class Executor:
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
         # 建筑占地表（pedia fp 字段）：类型名 -> (w, h, ox, oy)，槽位网格按此分配空间
         self.fp = {}
+        # 动作价格表（pedia price 字段）：生产动作ID -> 价格（规则层生产的资金感知）
+        self.price = {}
         for u in (pedia or {}).get("units", []):
             f = u.get("fp")
             if f:
@@ -109,6 +113,8 @@ class Executor:
                                           int(f.get("ox", 0)), int(f.get("oy", 0)))
                 except (TypeError, ValueError):
                     pass
+            if u.get("price") is not None:
+                self.price["u_" + u["name"]] = int(u["price"])
         self.stance = "expand"
         self.action_bad = {}           # 动作 -> 解封时间（None=永久：ID不存在；限时=科技未达，120s重试）
         self.cool = {}                 # 冷却：键 -> 到期时间
@@ -116,13 +122,21 @@ class Executor:
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
         self.issued_cells = {}         # 类型 -> [(x, y, 到期时间)] 在途建筑占位（槽位网格用）
         self.custom_builds = []        # LLM 指定建造队列 [(action, x, y)]
+        # 建造工单（BuilderManager）：有序建造任务队列，规则层调度建造者连干
+        # 任务 = {"action": str, "slot": spec, "status": pending/assigned/done/failed,
+        #         "builder": id, "ts": float, "x": x, "y": y, "note": str}
+        self.work_order = []
+        self.wo_version = 0
         self.ext_pool_bad = {}         # (gx,gy) -> 解封时间：agent 判"找不到合法建造位置"的池（120s 跳过）
         self._last_ext_xy = None       # (x, y, ts) 最近一次采集器下单（池失败归因用）
+        self._last_build_xy = None     # (x, y, ts) 最近一次带坐标建造下单（选址失败归因用）
+        self.site_bad = {}             # (gx,gy) -> 解封时间：选址判死格（水域/隔断/校验不过，600s）
         self.prog_seen = {}            # 建筑id -> (prog, 时间戳)：识别烂尾（进度长期不涨）
         self.upgrade_bad = {}          # (建筑id, 动作) -> 解封时间：该建筑此升级失败后的冷却
         self.last_upgrade = None
         self.lock = threading.Lock()   # tick/目标设置/失败学习 共用（执行层独立线程）
         self.dmap = None               # DangerMap（pilot 注入）：敌人记忆/威胁热力
+        self.on_action = None          # fn(cmd)：指令下发回调（multiagent 注入，推游戏内聊天台）
         self.train_hist = {}           # 工厂id -> deque(发车时间)：q 缺失（如 mechFactoryT2）时的本地队列估计
         self.last_military_order = 0.0  # 最近一次 LLM 军事指令时间（attack/harass/defend）
         self.auto_military_cd = 0.0
@@ -135,8 +149,154 @@ class Executor:
         self.resume_cd = {}             # 烂尾建筑id -> 续建派工冷却时间
         self._wext_issued = 0.0         # 水池建造下单窗口（45s 内不再派第二单）
         self.start_ts = time.time()
+        # 战力标签 + 领土控制图（确定性，快照驱动）
+        self.power_table = powergrid.power_table(pedia)
+        self.control = powergrid.ControlMap(self.power_table)
+        self.control.set_threat_fn(
+            lambda x, y, snap: (self.dmap.threat.get((int(x // 400), int(y // 400)), 0.0)
+                                if self.dmap else 0.0))
 
     # ---------- LLM 目标接口 ----------
+    def set_work_order(self, tasks):
+        """下发建造工单（LLM 规划员或模板）：有序任务队列。
+        tasks: [{"action": "b_x", "slot": spec, "note": str?}, ...]
+        slot 规格（派发时现场解析，队列随局自适应）：
+          "pool:k"=第 k 近安全池 | "factory:k"=厂区槽位k | "defense:k"=防线弧位k
+          "misc:k"=后勤槽位k | "water"=近水点 | (x,y)=精确坐标
+        状态机：pending -> assigned -> done/failed。规则层 2s 拍调度建造者连干。"""
+        self.work_order = []
+        for i, t in enumerate(tasks or []):
+            act = str(t.get("action", ""))
+            if not act.startswith(("b_", "u_", "c_")):
+                act = "b_" + act
+            self.work_order.append({"idx": i, "action": act, "slot": t.get("slot"),
+                                  "note": str(t.get("note", "")), "status": "pending",
+                                  "builder": None, "ts": 0.0, "x": None, "y": None})
+        self.wo_version += 1
+        self.log("status", f"⚙ 建造工单 v{self.wo_version} 已接收（{len(self.work_order)} 项）")
+
+    def _wo_resolve(self, task, snap, cc, safe_pools, occ):
+        """slot 规格 → 世界坐标（派发时现场解析）。"""
+        slot = task["slot"]
+        btype = task["action"][2:]
+        if isinstance(slot, (list, tuple)) and len(slot) == 2:
+            return float(slot[0]), float(slot[1])
+        if not cc:
+            return None
+        if isinstance(slot, str):
+            if slot.startswith("pool:"):
+                k = int(slot.split(":")[1])
+                if k < len(safe_pools):
+                    return float(safe_pools[k]["x"]), float(safe_pools[k]["y"])
+                return None
+            if slot.startswith("factory:"):
+                land = [u for u in snap.get("own", []) if u.get("bld") and u["t"] == "landFactory"]
+                idx = sum(1 for u in snap.get("own", [])
+                          if u.get("bld") and "actory" in u["t"].lower()
+                          and u["t"] not in ("commandCenter", "seaFactory"))
+                return self.factory_slot(cc, idx, land, occ=occ, btype=btype)
+            if slot.startswith("defense:"):
+                anchor = self.army_goal.get("rally")
+                mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
+                mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
+                tx, ty = anchor if anchor else (mw / 2, mh / 2)
+                ax, ay = tx - cc["x"], ty - cc["y"]
+                alen = max(1.0, math.hypot(ax, ay))
+                idx = int(slot.split(":")[1]) if ":" in slot else 0
+                spot = self.defense_slot(cc, occ, btype, idx, (ax / alen, ay / alen), 0)
+                if spot == "LANE":  # 主通道留空，跳一号
+                    spot = self.defense_slot(cc, occ, btype, idx + 1, (ax / alen, ay / alen), 0)
+                return None if spot in (None, "LANE") else spot
+            if slot.startswith("misc:"):
+                idx = sum(1 for u in snap.get("own", []) if u.get("bld")
+                          and (u["t"].startswith("fabricator") or "experimental" in u["t"].lower()
+                               or u["t"] == "repairbay"))
+                return self.misc_slot(cc, idx, occ=occ, btype=btype)
+            if slot == "water":
+                return self.water_anchor(cc)
+        return None
+
+    def _wo_tick(self, snap, emit, now, own, funds, idle_builders, safe_pools, cc, occ, danger):
+        """建造工单调度（BuilderManager 核心）：空闲建造者按序领最多 3 个连续任务，
+        以 buildq 追加进游戏原生路点队列（盖完一个自动去下一个，玩家拉条同款）。
+        资金按累计价停派（攒钱不乱序）；科技/占地/可达不过判 failed 不拖累队列。"""
+        if not self.work_order:
+            return
+        for task in self.work_order:
+            if not idle_builders:
+                break
+            if task["status"] != "pending":
+                continue
+            batch = []
+            funds_left = funds
+            for t in self.work_order:
+                if t["status"] != "pending":
+                    continue
+                btype = t["action"][2:]
+                price = self.price.get("u_" + btype) or self.price.get(btype) or 0
+                if price and funds_left < price:
+                    break  # 有序队列：攒钱再派
+                if self._bad(t["action"], now):
+                    t["status"] = "failed"
+                    t["note"] += "|动作不可用"
+                    continue
+                spot = self._wo_resolve(t, snap, cc, safe_pools, occ)
+                if not spot:
+                    t["status"] = "failed"
+                    t["note"] += "|槽位解析失败"
+                    continue
+                # 危险判定分家：防守类建筑在防线圈(≤1200px)内挨打照盖（防线挨打正是该盖的时候）；
+                # 扩张类(采集器/远征)危险照样禁（治开局乱跑送死）
+                defense_types = ("c_turret", "c_antiAirTurret", "laserDefence", "repairbay", "wall")
+                if danger(spot[0], spot[1], 400) and not (
+                        t["action"][2:].startswith(defense_types)
+                        and cc and (spot[0] - cc["x"]) ** 2 + (spot[1] - cc["y"]) ** 2 <= 1200 ** 2):
+                    t["status"] = "failed"
+                    t["note"] += "|点位危险"
+                    continue
+                batch.append((t, spot, price))
+                funds_left -= price
+                if len(batch) >= 3:
+                    break
+            if not batch:
+                break
+            b = idle_builders[0]
+            if len(batch) == 1:
+                t, s, _p = batch[0]
+                ok = emit({"cmd": "build", "action": t["action"], "builder": b["id"],
+                           "x": float(s[0]), "y": float(s[1])}, f"wo:{t['idx']}:{b['id']}", 3.0)
+            else:
+                items = ";".join(f"{t['action']}@{s[0]:.0f},{s[1]:.0f}" for t, s, _p in batch)
+                ok = emit({"cmd": "buildq", "builder": b["id"], "items": items},
+                          f"woq:{b['id']}", 3.0)
+            if ok:
+                for t, s, _p in batch:
+                    t["status"] = "assigned"
+                    t["builder"] = b["id"]
+                    t["ts"] = now
+                    t["x"], t["y"] = s
+                idle_builders = idle_builders[1:]
+        # 完成/烂尾判定
+        live = {(u["x"], u["y"], u["t"]) for u in own if u.get("bld")}
+        for task in self.work_order:
+            if task["status"] != "assigned":
+                continue
+            done = any(abs(x - task["x"]) < 60 and abs(y - task["y"]) < 60 and t == task["action"][2:]
+                       for x, y, t in live)
+            if done:
+                task["status"] = "done"
+            elif now - task["ts"] > 90:
+                task["status"] = "pending"  # 超 90s 没起来（建造者阵亡等）→ 重派
+                task["builder"] = None
+        done_n = sum(1 for t in self.work_order if t["status"] == "done")
+        pending_n = sum(1 for t in self.work_order if t["status"] == "pending")
+        self.wo_progress = (done_n, pending_n, len(self.work_order))
+
+    def _wo_pending(self, prefix):
+        """工单里是否还有 prefix 开头的未完成动作（响应式补给规则避让用）。"""
+        return any(t["status"] in ("pending", "assigned") and t["action"].startswith(prefix)
+                   for t in self.work_order)
+
     def set_economy_goal(self, extractors=None, builders=None):
         if extractors is not None:
             # 硬上限12：防 LLM 把扩张目标抬到天上去（8→10→22）拖垮全局
@@ -207,6 +367,18 @@ class Executor:
                 gx, gy = int(self._last_ext_xy[0] // 400), int(self._last_ext_xy[1] // 400)
                 self.ext_pool_bad[(gx, gy)] = time.time() + 120
                 self.log("status", f"⚙ 池点被占判死，120s跳过 ({self._last_ext_xy[0]:.0f},{self._last_ext_xy[1]:.0f})")
+            # 选址失败签名（水域/隔断不可达、找不到合法位置）：归因最近带坐标建造，600s 判死；
+            # 不可达的池直接永久判死（本局不会变得可达）
+            if ("无法靠近" in msg or "找不到合法建造位置" in msg) and self._last_build_xy \
+                    and time.time() - self._last_build_xy[2] < 10:
+                gx, gy = int(self._last_build_xy[0] // 400), int(self._last_build_xy[1] // 400)
+                self.site_bad[(gx, gy)] = time.time() + 600
+                self.log("status", f"⚙ 选址判死10分钟: 格({gx},{gy})")
+                if "无法靠近" in msg and self._last_ext_xy \
+                        and self._last_ext_xy[0] == self._last_build_xy[0] \
+                        and self._last_ext_xy[1] == self._last_build_xy[1]:
+                    self.ext_pool_bad[(gx, gy)] = time.time() + 3600
+                    self.log("status", f"⚙ 池点不可达永久判死 ({self._last_build_xy[0]:.0f},{self._last_build_xy[1]:.0f})")
 
     # ---------- 主循环 ----------
     def tick(self, snap):
@@ -233,6 +405,8 @@ class Executor:
         _cc = next((u for u in own if u["t"] == "commandCenter" and u.get("bld")), None)
         ccx = _cc["x"] if _cc else 0
         ccy = _cc["y"] if _cc else 0
+        # 控制图喂快照（每拍）：战力/占领/安全值全量刷新
+        self.control.update(snap, self.dmap, (ccx, ccy) if _cc else None)
         # 布局前线方向（CC→图心）：全局长持，工厂槽位/后勤槽位/防线都以此定向
         if _cc and mw and mh and self.front_dir is None:
             fdx, fdy = mw / 2 - _cc["x"], mh / 2 - _cc["y"]
@@ -240,7 +414,8 @@ class Executor:
             self.front_dir = (fdx / fd, fdy / fd)
         safe_pools = sorted(
             (p for p in self.resources
-             if not p.get("w") and not danger(p["x"], p["y"])
+             if not p.get("w") and (_cc is not None and (p["x"] - ccx) ** 2 + (p["y"] - ccy) ** 2 < 600 ** 2
+                                    or not danger(p["x"], p["y"]))
              and not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
                          for u in own + snap.get("allies", []) if u.get("bld"))),
             key=lambda p: (p["x"] - ccx) ** 2 + (p["y"] - ccy) ** 2)
@@ -274,12 +449,30 @@ class Executor:
                 return False
             self.cool[cool_key] = now + cooldown
             cmds.append(cmd)
+            if self.on_action:
+                try:
+                    self.on_action(cmd)
+                except Exception:
+                    pass
             if cmd["cmd"] == "build":
                 act = cmd.get("action", "")
                 btype = act[2:] if act.startswith("b_") else act
                 self.issued_builds.append((btype, now + 45.0))  # 施工窗口期，防重复下单
                 if cmd.get("x") is not None:
                     self.issued_cells.setdefault(btype, []).append((cmd["x"], cmd["y"], now + 45.0))
+                    self._last_build_xy = (cmd["x"], cmd["y"], now)  # 失败回执归因用
+            if cmd["cmd"] == "buildq":
+                for it in cmd.get("items", "").split(";"):
+                    if "@" not in it:
+                        continue
+                    act, xy = it.split("@", 1)
+                    try:
+                        x, y = (float(v) for v in xy.split(","))
+                    except ValueError:
+                        continue
+                    btype = act[2:] if act.startswith("b_") else act
+                    self.issued_builds.append((btype, now + 45.0))
+                    self.issued_cells.setdefault(btype, []).append((x, y, now + 45.0))
             if cmd["cmd"] == "train":
                 self.train_hist.setdefault(cmd["factory"], deque()).append(now)  # 本地队列估计用
             return True
@@ -414,6 +607,9 @@ class Executor:
                           if not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
                                      for u in friendly if u.get("bld"))]
             stalemate = (not free_pools) or (len(ext_done) >= self.econ_goal["extractors"] and funds >= 15000)
+            inc = (snap.get("team") or {}).get("income")
+            if inc is not None and inc < 8:
+                stalemate = True  # 收入率低就是穷（不看余额）——触发资源制造仪补经济
             fab_cap = 4 if funds >= 15000 else 2
             if stalemate and fab_count + fab_inflight < fab_cap and idle_builders \
                     and not self._bad("b_fabricatorT1", now):
@@ -429,7 +625,10 @@ class Executor:
         # 4.6) 高盈余战略建筑：实验厂（≥20000 且 ≥2 陆厂，限1座）与海军厂（水图才造，锚定近水）
         exp_count = sum(1 for u in own if "experimental" in u["t"].lower() and u.get("bld"))
         exp_inflight = sum(1 for t, _ in self.issued_builds if "experimental" in t.lower())
-        if (funds >= 20000 and len(land_factories) >= 2 and exp_count + exp_inflight < 1
+        # 大开支看收入率（有钱就乱用的根源）：收入 ≥15 或实在没这个字段才只看余额
+        inc = (snap.get("team") or {}).get("income")
+        rich = (inc >= 15) if inc is not None else (funds >= 20000)
+        if (rich and funds >= 8000 and len(land_factories) >= 2 and exp_count + exp_inflight < 1
                 and idle_builders and not self._bad("b_experimentalLandFactory", now)):
             b = idle_builders[0]
             excmd = {"cmd": "build", "action": "b_experimentalLandFactory", "builder": b["id"]}
@@ -612,15 +811,24 @@ class Executor:
                       ext_done, factories, safe_pools, cc, mw, mh, danger):
         """规则快层（多 agent 模式）：LLM 管决策，例行公事机器节拍执行。
         只做参数内的例行——不盖新厂型、不改方向（那是 chat 建造层/计划书的事）。"""
-        # ① 建造者维持（<目标且有钱就补，CC 队列不满时）
+        # 建造工单调度（BuilderManager）：规划层给的队列优先执行
+        occ = self._occupancy(snap)
+        self._wo_tick(snap, emit, now, own, funds, idle_builders, safe_pools, cc, occ, danger)
+
+        # ① 建造者维持（<目标且有钱就补，CC 队列不满时；价格从 pedia 取，不写死）
         if cc and len(builders) < self.econ_goal["builders"] and (cc.get("q") or 0) < QUEUE_MAX:
-            if funds >= 250:
+            if funds >= self.price.get("u_builder", 250):
                 emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
-        # ② 采集器补池（只去安全池，完工数达标即停；被 agent 判死的池 120s 跳过）
+        # ② 采集器补池（工单里有采集任务时避让；被 agent 判死的池 120s 跳过；在途池不重派）
         ext_inflight = sum(1 for t, _ in self.issued_builds if t.startswith("extractor"))
+        inflight_xy = [(x, y) for x, y, _e in self.issued_cells.get("extractorT1", [])]
         pools = [p for p in safe_pools
-                 if now >= self.ext_pool_bad.get((int(p["x"] // 400), int(p["y"] // 400)), 0)]
+                 if now >= self.ext_pool_bad.get((int(p["x"] // 400), int(p["y"] // 400)), 0)
+                 and not any(abs(p["x"] - x) < 40 and abs(p["y"] - y) < 40 for x, y in inflight_xy)
+                 and (self.control.secured(p["x"], p["y"], now)
+                      or (cc and (p["x"] - cc["x"]) ** 2 + (p["y"] - cc["y"]) ** 2 < 600 ** 2))]
         if (len(ext_done) < self.econ_goal["extractors"] and ext_inflight < 2
+                and not self._wo_pending("b_extractor")
                 and funds >= EXTRACTOR_PRICE and idle_builders and pools):
             b = idle_builders[0]
             px, py = float(pools[0]["x"]), float(pools[0]["y"])
@@ -658,7 +866,10 @@ class Executor:
             if spot == "LANE":  # 主通道留空，跳一号
                 idx += 1
                 spot = self.defense_slot(cc, occ, btype, idx, (ax / alen, ay / alen), back)
-            if spot and spot != "LANE" and not danger(spot[0], spot[1], 500):
+            if spot and spot != "LANE" and (
+                    not danger(spot[0], spot[1], 500)
+                    or (cc and (spot[0] - cc["x"]) ** 2 + (spot[1] - cc["y"]) ** 2 <= 1200 ** 2)):
+                # 防线圈(≤1200)内挨打照盖炮塔——防线挨打正是该盖的时候（危险只拦远征）
                 b = idle_builders[0]
                 emit({"cmd": "build", "action": tur_action, "builder": b["id"],
                       "x": float(spot[0]), "y": float(spot[1])}, f"build:tur:{b['id']}", 6.0)
@@ -678,6 +889,77 @@ class Executor:
                 b = idle_builders[0]
                 emit({"cmd": "build", "action": "b_repairbay", "builder": b["id"],
                       "x": float(spot[0]), "y": float(spot[1])}, f"build:bay:{b['id']}", 8.0)
+                idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
+
+        # ④ 工厂：首座陆厂 + 按资金扩到 3 座（工单里有工厂任务时避让）
+        facs = [u for u in factories if u["t"] != "commandCenter"]
+        fac_inflight = sum(1 for t, _ in self.issued_builds if "actory" in t)
+        fac_want = min(3, 1 + int(funds // 4000))
+        if (len(ext_done) >= 2 and len(facs) + fac_inflight < fac_want
+                and not any(self._wo_pending(p) for p in ("b_landFactory", "b_airFactory", "b_mechFactory"))
+                and funds >= 700 and idle_builders and cc and not self._bad("b_landFactory", now)):
+            b = idle_builders[0]
+            sx, sy = self.factory_slot(cc, len(facs) + fac_inflight,
+                                       [u for u in facs if u["t"] == "landFactory"],
+                                       occ=self._occupancy(snap))
+            emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"],
+                  "x": float(sx), "y": float(sy)}, f"build:fac:{b['id']}", 6.0)
+            idle_builders = idle_builders[1:]
+
+        # ⑤ 升级：采集器(≥3200) > 工厂(≥4500)（终态/回退动作已排除，30s 建筑级冷却）
+        def _try_upgrade(units, need):
+            if funds < need:
+                return
+            for u in units:
+                up = self.upgrade_action.get(u["t"])
+                if not up or self._bad(up, now):
+                    continue
+                if (u["id"], up) in self.upgrade_bad and now < self.upgrade_bad[(u["id"], up)]:
+                    continue
+                if now < self.cool.get(f"up:{u['id']}", 0):
+                    continue
+                if emit({"cmd": "train", "action": up, "factory": u["id"]}, f"upemit:{u['id']}"):
+                    self.cool[f"up:{u['id']}"] = now + UPGRADE_COOLDOWN
+                    self.last_upgrade = (u["id"], up, now)
+                return
+
+        _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                      and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))
+                      and "overclocked" not in u["t"] and "reinforced" not in u["t"]], 3200)
+        _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                      and "actory" in u["t"].lower()], 4500)
+
+        # ⑥ 前线哨戒：集结点离家 >900 时在其旁起炮塔（前线占领区要有防御，不是乱逛）
+        rally = self.army_goal.get("rally")
+        if (rally and cc and mw and mh and land_factories and funds >= 1600
+                and idle_builders and not self._bad("b_c_turret_t1", now)):
+            d_home = math.hypot(rally[0] - cc["x"], rally[1] - cc["y"])
+            fwd = [u for u in own if "turret" in u["t"].lower() and u.get("bld")
+                   and math.hypot(u["x"] - rally[0], u["y"] - rally[1]) < 400]
+            fwd_inf = sum(1 for x, y, _e in self.issued_cells.get("c_turret_t1", [])
+                          if math.hypot(x - rally[0], y - rally[1]) < 400)
+            if d_home > 900 and len(fwd) + fwd_inf < 2 and not danger(rally[0], rally[1], 400):
+                ang = (len(fwd) + fwd_inf) * 2.1
+                b = idle_builders[0]
+                emit({"cmd": "build", "action": "b_c_turret_t1", "builder": b["id"],
+                      "x": float(rally[0] + math.cos(ang) * 140),
+                      "y": float(rally[1] + math.sin(ang) * 140)},
+                     f"build:fwd:{b['id']}", 10.0)
+                idle_builders = idle_builders[1:]
+
+        # ⑦ 军工生产：构成由战斗域/计划书定（set_composition），队列执行归规则层——
+        #    稳态期零 LLM 也持续产兵（科技过滤/防空占比/队列上限都在 _next_production 内）
+        for fac in [u for u in factories if u["t"] != "commandCenter"]:
+            if self._q(fac, now) >= QUEUE_MAX:
+                continue
+            if funds < FUNDS_RESERVE and len(ext_done) + ext_inflight < self.econ_goal["extractors"]:
+                continue
+            act = self._next_production(fac, own)
+            if act:
+                price = self.price.get(act, 0)
+                if price and funds < price:
+                    continue  # 资金不够就憋着（此前无视价格每 2s 刷一次失败）
+                emit({"cmd": "train", "action": act, "factory": fac["id"]}, f"train:{fac['id']}")
 
     # ---------- 布局槽位（全局长持方向，建筑成行成排而非螺旋散点） ----------
     def factory_slot(self, cc, idx, existing, occ=None, btype="landFactory"):
@@ -760,6 +1042,14 @@ class Executor:
             self.issued_cells[t] = live
             for x, y, _e in live:
                 self._mark_fp(occ, t, x, y)
+        # 选址判死格（水域/隔断/校验不过签名，600s）按占位处理，槽位自然避让
+        for (gx, gy), exp in list(self.site_bad.items()):
+            if exp <= now:
+                del self.site_bad[(gx, gy)]
+            else:
+                for i in range(-1, 2):
+                    for j in range(-1, 2):
+                        occ.add((gx + i, gy + j))
         return occ
 
     def _cell_free(self, occ, name, gx, gy):
@@ -876,5 +1166,7 @@ class Executor:
         facs = sum(1 for u in own if _is_factory(u) and not _constructing(u))
         stalled_txt = f" 烂尾{getattr(self, 'last_stalled', 0)}座(续建已派)" if getattr(self, "last_stalled", 0) else ""
         naval_txt = " 水图" if self.naval else ""
+        inc = (snap.get("team") or {}).get("income")
+        inc_txt = f" 收{inc:+.0f}/s" if inc is not None else ""
         return (f"执行层: 池{ext}/{self.econ_goal['extractors']} 厂{facs} "
-                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}{naval_txt}{stalled_txt}")
+                f"建造者{len(builders)}(闲{idle_b}) 目标{self.stance}{inc_txt}{naval_txt}{stalled_txt}")

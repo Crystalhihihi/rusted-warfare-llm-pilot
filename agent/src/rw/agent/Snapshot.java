@@ -27,8 +27,14 @@ public final class Snapshot {
         }
         if (team != null) {
             sb.append(",\"team\":{\"id\":").append(team.k)
-              .append(",\"funds\":").append((long) team.o)
-              .append(",\"ai\":").append(team.w).append('}');
+              .append(",\"funds\":").append((long) team.o);
+            try {
+                // 队伍收支速率（游戏 UI "(+26)" 同款数据源：n.b/a(credits)）
+                sb.append(",\"income\":").append(team.b(com.corrodinggames.rts.game.units.custom.e.a.D))
+                  .append(",\"expense\":").append(team.a(com.corrodinggames.rts.game.units.custom.e.a.D));
+            } catch (Throwable ignored) {
+            }
+            sb.append(",\"ai\":").append(team.w).append('}');
             sb.append(",\"delegated\":[");
             java.util.ArrayList<am> del = Commands.delegatedUnits(team);
             for (int i = 0; i < del.size(); i++) {
