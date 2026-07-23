@@ -733,7 +733,11 @@ def main():
         return 1
 
     link = AgentLink()
-    open(ACTIVITY_FILE, "w", encoding="utf-8").close()  # 清空上轮活动流
+    # 活动流轮转存档（数据资产，不再清空丢失：文章/分析全靠它）
+    if os.path.exists(ACTIVITY_FILE) and os.path.getsize(ACTIVITY_FILE) > 0:
+        os.rename(ACTIVITY_FILE,
+                  ACTIVITY_FILE.replace(".jsonl", time.strftime("-%Y%m%d-%H%M%S.jsonl")))
+    open(ACTIVITY_FILE, "w", encoding="utf-8").close()
     print("[pilot] 等待游戏地图数据（请先开一局遭遇战）...")
     while link.map_message() is None:
         time.sleep(1)
