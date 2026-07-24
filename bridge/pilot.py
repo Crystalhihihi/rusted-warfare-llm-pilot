@@ -395,6 +395,7 @@ class AgentLink:
     def __init__(self):
         self.lock = threading.Lock()
         self.latest_snap = None
+        self.fog_snap = None   # 最近一帧带迷雾附件的快照（附件 ~10s 一跳，latest_snap 0.5s 后就被普通帧冲掉）
         self.map_msg = None
         self.map_version = 0  # 新对局（新地图消息）递增，pilot 据此重置上下文
         self.pedia = None
@@ -434,6 +435,8 @@ class AgentLink:
                         with self.lock:
                             if t == "snapshot":
                                 self.latest_snap = msg
+                                if "fogGrid" in msg or "ghosts" in msg:
+                                    self.fog_snap = msg  # 迷雾附件单帧易逝，单独留存
                             elif t == "map":
                                 rows_hash = hash(tuple(msg.get("rows", [])))
                                 if rows_hash != getattr(self, "_map_hash", None):
@@ -728,6 +731,14 @@ def main():
         if os.path.exists(secret_path):
             with open(secret_path, "rb") as fp:
                 api_key = tomllib.load(fp).get("api_key", "")
+    # 第二供应商（硅基流动）：squad chat 执行层专用（代金券抵扣），读取同一 secret.toml
+    sf_key = ""
+    secret_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret.toml")
+    if os.path.exists(secret_path):
+        with open(secret_path, "rb") as fp:
+            sf_key = tomllib.load(fp).get("siliconflow_key", "")
+    if sf_key:
+        cfg["squad_api_key"] = sf_key
     if not api_key and not llm_off:
         print(f"缺少 API key：请设置环境变量 {cfg['api_key_env']} 或填写 bridge/secret.toml")
         return 1
@@ -890,6 +901,7 @@ def main():
                              daemon=True, name="rw-executor").start()
         executor.autopilot = False
         executor.routine = bool(cfg.get("routine_layer", True))  # 规则快层：例行+炮塔弧跟随集结点
+        executor.auto_production = bool(cfg.get("auto_production", True))  # 规则层自动补军工队列
         import multiagent
         return multiagent.run({
             "link": link, "cfg": cfg, "api_key": api_key, "pedia": pedia,
@@ -906,7 +918,8 @@ def main():
             "ai_enabled": lambda: not (link.ai_control_state()
                                        and not link.ai_control_state().get("enabled", True)),
             "role_enabled": lambda name: (link.ai_control_state() or {}).get(
-                "cmd" + name.capitalize(), True),  # 设置面板的角色开关（缺省=开）
+                "cmd" + name.capitalize(),
+                (link.ai_control_state() or {}).get("cmdCombat", True)),  # 军种中层缺省跟战斗总闸
         })
 
     while True:

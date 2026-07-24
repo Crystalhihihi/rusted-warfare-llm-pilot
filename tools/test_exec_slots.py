@@ -81,7 +81,11 @@ fab = U("fabricatorT1", 1740, 1000, bld=True)
 ces3 = [U("combatEngineer", 1600, 1000), U("combatEngineer", 1610, 1000)]
 c4 = e3.tick(snap([cc3] + b3s + exts3 + facs3 + [fab] + ces3, 25000))
 exp = [c for c in c4 if c.get("action") == "b_experimentalLandFactory"]
-assert exp and (exp[0]["x"], exp[0]["y"]) == (2080.0, 1000.0), f"S3 实验厂后勤槽位错: {c4}"
+# 几何兜底槽位 (2080,1000) 在本图出界（图宽 2000px）——正确行为=跳过不发非法坐标（旧断言认的就是出界点）
+assert not exp, f"出界槽位应跳过而不是照发: {c4}"
+for c in c4:
+    if "x" in c:
+        assert 0 <= c["x"] and 0 <= c["y"], f"负坐标指令: {c}"
 # ---- S4：规则快层（多 agent 模式：autopilot=False + routine=True） ----
 e4 = ex.Executor(mk_map(water_cols=0), {}, log)
 e4.autopilot = False

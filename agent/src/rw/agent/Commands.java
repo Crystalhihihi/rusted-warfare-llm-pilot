@@ -246,12 +246,28 @@ public final class Commands {
                     } catch (NumberFormatException nfe) {
                         continue;
                     }
-                    try {
-                        if (placementError(type, px, py, team) != null) {
-                            skipped.append(pa[0]).append("@(").append((int) px).append(",").append((int) py).append(") ");
+                    if (type.p()) {
+                        // 池点类：游戏对非池心坐标静默丢路点（回执 ok 但不建）——
+                        // 吸附最近池的 9 宫格合法点，与单条 build 同套自纠
+                        float[] snap = snapToPool(engine, team, type, px, py);
+                        if (snap == null) {
+                            skipped.append(pa[0]).append("@(").append((int) px).append(",").append((int) py)
+                                   .append("):附近无空闲池点 ");
+                            continue;
+                        }
+                        px = snap[0];
+                        py = snap[1];
+                    } else {
+                        String err = null;
+                        try {
+                            err = placementError(type, px, py, team);
+                        } catch (Throwable ignored) {
+                        }
+                        if (err != null) {
+                            skipped.append(pa[0]).append("@(").append((int) px).append(",").append((int) py)
+                                   .append("):").append(err).append(' ');
                             continue; // 校验不过跳过该点，不影响队列其它路点
                         }
-                    } catch (Throwable ignored) {
                     }
                     e c = engine.cf.b(team);
                     c.e = true; // 追加模式：不清队列，路点进队尾（e.java:13）
@@ -438,14 +454,14 @@ public final class Commands {
                 }
             } catch (Throwable ignored) {
             }
-            reply(false, cmd, "找不到合法建造位置：" + spotReason + extra);
+            reply(false, cmd, "@(" + (int) ax + "," + (int) ay + ") 找不到合法建造位置：" + spotReason + extra);
             return;
         }
         x = spot[0];
         yv = spot[1];
         // 可达性预检：目标 85px 环带采样——建造者能走到施工距离内任一点即放行（岸边造水上建筑合法）
         if (!builderCanApproach(builder, x.floatValue(), yv.floatValue())) {
-            reply(false, cmd, "建造者无法靠近目标85px内（水域/隔断），需换海上建造者或换位置");
+            reply(false, cmd, "@(" + (int) x.floatValue() + "," + (int) yv.floatValue() + ") 建造者无法靠近目标85px内（水域/隔断），需换海上建造者或换位置");
             return;
         }
         // 前缀归一：建造指令只认 b_（s_ 是"选中同类"动作，存在于每个单位，命中即空操作）
@@ -518,7 +534,7 @@ public final class Commands {
         String resolvedT = resolveActionOn(fac, action);
         if (resolvedT == null) {
             String avail = availableActions(fac, 12);
-            reply(false, cmd, "该工厂没有此动作: " + action + (avail.isEmpty() ? "" : "；可用: " + avail));
+            reply(false, cmd, "工厂#" + fac.eh + " 没有此动作: " + action + (avail.isEmpty() ? "" : "；可用: " + avail));
             dumpActions(fac, "train " + action);
             return;
         }
@@ -886,6 +902,35 @@ public final class Commands {
         } catch (Throwable t) {
             return null; // 校验失败不挡指令
         }
+    }
+
+    /** buildq 池点吸附：找离目标最近的资源池（>60px 视为指错地方），
+     *  用 9 宫格候选交权威校验自纠（与单条 build 的 findBuildSpot 同套）。
+     *  游戏对非池心的采集器落点会静默丢路点，必须先吸附。 */
+    private static float[] snapToPool(l engine, n team, as type, float px, float py) {
+        try {
+            float[] best = null;
+            float bestD = Float.MAX_VALUE;
+            for (float[] p : resourcePoints(engine)) {
+                float d = dist2(p, px, py);
+                if (d < bestD) {
+                    bestD = d;
+                    best = p;
+                }
+            }
+            if (best == null || bestD > 60f * 60f) {
+                return null;
+            }
+            for (int[] off : POOL_CANDIDATES) {
+                float cx = best[0] + off[0];
+                float cy = best[1] + off[1];
+                if (placementError(type, cx, cy, team) == null) {
+                    return new float[]{cx, cy};
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /** 目标不可达时，在目标周围环形搜索一个"从部队和到目标都可达"的绕行点，写进回执引导绕行。 */

@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public final class NetServer {
     private static final int PORT = 41234;
     private static final ConcurrentLinkedQueue<String> inbox = new ConcurrentLinkedQueue<String>();
+    private static final ConcurrentLinkedQueue<Socket> welcomeQueue = new ConcurrentLinkedQueue<Socket>();
     private static final ArrayList<Socket> clients = new ArrayList<Socket>();
     private static boolean started = false;
 
@@ -56,6 +57,7 @@ public final class NetServer {
                 synchronized (clients) {
                     clients.add(s);
                 }
+                welcomeQueue.offer(s);  // 补发地图/百科用（暂停期换桥接也能救，不靠 client edge）
                 Log.info("bridge connected: " + s.getRemoteSocketAddress() + " clients=" + clients.size());
                 Thread reader = new Thread(new Runnable() {
                     @Override
@@ -130,6 +132,22 @@ public final class NetServer {
             } catch (Throwable t) {
                 removeClient(s);
             }
+        }
+    }
+
+    /** Poll one newly-connected client pending welcome resend. Game thread only. */
+    public static Socket pollWelcome() {
+        return welcomeQueue.poll();
+    }
+
+    /** Send one NDJSON line to a specific client (welcome resend). Never throws. */
+    public static void sendTo(Socket s, String line) {
+        try {
+            byte[] bytes = (line + "\n").getBytes("UTF-8");
+            s.getOutputStream().write(bytes);
+            s.getOutputStream().flush();
+        } catch (Throwable t) {
+            removeClient(s);
         }
     }
 

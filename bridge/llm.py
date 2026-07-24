@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal OpenAI-compatible chat client with tool-calling, stdlib only."""
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,10 @@ class LlmError(Exception):
 def chat(base_url: str, api_key: str, model: str, messages: list, tools: list,
          timeout: int = 45, max_retries: int = 2) -> dict:
     """Returns the assistant message dict (may contain content and/or tool_calls)."""
+    if os.environ.get("RW_LLM_MUTE"):
+        # 测试静音（用户要求：规则层验证不烧钱）——请求在客户端短路，零 token；
+        # 角色循环走 LlmError 分支继续，多 agent 结构与确定性层不受影响
+        raise LlmError("muted by RW_LLM_MUTE")
     import threading
     t_start = time.time()
     line = f"[llm] {time.strftime('%H:%M:%S')} 调用开始 model={model} 线程={threading.current_thread().name}"

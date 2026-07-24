@@ -51,6 +51,8 @@ public final class TickLoop {
         if (engine.bL != lastMap) {
             lastMap = engine.bL;
             mapSent = false;
+            ChatPanel.clear();  // 战役连打：上一局指令流不残留（"上一把的任务还在"的根治）
+            ChatPanel.add("system", "—— 新对局（地图已切换，上一局指令流已清空）——");
         }
         if (hasClient && !prevHasClient) {
             mapSent = false;
@@ -73,6 +75,24 @@ public final class TickLoop {
             } catch (Throwable t) {
                 Log.error("mapdata error", t);
                 mapSent = true; // don't retry-spam every tick
+            }
+        }
+        // 新客户端补发（暂停期换桥接：client edge 被 prevHasClient 陈化错过，welcome 队列无死角）
+        Socket w = NetServer.pollWelcome();
+        if (w != null && engine.bL != null) {
+            try {
+                String wm = MapData.build();
+                if (wm != null) {
+                    NetServer.sendTo(w, wm);
+                }
+                String wp = Pedia.build();
+                if (wp != null) {
+                    NetServer.sendTo(w, wp);
+                }
+                AiState.notifyChange();
+                Log.info("welcome resend done (map+pedia)");
+            } catch (Throwable t) {
+                Log.error("welcome resend error", t);
             }
         }
 

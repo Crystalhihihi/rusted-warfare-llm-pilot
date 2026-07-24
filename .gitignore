@@ -19,7 +19,10 @@ agent/logs/
 tools/pedia-dump.json
 tools/defense_sample.json
 bridge/__pycache__/
+bridge/pilot-stdout.log
+tools/__pycache__/
 bridge/activity.jsonl
+bridge/activity-*.jsonl
 bridge/control.json
 bridge/delegation.json
 bridge/map.txt

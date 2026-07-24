@@ -12,6 +12,8 @@ HOME_BONUS_MAX = 60.0     # 主基地加成上限（贴脸）
 HOME_BONUS_RANGE = 2400.0
 SECURE_MIN = 30.0         # 安稳阈值：安全值≥此且（无威胁或家近）
 SECURE_HOLD = 20.0        # 安稳需持续秒数
+FOG_BLACK_PENALTY = 25.0  # 全黑（未探索）安全惩罚：未知≠安全（阈值 30 下需硬实力压过）
+FOG_SHALLOW_PENALTY = 8.0  # 浅黑（记忆区）安全惩罚：幽灵威胁另计，此处小惩
 
 
 def power_table(pedia):
@@ -48,6 +50,7 @@ class ControlMap:
         self.secure_since = {} # 点 key -> 达标起始 ts
         self.home = None
         self.threat_of = None  # fn(x,y,snap)->float，由调用方从 DangerMap 注入
+        self.fog = None        # FogMap（接线后：全黑/浅黑安全惩罚，未知≠安全）
 
     def update(self, snap, dmap, home=None):
         if home:
@@ -81,7 +84,7 @@ class ControlMap:
         return HOME_BONUS_MAX * (1.0 - d / HOME_BONUS_RANGE)
 
     def safety(self, x, y, snap=None):
-        """点安全值 = 军力 + 建筑×1.5 + 离家加成 − 威胁热力。"""
+        """点安全值 = 军力 + 建筑×1.5 + 离家加成 − 威胁热力 − 迷雾惩罚（未知≠安全）。"""
         gx, gy = int(x // CELL), int(y // CELL)
         army = [0.0, 0.0]
         struct = [0.0, 0.0]
@@ -95,7 +98,14 @@ class ControlMap:
                 army[0] += c["army"][0] * w
                 struct[0] += c["struct"][0] * w
                 threat = max(threat, c["threat"])
-        return (army[0] + struct[0] * 1.5 + self.home_bonus(x, y)) - threat * 10.0
+        fog_penalty = 0.0
+        if self.fog is not None:
+            st = self.fog.state_at(x, y)
+            if st == "black":
+                fog_penalty = FOG_BLACK_PENALTY    # 全黑=未知：不许当安全区
+            elif st == "shallow":
+                fog_penalty = FOG_SHALLOW_PENALTY  # 浅黑=记忆：幽灵威胁已进热力，再小惩
+        return (army[0] + struct[0] * 1.5 + self.home_bonus(x, y)) - threat * 10.0 - fog_penalty
 
     def state(self, x, y):
         """占领形态：军+建筑 / 纯军队 / 纯建筑 / 未控。"""

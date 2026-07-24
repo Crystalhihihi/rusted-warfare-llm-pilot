@@ -47,6 +47,15 @@ final class ChatPanel {
     private static long msgSeq = 0L;        // synchronized(msgs) 内自增；快照缓存的失效键
     private static volatile int scroll = 0; // 距底行数：0=贴底（新消息自动可见），>0=用户上翻中
 
+    /** 新对局清屏（战役连打：上一局的指令流不残留）。 */
+    static void clear() {
+        synchronized (msgs) {
+            msgs.clear();
+            msgSeq++;  // 失效快照缓存（增量 wrap 的失效键）
+        }
+        scroll = 0;
+    }
+
     static void add(String who, String text) {
         if (text == null || text.isEmpty()) {
             return;
