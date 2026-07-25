@@ -4,6 +4,8 @@ import com.corrodinggames.rts.game.n;
 import com.corrodinggames.rts.game.units.am;
 import com.corrodinggames.rts.gameFramework.l;
 
+import java.net.Socket;
+
 /**
  * Per-tick driver, invoked from BridgeObject on the game thread:
  *  - drain inbound bridge commands (logged for now; executed in M2)

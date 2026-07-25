@@ -265,7 +265,7 @@ public final class Commands {
                         }
                         if (err != null) {
                             skipped.append(pa[0]).append("@(").append((int) px).append(",").append((int) py)
-                                   .append("):").append(err).append(' ');
+                                   .append("):").append(placementReason(err)).append(' ');
                             continue; // 校验不过跳过该点，不影响队列其它路点
                         }
                     }
@@ -821,7 +821,7 @@ public final class Commands {
                         return new float[]{cx, cy};
                     }
                     if (firstErr == null) {
-                        firstErr = err;
+                        firstErr = placementReason(err);
                     }
                 }
             }
@@ -901,6 +901,25 @@ public final class Commands {
             }
         } catch (Throwable t) {
             return null; // 校验失败不挡指令
+        }
+    }
+
+    /** 放置模板码 → 人话原因（y.java:5189 {2}=不在资源池；g.java:1982/1998 {0}=占位/碰撞/超范围）。 */
+    private static String placementReason(String err) {
+        if (err == null) {
+            return "?";
+        }
+        switch (err) {
+            case "{0}":
+                return "占位/碰撞或超建造范围";
+            case "{1}":
+                return "条件不符(游戏自定义)";
+            case "{2}":
+                return "不在资源池上";
+            case "{3}":
+                return "地形不符(水/岩浆等)";
+            default:
+                return err;
         }
     }
 
