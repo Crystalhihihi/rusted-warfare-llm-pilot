@@ -141,6 +141,7 @@ def _map_state(ctx, st, full=False):
     bidx = {"land": 0, "air": 1, "navy": 2}
     return {"ok": True, "generation": st.generation,
             "rows": (m.get("rows", []) if full else None),
+            "resources": (m.get("resources", []) if full else None),
             "tileW": m.get("tileW", 20), "tileH": m.get("tileH", 20),
             "w": m.get("tilesW") or 0, "h": m.get("tilesH") or 0,
             "fog": fm.raw if fresh else None,
@@ -154,6 +155,31 @@ def _map_state(ctx, st, full=False):
                 "allies": [[u.get("x", 0), u.get("y", 0)] for u in snap.get("allies", [])],
                 "enemy": [[u.get("x", 0), u.get("y", 0)] for u in snap.get("enemy", [])],
             }}
+
+
+def _bchat(ctx, st, body=None):
+    """建造小队 chat 状态与参数：GET 读（开关/每组上限/各组成员数+最近动作+回退态）；
+    POST 改 enabled/cap（运行中改下拍生效）。"""
+    import multiagent as ma  # 组名中文化
+    cfg = ctx["cfg"]
+    if body is not None:
+        v = body.get("cap")
+        if isinstance(v, int) and 1 <= v <= 12:
+            cfg["builder_chat_cap"] = v
+            ctx["log_activity"]("status", f"🖥 面板调整建造组上限: {v}")
+        en = body.get("enabled")
+        if isinstance(en, bool):
+            cfg["builder_chat_enabled"] = en
+            ctx["log_activity"]("status", f"🖥 面板{'开启' if en else '关闭'}建造小队")
+    groups = {}
+    for gid, bg in (st.bgroups or {}).items():
+        groups[gid] = {"name": ma._bchat_gname(gid),
+                       "members": len(bg["members"]),
+                       "online": bool(bg["thread"] and bg["thread"].is_alive()),
+                       "fallback": time.time() < bg["fallback_until"],
+                       "actions": list(bg["actions"])}
+    return {"ok": True, "enabled": bool(cfg.get("builder_chat_enabled")),
+            "cap": int(cfg.get("builder_chat_cap", 4)), "groups": groups}
 
 
 def _squads_caps(ctx, body=None):
@@ -251,6 +277,8 @@ def _make_handler(ctx, st):
                 self._send(json.dumps(_switches(ctx), ensure_ascii=False))
             elif path == "/api/squads":
                 self._send(json.dumps(_squads_caps(ctx), ensure_ascii=False))
+            elif path == "/api/bchat":
+                self._send(json.dumps(_bchat(ctx, st), ensure_ascii=False))
             else:
                 self._send('{"ok":false,"err":"404"}', code=404)
 
@@ -267,6 +295,8 @@ def _make_handler(ctx, st):
                                       ensure_ascii=False), code=200 if ok else 400)
             elif path == "/api/squads":
                 self._send(json.dumps(_squads_caps(ctx, body), ensure_ascii=False))
+            elif path == "/api/bchat":
+                self._send(json.dumps(_bchat(ctx, st, body), ensure_ascii=False))
             else:
                 self._send('{"ok":false,"err":"404"}', code=404)
 
@@ -350,6 +380,12 @@ _PAGE = """<!DOCTYPE html>
       陆<input class="capin" id="cap-land"> 空<input class="capin" id="cap-air"> 海<input class="capin" id="cap-navy">
       <button class="capbtn" onclick="setCaps()">应用</button><span id="cap-note" style="margin-left:6px"></span></div>
     <div id="squads"></div></div>
+  <div class="card"><h2>🧰 建造小队 · 现场执行层 <span class="meta" id="bchat-meta"></span></h2>
+    <div style="margin-bottom:8px;color:var(--dim);font-size:12px">
+      <button class="capbtn" id="bchat-toggle" onclick="toggleBchat()">开/关</button>
+      每组上限<input class="capin" id="bchat-cap">
+      <button class="capbtn" onclick="setBchatCap()">应用</button></div>
+    <div id="bchat"></div></div>
   <div class="card"><h2>🗺 地图理解 <span class="meta" id="map-meta"></span></h2>
     <canvas id="mapcanvas" style="width:100%;image-rendering:pixelated;border-radius:6px"></canvas>
     <div style="color:var(--dim);font-size:12px;margin-top:6px">军种着色：亮绿=陆军 · 天蓝=空军 · 深蓝=海军 · 深绿块=建筑 · 淡紫=盟友 · 红点=可见敌（AI 所见） · 空心红框=记忆敌建筑 · 黄=浅黑(记忆区) · 黑=未探索（AI 盲区） · 绿圈=家</div></div>
@@ -461,6 +497,33 @@ async function setCaps() {
                               body: JSON.stringify(body)});
   refreshCaps();
 }
+async function refreshBchat() {
+  try {
+    const b = await (await fetch("/api/bchat")).json();
+    $("bchat-meta").textContent = b.enabled ? "运行中" : "已关闭";
+    $("bchat-toggle").textContent = b.enabled ? "关闭建造小队" : "开启建造小队";
+    const el = $("bchat-cap");
+    if (document.activeElement !== el) el.value = b.cap;
+    $("bchat").innerHTML = Object.entries(b.groups || {}).map(([gid, g]) =>
+      `<div class="sq"><b>${esc(g.name)}(${gid})</b> ${g.online ? "🟢在线" : "⚪待员"} · 在组 ${g.members}` +
+      (g.fallback ? ` · <span style="color:#ff9e64">规则层接管中</span>` : "") +
+      `<div class="meta">${(g.actions || []).map(esc).join(" | ") || "（暂无动作）"}</div></div>`
+    ).join("") || `<div class="meta">（尚无分组——委托建造者后自动归队）</div>`;
+  } catch (e) {}
+}
+async function toggleBchat() {
+  const b = await (await fetch("/api/bchat")).json();
+  await fetch("/api/bchat", {method:"POST", headers:{"Content-Type":"application/json"},
+                             body: JSON.stringify({enabled: !b.enabled})});
+  refreshBchat();
+}
+async function setBchatCap() {
+  const v = parseInt($("bchat-cap").value, 10);
+  if (!(v >= 1 && v <= 12)) return;
+  await fetch("/api/bchat", {method:"POST", headers:{"Content-Type":"application/json"},
+                             body: JSON.stringify({cap: v})});
+  refreshBchat();
+}
 function decodeRow(s) {
   const out = [];
   for (const p of String(s).split(";")) {
@@ -529,9 +592,11 @@ $("cmdtext").addEventListener("keydown", e => { if (e.key === "Enter") sendCmd()
 refresh();
 refreshMap();
 refreshCaps();
+refreshBchat();
 setInterval(refresh, 2500);
 setInterval(refreshMap, 2500);  // 单位/迷雾动态刷新（快照 0.5s 一跳，面板 2.5s 跟拍）
 setInterval(refreshCaps, 5000);
+setInterval(refreshBchat, 5000);
 </script>
 </body>
 </html>

@@ -2,16 +2,23 @@
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"      # 从环境变量读 key，不写进文件
 model = "deepseek-reasoner"   # 推理型：deepseek-chat 实测优柔寡断不敢进攻；reasoner 决策果断（输出含思维链，单次略贵）
-# 模型分路（v3.2）：总指挥/建造指挥=pro，战斗指挥=flash，小队 chat=flash；缺省回退 model/model_fast
-# （可用 id 经 /v1/models 核实：deepseek-v4-pro / deepseek-v4-flash）
-commander_model = "deepseek-v4-pro"
-build_model = "deepseek-v4-pro"
+# 模型分路（2026-07-25 用户拍板：pro 全换 flash，省钱提速）
+commander_model = "deepseek-v4-flash"
+build_model = "deepseek-v4-flash"
 combat_thinker_model = "deepseek-v4-flash"
 combat_squad_model = "deepseek-v4-flash"
+routine_defense = false      # 脚本自动防线取消（防线弧/哨戒"实在太乱"）：防御只听计划书/阵地单+建造 chat
 # 战斗执行层（squad chat）第二供应商：硅基流动小模型（基准实测 16.4s/轮、工具调用 10/10 合法）
 squad_base_url = "https://api.siliconflow.cn/v1"
 squad_model_sf = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 build_chat_enabled = false   # 建造 chat 退役：建造指挥(pro)直接出 JSON 工单，确定性层执行（true=旧 chat 自由发挥模式）
+# 建造小队 chat（小模型现场执行层，2026-07-25 探针实证 Qwen3-30B 契约 10/10 后落地）：
+# 工单按域分流（econ 经济/defense 防御阵型），各挂 ≤cap 建造者；事件触发召唤不轮询；
+# 规则层保底——组 45s 静默回退 BuilderManager 自动派；战斗 squad chat 同款军规契约
+builder_chat_enabled = true
+builder_chat_cap = 4         # 每组建造者上限
+builder_chat_per_domain = 2  # 每域组数（用户拍板：30B 便宜，多开执行层）：econ/econ2/defense/defense2
+builder_chat_cadence = 15    # 心跳秒数（无事件不召唤，零 token 空转）
 # 军种三层小队层（阶段 4）：各军种小队数上限（面板 /api/squads 可中途改，覆盖此处）
 squad_cap_land = 3
 squad_cap_air = 2

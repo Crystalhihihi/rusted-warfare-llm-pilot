@@ -80,6 +80,21 @@ def main():
         gx, gy = int(t["slot"][0] // TILE), int(t["slot"][1] // TILE)
         assert MAP["rows"][gy][gx] == ".", "落点必须在可建地形"
         assert "阵地" in t["note"]
+    # 密集阵几何：两两不撞（≥60px）；炮塔排沿敌向垂直线展开；防空压炮塔排后 ~120px
+    import math as _m
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = _m.hypot(pts[i]["slot"][0] - pts[j]["slot"][0],
+                         pts[i]["slot"][1] - pts[j]["slot"][1])
+            assert d >= 60, f"阵型撞点 {pts[i]['slot']} vs {pts[j]['slot']} 距 {d:.0f}"
+    ax_, ay_ = 1.0, 0.0  # anchor(1000,1000)→toward(2000,1000) 的敌向
+    for t in aa:
+        # 防空相对锚点的敌向投影应约为 -120（压后排）
+        proj = (t["slot"][0] - 1000) * ax_ + (t["slot"][1] - 1000) * ay_
+        assert abs(proj - (-120)) < 60, f"防空未压后排: 投影 {proj:.0f}"
+    for t in ground:
+        proj = (t["slot"][0] - 1000) * ax_ + (t["slot"][1] - 1000) * ay_
+        assert abs(proj) < 60, f"炮塔未顶第一排: 投影 {proj:.0f}"
     # defense_ground / defense_aa 纯类型
     ex = make_ex()
     ex.set_work_order([{"action": "position", "kind": "defense_aa",
@@ -235,7 +250,52 @@ def main():
     assert wa10 is not None and wa10[2] is False, f"对岸水域应给悬浮专场: {wa10}"
     assert ex10._in_bounds(0, 0) and not ex10._in_bounds(-70, 120) and not ex10._in_bounds(99999, 10)
 
-    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点 全部符合预期")
+    # 11. 隘口检测：开阔图无隘口；走廊图逮到隘口且宽度合理
+    cc0 = {"x": 200, "y": 1000}
+    ex11 = make_ex()
+    assert ex11.chokes(cc0, (1.0, 0.0)) == [], "开阔图不应有隘口"
+    rowsC = (["." * 100] * 45 + ["~" * 100] * 10 + ["." * 100] * 10
+             + ["~" * 100] * 10 + ["." * 100] * 25)
+    MAPC = {"tilesW": 100, "tilesH": 100, "tileW": TILE, "tileH": TILE,
+            "rows": rowsC, "resources": [], "path": ""}
+    exC = exec_mod.Executor(MAPC, PEDIA, lambda k, t: None)
+    ch = exC.chokes({"x": 200, "y": 1200}, (1.0, 0.0))
+    assert ch, "走廊图应检出隘口"
+    cx, cy, w = ch[0]
+    assert 1100 <= cy <= 1300 and w <= 400, f"隘口应在走廊带内且窄: ({cx},{cy}) 宽{w}"
+
+    # 12. 实控前沿锚点：安全值≥30 格中沿敌向投影最远者
+    ex12 = make_ex()
+    ex12.control.cells = {
+        (5, 3): {"army": [40.0, 0.0], "struct": [0.0, 0.0], "threat": 0.0},   # (2200,1400) proj 1200
+        (3, 2): {"army": [50.0, 0.0], "struct": [0.0, 0.0], "threat": 0.0},   # (1400,1000) proj 400
+        (2, 2): {"army": [99.0, 0.0], "struct": [0.0, 0.0], "threat": 0.0},   # (1000,1000) proj 0 家圈内排除
+    }
+    cc12 = {"x": 1000, "y": 1000}
+    fa = ex12.frontier_anchor(cc12, (1.0, 0.0), time.time())
+    assert fa and abs(fa[0] - 2200) < 1 and abs(fa[1] - 1400) < 1, f"应取投影最远的实控格: {fa}"
+    ex12.control.cells = {(2, 2): {"army": [99.0, 0.0], "struct": [0.0, 0.0], "threat": 0.0}}
+    assert ex12.frontier_anchor(cc12, (1.0, 0.0), time.time()) is None, "只家圈内实控=无前沿"
+
+    # 13. 撞点统一占位：阵地展开坐标进占位图，defense:k 解析避让；自身豁免不误挪
+    ex13 = make_ex()
+    ex13.set_work_order([{"action": "position", "kind": "defense_mixed",
+                          "anchor": [1000, 1000], "toward": [2000, 1000], "count": 4}],
+                        snap={"own": [], "allies": []})
+    fpts = [t["slot"] for t in ex13.work_order if isinstance(t.get("slot"), list)]
+    assert len(fpts) == 4
+    occ13 = ex13._occupancy({"own": [], "allies": []})
+    for x, y in fpts:
+        assert not ex13._cell_free(occ13, "c_turret_t1", int(x // TILE), int(y // TILE)), \
+            f"展开坐标必须进占位图: ({x},{y})"
+    # 自身豁免：排除本任务 idx 后，自己的点应恢复 free（不被当成"撞占位"）
+    idx0 = ex13.work_order[0]["idx"]
+    occ_self = ex13._occupancy({"own": [], "allies": []}, exclude_idx=idx0)
+    assert ex13._cell_free(occ_self, "c_turret_t1",
+                           int(fpts[0][0] // TILE), int(fpts[0][1] // TILE)), \
+        "豁免本任务后自身坐标应恢复 free"
+
+    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一 全部符合预期")
 
 
 if __name__ == "__main__":

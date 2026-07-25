@@ -47,6 +47,16 @@ def main():
             snap = m
         elif m.get("type") == "map":
             mapm = m
+    if not mapm:
+        # agent welcome 补发缺失时（旧 TickLoop 未含 pollWelcome 的构建）走面板兜底
+        try:
+            import urllib.request
+            d = json.load(urllib.request.urlopen("http://127.0.0.1:8321/api/map?full=1", timeout=5))
+            if d.get("resources"):
+                mapm = {"resources": d["resources"]}
+                print(f"[map] 面板兜底取图（池 {len(d['resources'])} 个）", flush=True)
+        except Exception as e:
+            print(f"[map] 面板兜底失败: {e}", flush=True)
     if not snap or not snap.get("own") or not mapm:
         print("FATAL: 快照/地图不全")
         return 1

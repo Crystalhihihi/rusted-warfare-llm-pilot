@@ -11,6 +11,8 @@
 - 注意：本模块严禁 import pilot（pilot 以 __main__ 运行，import 会重执行 main）；pilot 的函数经 ctx 传入
 """
 import json
+import math
+import os
 import re
 import threading
 import time
@@ -170,6 +172,9 @@ class SharedState:
         # 小队编制（军种三层：动态编号 L陆/A空/N海，军种中层写任务，系统维护成员，squad chat 执行；
         # 无守家队——全员出战，守家=炮塔+反射层按距离拉最近队，用户 2026-07-24 拍板）
         self.squads = {}
+        # 建造小队 chat（小模型现场执行层）：按域分组（econ 经济/defense 防御阵型），
+        # 工单域内条目归它派（规则层让位，45s 静默回退 BuilderManager 兜底）
+        self.bgroups = {}
         self.move_map = {u["name"]: u.get("move") for u in (ctx.get("pedia") or {}).get("units", [])}
         self.mission_stale = False    # 任务失效信号（produce 完成/小队团灭 → 召唤战斗思考改派）
         self.plan_ts = 0.0
@@ -460,6 +465,22 @@ def _user_build(ctx, st, snap, text, receipts):
                 lbls.append(f"({int(p['x'])},{int(p['y'])}){lbl}")
             parts.append("资源池实控状态（采集器只许去 家圈/安稳，未控=敌区/争夺区，要去先派兵实控）: "
                          + " ".join(lbls))
+        # 推荐防线/经济锚点（隘口必守/防线贴实控边界/经济区贴制造仪群——"哪里需要防护"的规则依据）
+        if cc2:
+            ax2, ay2 = (st.world_w or 0) / 2.0 - cc2["x"], (st.world_h or 0) / 2.0 - cc2["y"]
+            alen2 = max(1.0, math.hypot(ax2, ay2))
+            axis2 = (ax2 / alen2, ay2 / alen2)
+            recs = [f"隘口({int(x)},{int(y)})宽{w}px" for x, y, w in ex.chokes(cc2, axis2)]
+            fa = ex.frontier_anchor(cc2, axis2, time.time())
+            if fa:
+                recs.append(f"实控前沿({int(fa[0])},{int(fa[1])})安全值{fa[2]:.0f}")
+            fabs = [u for u in snap.get("own", []) if u.get("bld") and u["t"].startswith("fabricator")]
+            if len(fabs) >= 3:
+                fx = sum(u["x"] for u in fabs) / len(fabs)
+                fy = sum(u["y"] for u in fabs) / len(fabs)
+                recs.append(f"制造仪群({int(fx)},{int(fy)})共{len(fabs)}座（经济区贴此扩）")
+            if recs:
+                parts.append("推荐锚点（可采纳也可推翻，推翻写理由）: " + " | ".join(recs))
     comp = (ex.army_goal.get("composition") if ex else None) or {}
     if comp:
         parts.append("战斗域目标构成（信息参考：工厂升级优先满足其 T2 需求）: "
@@ -1664,7 +1685,8 @@ def _squad_chat_loop(ctx, st, sid):
                 if name == "note":
                     t = str(args.get("text", "")).strip()
                     if t:
-                        st.pending["combat"].append(f"[{sid} 上报] {t}")
+                        ts = time.strftime("%H:%M:%S")
+                        st.pending["combat"].append(f"[{ts}] [{sid} 上报] {t}")
                         own_actions.append("note:" + t[:24])
                         ctx["log_activity"]("status", f"🏳 {sid} 上报: {t}")
                     continue
@@ -1767,6 +1789,331 @@ def _squad_manager(ctx, st):
         time.sleep(2.0)
 
 
+# ---------- 建造小队 chat（小模型现场执行层，2026-07-25 探针实证后落地） ----------
+
+_BCHAT_DOMAINS = ("econ", "defense")
+_BCHAT_GNAME = {"econ": "经济建造", "defense": "防御阵型"}
+
+
+def _bchat_gids(cfg):
+    """每域组数（用户拍板：30B 便宜，多开执行层）：econ/econ2/defense/defense2…"""
+    k = max(1, min(4, int(cfg.get("builder_chat_per_domain", 2))))
+    return [d if i == 1 else f"{d}{i}" for d in _BCHAT_DOMAINS for i in range(1, k + 1)]
+
+
+def _bchat_dom(gid):
+    return gid.rstrip("0123456789")
+
+
+def _bchat_gname(gid):
+    dom = _bchat_dom(gid)
+    return _BCHAT_GNAME.get(dom, dom) + gid[len(dom):]
+
+
+def _bchat_slot(ctx, gid):
+    """(域, 组内序号, 同域组数)：工单按 idx 奇偶在同域组间分流（防两组抢同一单）。"""
+    dom = _bchat_dom(gid)
+    grp = [g for g in _bchat_gids(ctx["cfg"]) if _bchat_dom(g) == dom]
+    return dom, grp.index(gid), len(grp)
+
+_BCHAT_SYS = """你是 RTS 游戏建造小队的现场指挥（域：{gname}），指挥 ≤{cap} 个建造者执行工单。只输出一行 JSON，禁止任何其他文字。
+输出契约：{{"actions":[{{"action":"build|move|repair|hold|note","idx":任务编号,"anchor":"合法锚点表之一","builders":[建造者编号],"reason":"≤20字"}}]}}
+军规：
+1. 每拍至多 3 个动作（同批任务连着派，别磨叽）；没有好选择就 hold（actions 里只放一个 hold）
+2. anchor 只能原样选自合法锚点表，禁止自造坐标、禁止编造锚点
+3. build 的 idx 只能选【本组任务】里的编号，系统按锚点落点派工
+4. 遇袭优先保命（move 到安全锚点）；主基地被打优先 repair
+5. reason 不超过 20 字，不许解释规则
+6. 觉得任务本身不合理（点位危险/重复/超实控/没必要）→ note 上报留言（带理由），上级建造指挥下一轮会看到{extra}"""
+
+_BCHAT_EXTRA = {
+    "econ": "",
+    "defense": "\n6. 造整齐：同批炮塔相邻成排、节距均匀、防空排在炮塔后排、别堵主通道",
+}
+
+
+def _new_bgroup():
+    return {"members": set(), "last_act": time.time(),  # 建组即给 90s 宽限（防"从未接活=未动"假接管）
+            "fallback_until": 0.0,
+            "thread": None, "actions": deque(maxlen=4), "wake": threading.Event()}
+
+
+def _bchat_llm(ctx):
+    """建造 chat 供应商（squad chat 同款第二供应商回退链：硅基小模型优先）。"""
+    cfg = ctx["cfg"]
+    sf_key = cfg.get("squad_api_key")
+    if sf_key and cfg.get("squad_base_url"):
+        return (cfg["squad_base_url"], sf_key,
+                cfg.get("squad_model_sf") or "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    return (cfg["base_url"], ctx["api_key"],
+            cfg.get("combat_squad_model") or cfg.get("model_fast") or cfg["model"])
+
+
+def _dir8(dx, dy):
+    ang = math.degrees(math.atan2(-dy, dx))  # y 向下为正，取反成方位角
+    names = ["东", "东北", "北", "西北", "西", "西南", "南", "东南"]
+    return names[int((ang % 360) / 45 + 0.5) % 8]
+
+
+def _bchat_anchors(ctx, st, ex, snap, domain, pending=None):
+    """合法锚点表（文字签↔坐标）：池/弧位/厂位/后勤位/家圈 + 任务自带精确点（阵地展开项），
+    全带方位与安全描述。"""
+    cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter"), None)
+    if not cc:
+        return []
+
+    def desc(x, y, base=""):
+        dx, dy = x - cc["x"], y - cc["y"]
+        hot = st.danger_map.threat_at(x, y) > 0
+        return f"{base}{_dir8(dx, dy)}{int(math.hypot(dx, dy))}px,{'有敌情' if hot else '安全'}"
+
+    occ = ex._occupancy(snap)
+    anchors = []
+    for i, p in enumerate((ex.last_safe_pools or [])[:2]):
+        px, py = (p["x"], p["y"]) if isinstance(p, dict) else (p[0], p[1])
+        anchors.append({"label": f"池{chr(65 + i)}", "x": px, "y": py, "desc": desc(px, py)})
+    front = ex.army_goal.get("rally")
+    tx, ty = front if front else (st.world_w / 2.0, st.world_h / 2.0)
+    ax, ay = tx - cc["x"], ty - cc["y"]
+    alen = max(1.0, math.hypot(ax, ay))
+    d = (ax / alen, ay / alen)
+    for i, bt in enumerate(("c_turret_t1", "c_antiAirTurret")):
+        spot = None
+        for k in range(3):  # 0 号弧位撞主通道(LANE)就跳号（_wo_resolve 同款处理）
+            spot = ex.defense_slot(cc, occ, bt, k, d, 0)
+            if spot and spot != "LANE":
+                break
+            spot = None
+        if spot:
+            anchors.append({"label": f"弧位{chr(68 + i)}", "x": spot[0], "y": spot[1],
+                            "desc": desc(spot[0], spot[1], "防线")})
+            ex._mark_fp(occ, bt, spot[0], spot[1])  # 锚点互斥：后查者避开先中者
+    fac = ex.factory_slot(cc, 0, [], occ=occ, btype="landFactory")
+    if fac:
+        anchors.append({"label": "厂位F", "x": fac[0], "y": fac[1], "desc": desc(fac[0], fac[1])})
+    mis = ex.misc_slot(cc, 0, occ=occ, btype="fabricatorT1")
+    if mis:
+        anchors.append({"label": "后勤位G", "x": mis[0], "y": mis[1], "desc": desc(mis[0], mis[1])})
+    anchors.append({"label": "家圈", "x": cc["x"], "y": cc["y"], "desc": desc(cc["x"], cc["y"])})
+    for t in (pending or [])[:8]:  # 阵地展开等精确坐标任务：自带点进锚点表（不被重锚散开）
+        if isinstance(t.get("slot"), (list, tuple)):
+            anchors.append({"label": f"任务#{t['idx']}点", "x": t["slot"][0], "y": t["slot"][1],
+                            "desc": desc(t["slot"][0], t["slot"][1], "任务点")})
+    if domain == "defense":
+        anchors.sort(key=lambda a: 0 if a["label"].startswith("弧位") else 1)
+    return anchors
+
+
+def _bchat_loop(ctx, st, gid):
+    """建造 chat 循环：事件触发（新工单/遇袭/心跳到点有活），无活不召唤（零 token）。
+    上下文=本组建造者+本组任务+合法锚点表+最近4条动作；输出契约 JSON，非法即弃。"""
+    cfg = ctx["cfg"]
+    link = ctx["link"]
+    base_url, api_key, model = _bchat_llm(ctx)
+    bg = st.bgroups[gid]
+    timeout = int(cfg["timeout_sec"])
+    acts = bg["actions"]
+    sysp = _BCHAT_SYS.format(gname=_bchat_gname(gid), cap=int(cfg.get("builder_chat_cap", 4)),
+                             extra=_BCHAT_EXTRA[_bchat_dom(gid)])
+    ctx["log_activity"]("status", f"🧰 {gid} 建造队长上线（{model}）")
+    while True:
+        try:
+            if not cfg.get("builder_chat_enabled") or not bg.get("members"):
+                break
+            if not ctx["ai_enabled"]():
+                time.sleep(1.5)
+                continue
+            snap = link.snapshot()
+            if not snap or not snap.get("team") or snap["team"].get("ai") or not snap.get("delegated"):
+                time.sleep(1.5)
+                continue
+            ex = ctx["exec_holder"].get("ex")
+            if not ex:
+                time.sleep(1.5)
+                continue
+            members = [u for u in snap.get("own", []) if u["id"] in bg["members"] and not u.get("bld")]
+            if not members:
+                time.sleep(2.0)
+                continue
+            dom, slot, ngrp = _bchat_slot(ctx, gid)
+            pending = [t for t in ex.wo_pending(dom) if t["idx"] % ngrp == slot]
+            # 遇袭=敌武器实际够得着（距离≤射程×1.15），不是"近"就怕——
+            # 750px 外一座 290 射程的炮塔曾让全队永远处于"遇袭"死循环
+            prange = {u["name"]: (u.get("atk") or {}).get("rng", 0)
+                      for u in (ctx["pedia"].get("units") or [])}
+            near = []
+            for e in snap.get("enemy", []):
+                d2 = min((e["x"] - u["x"]) ** 2 + (e["y"] - u["y"]) ** 2 for u in members)
+                rng = prange.get(e["t"], 0) or 0
+                near.append((math.sqrt(d2), rng, e))
+            near.sort(key=lambda t: t[0])
+            near = near[:3]
+            under_fire = any(d <= rng * 1.15 for d, rng, _e in near)
+            woke = bg["wake"].wait(float(cfg.get("builder_chat_cadence", 15)))
+            bg["wake"].clear()
+            if not pending and not under_fire and not woke:
+                continue  # 无任务无事件：不召唤
+            anchors = _bchat_anchors(ctx, st, ex, snap, dom, pending)
+            mtxt = " | ".join(f"#{u['id']}@({int(u['x'])},{int(u['y'])}) act={u.get('act') or 'idle'} hp{u['hp']}"
+                              for u in members[:6])
+            ttxt = "；".join(f"#{t['idx']} {t['action']}[{t.get('slot')}]"
+                             for t in pending[:8]) or "（无）"
+            atxt = "；".join(f"{a['label']}({a['desc']})" for a in anchors)
+            etxt = "；".join(f"{e['t']}@({int(e['x'])},{int(e['y'])})距{int(d)}射程{int(rng)}"
+                             f"{'=够得着你!' if d <= rng * 1.15 else '=打不到你'}"
+                             for d, rng, e in near) or "无"
+            user = (f"【本组建造者】{mtxt}\n【本组任务】{ttxt}\n【合法锚点表】{atxt}\n"
+                    f"【近敌】{etxt}\n"
+                    f"【你最近的行动】{' | '.join(acts) or '（暂无）'}")
+            if under_fire:
+                user = "⚠ 有敌武器够得着你，保命优先！\n" + user
+            msg = llm.chat(base_url, api_key, model,
+                           [{"role": "system", "content": sysp},
+                            {"role": "user", "content": user}], tools=[], timeout=timeout, max_retries=1)
+            txt = (msg.get("content") or "").strip()
+            i, j = txt.find("{"), txt.rfind("}")
+            try:
+                obj = json.loads(txt[i:j + 1]) if 0 <= i < j else {}
+            except json.JSONDecodeError:
+                obj = {}
+            objs = obj.get("actions") if isinstance(obj.get("actions"), list) else [obj]
+            anchor_map = {a["label"]: a for a in anchors}
+            for obj in objs[:3]:
+                if not isinstance(obj, dict):
+                    continue
+                act = obj.get("action")
+                if act not in ("build", "move", "repair", "hold", "note"):
+                    acts.append(f"（非法输出已丢弃: {txt[:30]}）")
+                    ctx["log_activity"]("error", f"🧰 {gid} 非法输出: {txt[:60]}")
+                    break
+                if act == "note":
+                    t = str(obj.get("reason", "")).strip()
+                    if t:
+                        ts = time.strftime("%H:%M:%S")
+                        st.pending["build"].append(f"[{ts}] [🧰{gid} 上报] {t}")
+                        acts.append("note:" + t[:24])
+                        ctx["log_activity"]("status", f"🧰 {gid} 上报: {t}")
+                    continue
+                if act == "hold":
+                    acts.append(f"hold({str(obj.get('reason', ''))[:20]})")
+                    ctx["log_activity"]("status", f"🧰 {gid} hold（{str(obj.get('reason', ''))[:24]}）")
+                    break  # hold=本拍收工
+                lab = obj.get("anchor")
+                a = anchor_map.get(lab)
+                if act == "move":
+                    if not a:
+                        acts.append(f"（move 锚点非法已丢弃: {lab}）")
+                        continue
+                    ids = ",".join(str(u["id"]) for u in members)
+                    link.send({"cmd": "move", "x": float(a["x"]), "y": float(a["y"]), "units": ids})
+                    bg["last_act"] = time.time()
+                    acts.append(f"move→{lab}")
+                    ctx["log_activity"]("cmd", f"🧰 {gid} move→{lab}（{str(obj.get('reason', ''))[:20]}）")
+                    break  # move 是全组动作，不再叠加
+                if act == "repair":
+                    try:
+                        tid = int(obj.get("idx"))
+                    except (TypeError, ValueError):
+                        tid = None
+                    if not tid or not any(u["id"] == tid and u.get("bld") for u in snap.get("own", [])):
+                        acts.append(f"（repair 目标非法已丢弃: {obj.get('idx')}）")
+                        continue
+                    free = [u for u in members if u.get("act") in (None, "", "idle")]
+                    b = free[0] if free else members[0]
+                    link.send({"cmd": "resume", "builder": b["id"], "target": tid})
+                    bg["last_act"] = time.time()
+                    acts.append(f"repair→#{tid}")
+                    ctx["log_activity"]("cmd", f"🧰 {gid} repair→#{tid}（建造者#{b['id']}）")
+                    continue
+                # build：idx 必须命中本组任务，anchor 必须合法
+                try:
+                    tidx = int(obj.get("idx"))
+                except (TypeError, ValueError):
+                    tidx = None
+                task = next((t for t in pending if t["idx"] == tidx), None)
+                if task is None or a is None:
+                    acts.append(f"（build 任务/锚点非法已丢弃: idx={obj.get('idx')} {lab}）")
+                    continue
+                want = obj.get("builders") or []
+                bid = next((u["id"] for u in members
+                            if u["id"] in want and u.get("act") in (None, "", "idle")), None)
+                if bid is None:
+                    free = [u for u in members if u.get("act") in (None, "", "idle")]
+                    bid = (free[0] if free else members[0])["id"]
+                link.send({"cmd": "build", "action": task["action"], "builder": bid,
+                           "x": float(a["x"]), "y": float(a["y"])})
+                ex.wo_mark_assigned(tidx, bid, a["x"], a["y"])
+                bg["last_act"] = time.time()
+                acts.append(f"build #{tidx}→{lab}")
+                ctx["log_activity"]("cmd", f"🧰 {gid} build #{tidx} {task['action']}→{lab}（建造者#{bid}）")
+                pending = [t for t in pending if t["idx"] != tidx]  # 连派本拍内不重复命中
+        except llm.LlmError as e:
+            acts.append(f"（LLM 失败: {str(e)[:30]}）")
+            time.sleep(3.0)
+        except Exception as e:
+            print(f"[bchat {gid}] 异常: {e}")
+            ctx["log_activity"]("error", f"🧰 {gid} 循环异常: {e}")
+            time.sleep(2.0)
+    ctx["log_activity"]("status", f"🧰 {gid} 建造队长下线")
+
+
+def _bchat_manager(ctx, st):
+    """建造 chat 管理器（2s/拍）：归队（人少优先、≤cap）/剪除/45s 静默回退（规则层接管）
+    /新工单唤醒/按需开 chat 线程。"""
+    seen_gen = st.generation
+    seen_wo = -1
+    while True:
+        time.sleep(2.0)
+        try:
+            cfg = ctx["cfg"]
+            if not cfg.get("builder_chat_enabled"):
+                continue
+            if st.generation != seen_gen:
+                seen_gen = st.generation
+                st.bgroups.clear()  # 换图重建分组（线程随 members 空自退）
+                seen_wo = -1
+            snap = ctx["link"].snapshot()
+            ex = ctx["exec_holder"].get("ex")
+            if not snap or not snap.get("team") or snap["team"].get("ai") or not ex:
+                continue
+            delegated = set(snap.get("delegated", []))
+            builders = [u for u in snap.get("own", [])
+                        if u["id"] in delegated and not u.get("bld")
+                        and ("uilder" in u["t"] or u["t"] == "combatEngineer")
+                        and "editor" not in u["t"].lower()]
+            cap = int(cfg.get("builder_chat_cap", 4))
+            live = {u["id"] for u in builders}
+            gids = _bchat_gids(cfg)
+            for gid in gids:
+                bg = st.bgroups.setdefault(gid, _new_bgroup())
+                bg["members"] &= live
+            grouped = set().union(*(bg["members"] for bg in st.bgroups.values())) if st.bgroups else set()
+            for u in builders:
+                if u["id"] in grouped:
+                    continue
+                gid = min(gids, key=lambda g: len(st.bgroups[g]["members"]))
+                if len(st.bgroups[gid]["members"]) < cap:
+                    st.bgroups[gid]["members"].add(u["id"])
+                    grouped.add(u["id"])
+            now = time.time()
+            for gid, bg in st.bgroups.items():
+                dom, slot, ngrp = _bchat_slot(ctx, gid)
+                pend = [t for t in ex.wo_pending(dom) if t["idx"] % ngrp == slot]
+                if pend and now - bg["last_act"] > 90 and now > bg["fallback_until"]:
+                    bg["fallback_until"] = now + 45
+                    if bg["last_act"]:
+                        ctx["log_activity"]("status", f"🧰 {gid} 90s 未动，规则层接管 45s")
+                if bg["members"] and not (bg["thread"] and bg["thread"].is_alive()):
+                    bg["thread"] = threading.Thread(target=_bchat_loop, args=(ctx, st, gid), daemon=True)
+                    bg["thread"].start()
+            if ex.wo_version != seen_wo:
+                seen_wo = ex.wo_version
+                for bg in st.bgroups.values():
+                    bg["wake"].set()
+        except Exception as e:
+            print(f"[bchat mgr] 异常: {e}")
+
+
 def _cmd_brief(cmd):
     """规则层指令的紧凑可读形式（聊天台显示用）。"""
     c = cmd.get("cmd")
@@ -1809,12 +2156,25 @@ def start(ctx):
 
     reflex.on_builder_recall = _on_recall
     reflex.on_squad_reflex = _on_squad
+
+    def _chat_yield(domain):
+        """建造 chat 让位闸（executor._wo_tick 查）：该域任一组有员且不在回退期。"""
+        if not ctx["cfg"].get("builder_chat_enabled") or not ctx["ai_enabled"]():
+            return False
+        return any(bg["members"] and time.time() > bg["fallback_until"]
+                   for gid, bg in st.bgroups.items() if _bchat_dom(gid) == domain)
+
+    ctx["chat_yield_fn"] = _chat_yield
+    if ex0:
+        ex0.chat_yield_fn = _chat_yield
     for role in _roles(ctx):
         threading.Thread(target=_agent_loop, args=(ctx, st, role),
                          daemon=True, name=f"rw-{role['name']}").start()
     threading.Thread(target=_squad_manager, args=(ctx, st),
                      daemon=True, name="rw-squad-manager").start()
-    print("[multiagent] 循环已启动：commander(慢) build(指挥) combat(指挥) squad-manager")
+    threading.Thread(target=_bchat_manager, args=(ctx, st),
+                     daemon=True, name="rw-bchat-manager").start()
+    print("[multiagent] 循环已启动：commander(慢) build(指挥) combat(指挥) squad-manager bchat-manager")
     return st
 
 
@@ -1876,10 +2236,12 @@ def supervisor_loop(ctx, st):
                     ex = exec_mod.Executor(new_map, ctx["pedia"], ctx["log_activity"])
                     ex.autopilot = False
                     ex.routine = bool(ctx["cfg"].get("routine_layer", True))  # 规则快层：例行+炮塔弧
+                    ex.routine_defense = bool(ctx["cfg"].get("routine_defense", True))  # 脚本防线（false=只听阵地单）
                     ex.auto_production = bool(ctx["cfg"].get("auto_production", True))  # 规则层自动补军工队列
                     ex.dmap = st.danger_map
                     ex.control.fog = st.fog_map  # 安全值迷雾惩罚（全黑/浅黑）
                     ex.on_action = lambda c: _push_chat(ctx, "system", "⚙ " + _cmd_brief(c))
+                    ex.chat_yield_fn = ctx.get("chat_yield_fn")  # 建造 chat 管辖域，规则层让位
                     ctx["exec_holder"]["ex"] = ex
                     ctx["reflex"].dmap = st.danger_map
                     smz = summarize.Summarizer(new_map.get("resources", []))
@@ -1909,6 +2271,19 @@ def supervisor_loop(ctx, st):
                 st.broadcast(f"【玩家留言】（优先级最高，照做并说明怎么执行）: {msg}")
                 ctx["log_activity"]("chat", f"💬 玩家: {msg}")
                 _push_chat(ctx, "player", f"💬 {msg}")
+            # 工单注入（静音/测试通道）：wo_inject.json → set_work_order 同款校验，注完即删
+            inj = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wo_inject.json")
+            if os.path.exists(inj):
+                try:
+                    with open(inj, encoding="utf-8") as f:
+                        payload = json.load(f)
+                    os.remove(inj)
+                    if isinstance(payload, dict) and ctx["exec_holder"].get("ex"):
+                        _, desc = _translate_build(ctx, st, "set_work_order", payload,
+                                                   link.snapshot(), {})
+                        ctx["log_activity"]("status", f"⚙ 工单注入: {desc}")
+                except Exception as e:
+                    ctx["log_activity"]("error", f"✗ 工单注入失败: {e}")
         except Exception as e:
             print(f"[multiagent] 督导异常: {e}")
 
