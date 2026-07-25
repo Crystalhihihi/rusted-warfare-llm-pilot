@@ -2,82 +2,91 @@
 
 [中文](README.md) | **English**
 
-> ## ⚠️ WARNING
->
-> **Experimental project — DO NOT use in multiplayer / online matches.**
-> Automated control violates fair-play principles, and AI mistakes will drag down
-> teammates. **Single-player, local reverse-engineering research only.
-> You are solely responsible for any consequences of misuse.**
->
-> Known limitations (the layered v2 architecture has fixed most early control defects):
-> - The executor's build order is a fixed template (land maps mainly); water maps and
->   exotic starts are not well tested
-> - Stalled constructions (e.g. builder died) are not auto-resumed — a status line
->   reports them for manual completion
-> - Strategic quality depends on the LLM you plug in; weak models still make bad calls
+> **Experimental. DO NOT use in multiplayer/online matches.** Automated play violates
+> fair-play principles in multiplayer, and the AI's mistakes will drag down your teammates.
+> **For single-player research and local reverse-engineering study only. All consequences of misuse are yours.**
 
-An experiment that connects large language models to the real-time strategy game
-Rusted Warfare: it extracts live battlefield state in a non-intrusive way, lets an
-LLM make decisions, and injects the resulting orders back to command your forces.
+A single-player research project that connects Large Language Models to the RTS game
+*Rusted Warfare*: it extracts live battlefield state non-invasively, hands decisions to LLMs,
+and re-injects commands to drive its own forces.
 
-## How it works (three layers)
+## What it is
 
+Two parts: a Java javaagent (attached to the game JVM, no game files modified) that uses
+bytecode hooks and reflection to extract live battlefield snapshots — units, buildings,
+funds, production queues, three-state fog of war, ASCII map, resource points — streamed
+over TCP NDJSON every 0.5s; and a Python bridge that distills those snapshots for an LLM
+command chain and re-injects commands through the game's native command queue. The data
+channel generalizes to other closed-source Java/libGDX games.
+
+The command chain is a layered asynchronous "slow LLM intent, fast deterministic execution"
+design: a commander and a build commander (flash) emit JSON planbooks and work orders;
+branch mids, squad chats, and builder chats (Qwen3-30B) execute per squad; a rules layer
+(2s ticks) and a reflex layer (millisecond) provide the safety net; events decide when to
+call the LLM. Fairness by design: only team-vision information is forwarded, commands go
+through the normal queue, and everything is rate-limited to human-like APM.
+
+Engineering log and data assets: `PROGRESS.md` (bug history, playtest quotes, baselines)
+and `docs/DATASETS.md` (dataset index).
+
+## Current status
+
+- The AI cannot yet reliably beat the highest-difficulty built-in AI; aggression, build
+  speed, and multi-front coordination are still being worked out
+- The data channel is stable, the four-layer command chain runs on real matches, and
+  games are reproducible
+- Known issues: upgrade actions that "receipt OK but never land", an extractor
+  follow-the-front loop not yet closed, reflection targets pinned to a specific game
+  version (a major game update may break them)
+
+## How it works
+
+```mermaid
+flowchart TD
+    AG["Rusted Warfare (JVM)<br>javaagent: rw-agent.jar<br>snapshots/pedia/fog/in-game UI"]
+    AG -- "TCP 127.0.0.1:41234 / NDJSON" --> BR
+    subgraph BR["bridge (Python)"]
+        CMD["Commander (flash)<br>planbook: text + JSON params"]
+        BLD["Build commander (flash)<br>work orders (JSON)"]
+        MID["Branch mids (flash)×3<br>land/air/navy squad missions"]
+        SQ["squad chats ×N (Qwen3-30B)<br>one loop per squad"]
+        BC["builder chats ×4 (Qwen3-30B)<br>econ/econ2/defense/defense2<br>domain split + contract"]
+        EX["rules layer executor (2s tick)<br>work-order scheduling/routine economy/formation generator/occupancy map/budget arbiter/rescue"]
+        SM["squad manager (2s tick)<br>regroup/production/watchdog fallback"]
+        RX["reflex layer (ms)<br>retreat under fire/recall"]
+        CMD --> BLD
+        CMD --> MID
+        BLD -- "work orders by domain" --> BC
+        MID --> SQ
+        BLD --> EX
+        BC --> EX
+        SM --> EX
+        SQ -.-> RX
+        BC -.-> RX
+    end
+    BR -- "atomic commands re-injected via the game's native command queue" --> AG
 ```
-Rusted Warfare (JVM)
-  └─ javaagent: rw-agent.jar ──TCP 127.0.0.1:41234 / NDJSON──▶ bridge (Python)
-                                                                 │
-   ┌─ Strategy layer (LLM, ~every 25s: attack/defend/expand/build_army only)
-   │      token budget ≈ 1/30 of a pure-LLM micro-control design
-   ├─ Executor (deterministic FSM: build order / production / upgrades / builders)
-   └─ Reflex (pure rules, millisecond: retreat under fire, defend the base)
-                                                                 ▼
-                                     atomic orders injected via the game's normal command queue
-```
-
-- **agent/**: a Java `javaagent` attached at game launch (modifies no game files),
-  emitting periodic battlefield snapshots (own/ally/visible-enemy units, funds,
-  build progress, production queues, ASCII map and resource points).
-- **bridge/executor.py**: deterministic execution layer — default build order,
-  action-availability self-learning, parallel builders, stalled-construction
-  detection; runs the economy with zero LLM calls (`LLM_OFF=1`).
-- **bridge/pilot.py**: strategy layer — distills the battlefield into a 12×12
-  strategic grid plus executor status, asks an OpenAI-compatible API (DeepSeek by
-  default) for one strategic verb every ~25s, and translates it into goals or orders.
-- **bridge/reflex.py**: pure-rule reflexes — retreat when the squad's HP crashes,
-  pull back when the base is threatened.
-- **tools/**: an analysis probe and a launcher that starts the game with the agent.
-
-Fair-play by design: only information within the team's own vision is forwarded;
-orders go through the game's normal command queue; everything is rate-limited.
 
 ## Quick start
 
-1. **Build the agent** (JDK 11+): point `GAME_DIR` in `agent/build.sh` at your
-   game installation, then run `bash agent/build.sh` — output: `agent/dist/rw-agent.jar`.
-   (Game jars are referenced at compile time only; nothing from the game is bundled.)
-2. **Configure the model**: copy `bridge/secret.toml.example` to
-   `bridge/secret.toml` and fill in your DeepSeek API key (or set the
-   `DEEPSEEK_API_KEY` environment variable). `bridge/config.toml` holds
-   `base_url`, `model`, tick rates, APM cap, etc.
-3. **Launch the game**: edit paths in `tools/run-with-agent.bat` and run it —
-   the game starts with the agent attached.
-4. **Run the bridge**:
-   - `python bridge/main.py` — battlefield summary printout (bring-up check)
-   - `LLM_OFF=1 python bridge/pilot.py` — executor-only mode (zero tokens, verify auto-economy)
-   - `python bridge/pilot.py` — full mode (executor economy + reflexes + LLM strategy)
-
-   In-game, delegate units first: click "control all" on the overlay panel, or box-select
-   units and click "delegate selection".
+1. **Build the agent** (JDK 11+): set `GAME_DIR` in `agent/build.sh`, run `bash agent/build.sh`
+   → `agent/dist/rw-agent.jar` (the game jar is compile-time only, never bundled)
+2. **Configure models**: copy `bridge/secret.toml.example` → `bridge/secret.toml`, add your
+   DeepSeek key (or `DEEPSEEK_API_KEY`); tune models/rates/limits in `bridge/config.toml`
+3. **Launch the game**: edit paths in `tools/run-with-agent.bat` and run it
+4. **Run the bridge**: `python bridge/pilot.py`
+   (rule-layer-only, zero tokens: `RW_LLM_MUTE=1 python bridge/pilot.py`)
+5. In-game: start a skirmish → click "Delegate all" on the overlay → open
+   <http://127.0.0.1:8321> for the dashboard
 
 ## Compliance
 
-- **No multiplayer use** (see the warning above): known control defects would
-  drag down teammates and violate fair play.
-- Single-player, local reverse-engineering research only.
-- This repository contains no game files and no decompiled code. Please support
-  the official game.
-- This project is not affiliated with Corroding Games in any way.
+- **DO NOT use in multiplayer/online matches** (see the warning above)
+- Single-player research and reverse-engineering study only; this repo contains no game
+  binaries or decompiled artifacts; please support the official game
+- Not affiliated with Corroding Games in any way
 
 ## License
 
-[MIT](LICENSE)
+**Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Derivative works must
+preserve attribution and the NOTICE file, and must state changes.
