@@ -17,21 +17,32 @@
 将大语言模型接入即时战略游戏《铁锈战争》（Rusted Warfare）的研究项目：
 以无侵入方式实时提取战况，交由 LLM 决策，再回注指令指挥自己的部队。
 
-## 工作原理（参数化指挥链 v3.2）
+## 工作原理（分层异步指挥链 v4.x）
 
-```
-Rusted Warfare (JVM)
-  └─ javaagent: rw-agent.jar ──TCP 127.0.0.1:41234 / NDJSON──▶ bridge (Python)
-                                                                 │
-   ┌─ 总指挥 LLM（v4-pro：《作战计划书》五小节+```json 参数块——阶段/经济/配兵/攻防/布局，机器消费）
-   ├─ 建造指挥 LLM（v4-pro：《建造工单》JSON——任务序列+防线点位坐标+建造者目标数；建造 chat 已退役）
-   ├─ 战斗指挥 LLM（v4-flash：《小队任务书》JSON——S1~S4 编号 attack/defend/hold/harass/produce）
-   ├─ squad chat ×N（v4-flash：每编号小队一个循环，上下文=本队任务+态势+最近动作，只做快速反应）
-   ├─ 规则快层 executor（2s/拍：工单调度 buildq 拉条/例行经济/防线网格弧/池点哨戒/抢修重建）
-   ├─ 小队管理器（2s/拍：归队/生产刻度/按任务开 squad chat；进攻队零成员自动从守家队抽调）
-   └─ 反射层 reflex（毫秒级分小队：受击撤退按队独立、基地回防只拉守家队、赴险召回）
-                                                                 ▼
-                                        原子指令经游戏正常命令队列回注执行
+```mermaid
+flowchart TD
+    AG["Rusted Warfare (JVM)<br>javaagent: rw-agent.jar<br>快照/百科/迷雾/游戏内 UI"]
+    AG -- "TCP 127.0.0.1:41234 / NDJSON" --> BR
+    subgraph BR["bridge (Python)"]
+        CMD["总指挥 (flash)<br>《作战计划书》文本+JSON 参数块"]
+        BLD["建造指挥 (flash)<br>《建造工单》JSON"]
+        MID["军种中层 (flash)×3<br>陆/空/海《小队任务书》"]
+        SQ["squad chat ×N (Qwen3-30B)<br>每编号小队一个循环"]
+        BC["建造小队 chat ×4 (Qwen3-30B)<br>econ/econ2/defense/defense2<br>域分流+军规契约"]
+        EX["规则快层 executor (2s/拍)<br>工单调度/例行经济/密集阵型生成器/占位图/预算仲裁/抢修"]
+        SM["小队管理器 (2s/拍)<br>归队/生产刻度/看门狗兜底"]
+        RX["反射层 reflex (毫秒级)<br>受击撤退/回防/赴险召回"]
+        CMD --> BLD
+        CMD --> MID
+        BLD -- "工单按域分流" --> BC
+        MID --> SQ
+        BLD --> EX
+        BC --> EX
+        SM --> EX
+        SQ -.-> RX
+        BC -.-> RX
+    end
+    BR -- "原子指令经游戏正常命令队列回注执行" --> AG
 ```
 
 - **agent/**：Java `javaagent`，随游戏 JVM 启动挂载（不修改任何游戏文件），周期性输出
