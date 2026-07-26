@@ -85,12 +85,25 @@ def main():
     assert {frozenset(sq["members"]) for sq in st2.squads.values()} == \
         {frozenset({1, 2, 3, 4, 5}), frozenset({6, 7, 8, 9, 10})}
 
-    # 5. 注销：成员全灭且无任务 → 小队删除
+    # 5. 注销：成员清零即注销（带任务书的也注销 + mission_stale 失效信号 + activity 日志）
     st2.squads["L1"]["mission"] = None
     st2.squads["L2"]["mission"] = {"任务": "hold"}
+    st2.mission_stale = False
+    logs5 = []
+    ctx2["log_activity"] = lambda k, t: logs5.append(t)
     multiagent.squad_assign(ctx2, st2, {"own": []})
-    assert "L1" not in st2.squads and "L2" in st2.squads, \
-        f"无任务空队注销、有任务空队保留: {list(st2.squads)}"
+    assert "L1" not in st2.squads and "L2" not in st2.squads, \
+        f"空队无论有无任务书都应注销（幽灵小队曾吸新兵/代打旧目标）: {list(st2.squads)}"
+    assert st2.mission_stale is True, "带任务书的空队注销应置 mission_stale"
+    assert any("注销" in t for t in logs5), f"注销应记 activity 日志: {logs5}"
+    # 中层感知失效：_branch_event 消费 mission_stale 触发改派思考
+    st2.pending = {"land": deque(), "air": deque(), "navy": deque()}
+    st2.plan_ts = 0.0
+    st2.plan_params = {}
+    r = multiagent._branch_event(mk_ctx(), st2, {"own": []}, [], 1000.0,
+                                 {"plan_ts_fired": 0.0, "last_fire": 1000.0}, "land")
+    assert r and "失效" in r, f"空队注销后军种中层应感知任务失效: {r}"
+    assert st2.mission_stale is False, "失效信号应被消费复位"
 
     # 6. 反射回防拉最近队（守家队已取消）
     sent = []

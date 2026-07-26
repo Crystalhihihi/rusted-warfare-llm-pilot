@@ -23,6 +23,8 @@ builder_chat_cadence = 15    # 心跳秒数（无事件不召唤，零 token 空
 squad_cap_land = 3
 squad_cap_air = 2
 squad_cap_navy = 1
+squad_watchdog_sec = 90  # 服从看门狗阈值：attack/harass 下达后小队 LLM 超时无动作则系统代打
+                         # （曾 45s≈LLM 往返时长，看门狗抢在决策返回前代打；note 上报不算动作——防刷屏抗命）
 
 use_executor = true        # 执行层托管经济/生产/升级（false 回退纯 LLM 微操）；LLM_OFF=1 环境变量可跳过 LLM 纯跑执行层
 multi_agent = true         # 多 agent 架构：总指挥+建造/战斗三循环并行（建造也归 LLM；executor 退为执行内核只做跟踪/抢修/槽位）
@@ -36,6 +38,7 @@ combat_interval_sec = 6    # 战斗 agent 节拍（警报时由 fast_interval_se
 strategy_interval_sec = 25 # 单 LLM 模式战略层节拍（multi_agent=false 时用）
 auto_military = false      # LLM 沉默 90s 时执行层是否自动用兵（默认 false：军事决策完全归 LLM）
 auto_production = true     # 规则快层按构成缺口持续补军工队列（治 LLM 喂不满的断供空窗）；战斗 LLM 的 produce 条目=定向猛造例外通道（produce_focus 防撞车）
+scout_enabled = true       # 规则层零 LLM 主动侦察：平静期（无敌情+≥45s+有全黑迷雾）派最快空闲单位 move 探全黑区（朝敌出生点方向优先）；受击保命归反射层
 
 interval_sec = 4.0        # 基础节拍（秒）；自适应模式下为无威胁时的参考值
 fast_interval_sec = 2.5   # 有警报/敌人贴近(<1200)时的节拍

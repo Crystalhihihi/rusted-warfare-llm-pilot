@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+import json
 from collections import Counter, deque
 
 import connmap
@@ -43,9 +44,13 @@ DEFAULT_ECON = {"extractors": 4, "builders": 3, "max_factories": 2}
 EXTRACTOR_PRICE = 700
 FUNDS_RESERVE = 700        # 非采集器开支的资金底线
 FACTORY_SAFE_FLOOR = 0.0   # 家圈工厂安全值地板：低于此=威胁压过一切，不盖（高于则被袭也照盖）
-SAFE_PICK_FLOOR = -5.0     # 槽位择优地板：低于此的合法槽位跳过继续找（全热才退回最安全候选）
+SAFE_PICK_FLOOR = 10.0     # 槽位择优地板：低于此的合法槽位跳过继续找（全热才退回最安全候选）。
+#                           2026-07-26 由 -5 提至 10：支持建筑跑出防线外的根治——择优更挑剔，
+#                           宁沿排走远也不落冷点；兜底"退回已见最安全候选"保证不空手
 UPGRADE_FUNDS = 2600       # 超过此资金且采集器达标后开始升级
 QUEUE_MAX = 2              # 每厂队列上限
+SCOUT_INTERVAL = 45.0      # 主动侦察冷却（全局间隔 + 同单位再派间隔，问题3 设计值）
+SCOUT_PREF = ("scout", "lightGunship", "interceptor", "hoverTank")  # 侦察优先兵种（快）
 MAX_CMDS_PER_TICK = 4      # 每拍指令上限（2 会被经济/升级占满，生产饿死）
 ACTION_COOLDOWN = 2.0      # 同类指令最小间隔
 UPGRADE_COOLDOWN = 30.0    # 同一建筑升级冷却
@@ -110,6 +115,7 @@ class Executor:
                     self.action_tech["u_" + name] = u.get("tech", 1)
         self.econ_goal = dict(DEFAULT_ECON)
         self.army_goal = {"composition": None, "rally": None}  # composition: {action: 目标数}
+        self._default_comp = None   # 默认构成缓存（_default_composition 惰性生成）
         # 建筑占地表（pedia fp 字段）：类型名 -> (w, h, ox, oy)，槽位网格按此分配空间
         self.fp = {}
         # 动作价格表（pedia price 字段）：生产动作ID -> 价格（规则层生产的资金感知）
@@ -140,6 +146,7 @@ class Executor:
         #         "builder": id, "ts": float, "x": x, "y": y, "note": str}
         self.work_order = []
         self.wo_version = 0
+        self._wo_seq = 0               # 工单任务稳定编号（单调递增）：续单重排 idx 会变，wo_id 不变
         self.ext_pool_bad = {}         # (gx,gy) -> 解封时间：agent 判"找不到合法建造位置"的池（120s 跳过）
         self.last_safe_pools = []      # 最近一拍的安全池清单（建造 prompt 报 pool:k 可用下标用）
         self._last_ext_xy = None       # (x, y, ts) 最近一次采集器下单（池失败归因用）
@@ -160,6 +167,11 @@ class Executor:
         self.autopilot = True           # False=多 agent 模式：只跑跟踪/抢修机械，经济生产决策归 LLM agent
         self.auto_production = True     # False=规则快层不自动补军工队列（产量归战斗 LLM 自己 train）
         self.produce_focus = {}         # 战斗 LLM produce 任务的定向猛造 {action: 剩余数}——规则层补水避开，防撞车
+        self.scout_enabled = True       # 规则层零 LLM 主动侦察（config scout_enabled，2026-07-26 问题3）
+        self.last_scout = 0.0           # 上次侦察派单时刻（全局 ≥45s 间隔）
+        self.scout_unit_cd = {}         # 单位id -> 可再派时刻（同一单位 45s 内不重复派）
+        self.squad_ids = set()          # 小队成员 id 集（multiagent 注入）：侦察优先派非小队成员
+        self.move_type = {u["name"]: u.get("move") for u in (pedia or {}).get("units", [])}
         self.routine = False            # 多 agent 模式的规则快层：例行（建造者/采集器）2s 级执行
         self.routine_defense = True     # 脚本自动防线（防线弧/池点哨戒/前线哨戒/内圈维修湾）——
         #                                 用户 2026-07-25 拍板取消（"实在太乱"）：防御只听计划书/阵地单
@@ -218,7 +230,12 @@ class Executor:
                                     "note": str((t or {}).get("note", "")), "status": "pending",
                                     "builder": None, "ts": 0.0, "x": None, "y": None})
         for i, t in enumerate(self.work_order):
-            t["idx"] = i
+            t["idx"] = i  # 位置号（dashboard 行号展示用；跨 actor 逻辑引用一律走 wo_id）
+            if t.get("wo_id") is None:
+                # 在干任务保留原 wo_id，新任务发新号（bchat 队长 45s 往返按 wo_id 落账，
+                # 此前按 idx 落账：续单重排后 idx 指向新任务 → 记假账、烂尾循环）
+                self._wo_seq += 1
+                t["wo_id"] = self._wo_seq
         self.wo_version += 1
         self.log("status", f"⚙ 建造工单 v{self.wo_version} 已接收（{len(self.work_order)} 项"
                            + (f"，并回在干 {len(keep)} 项" if keep else "") + "）")
@@ -398,10 +415,11 @@ class Executor:
         return [t for t in self.work_order if t["status"] == "pending"
                 and (domain is None or self._wo_domain(t) == domain)]
 
-    def wo_mark_assigned(self, idx, builder_id, x, y):
-        """建造 chat 派单落账：任务标 assigned（完成/烂尾判定照 BuilderManager 老路径）。"""
+    def wo_mark_assigned(self, wo_id, builder_id, x, y):
+        """建造 chat 派单落账：按稳定 wo_id 命中任务标 assigned（完成/烂尾判定照 BuilderManager 老路径）。
+        返回 False=任务已被接走/不存在（调用方不得再 send，防双重派单）。"""
         for t in self.work_order:
-            if t["idx"] == idx and t["status"] == "pending":
+            if t.get("wo_id") == wo_id and t["status"] == "pending":
                 t["status"] = "assigned"
                 t["builder"] = builder_id
                 t["x"], t["y"] = float(x), float(y)
@@ -464,7 +482,7 @@ class Executor:
                     tw, th = self._tw()
                     btype = t["action"][2:]
                     gx0, gy0 = int(spot[0] // tw), int(spot[1] // th)
-                    occ_ns = self._occupancy(snap, exclude_idx=t["idx"])  # 豁免本任务自身坐标
+                    occ_ns = self._occupancy(snap, exclude_wo=t["wo_id"])  # 豁免本任务自身坐标
                     if not self._cell_free(occ_ns, btype, gx0, gy0):
                         moved = None
                         for r in range(1, 7):
@@ -488,30 +506,36 @@ class Executor:
                     if ce is None:
                         continue
                     if emit({"cmd": "build", "action": t["action"], "builder": ce["id"],
-                             "x": float(spot[0]), "y": float(spot[1])}, f"wo:{t['idx']}:{ce['id']}", 3.0):
+                             "x": float(spot[0]), "y": float(spot[1])}, f"wo:{t['wo_id']}:{ce['id']}", 3.0):
                         t["status"] = "assigned"
                         t["builder"] = ce["id"]
                         t["x"], t["y"] = float(spot[0]), float(spot[1])
                         t["note"] += "|悬浮接手"
-                        idle_builders = [u for u in idle_builders if u["id"] != ce["id"]]
+                        idle_builders[:] = [u for u in idle_builders if u["id"] != ce["id"]]  # 原地消耗：同拍各段共享
                         funds_left -= price
                     continue
-                # 扩张类（采集器）坐标单也要过实控闸：家圈 600px 外必须安稳（secured 持续 20s），
-                # 否则就是"资源点选进敌区"——此前只有 pool:k 规格走 safe_pools 有这道闸，
-                # LLM 写精确坐标就绕过了（用户实局：builder 孤悬敌境）
-                if btype.startswith("extractor") and cc \
+                # 坐标单实控闸（2026-07-26 由采集器专属扩到全部非防守建筑）：LLM 写精确坐标的
+                # 任务，家圈 600px 外必须安稳（secured 持续 20s）——否则就是"建筑选进敌区"。
+                # 此前只有 pool:k 规格走 safe_pools 有这道闸，LLM 写精确坐标就绕过
+                # （用户实局：builder 孤悬敌境；支持建筑跑到防线外不巩固新点）。
+                # 防守类（_WO_DEFENSE_TYPES）豁免——防线前压本来就要出圈；
+                # 槽位规格单（pool:/factory:/misc:）走槽位安全择优，不在此闸范围
+                if isinstance(t["slot"], (list, tuple)) and cc \
+                        and not btype.startswith(self._WO_DEFENSE_TYPES) \
                         and (spot[0] - cc["x"]) ** 2 + (spot[1] - cc["y"]) ** 2 > 600 ** 2 \
                         and not self.control.secured(spot[0], spot[1], now):
                     t["status"] = "failed"
-                    t["note"] += "|超出实控区（远征采集需先安稳）"
+                    if btype.startswith("extractor"):
+                        t["note"] += "|超出实控区（远征采集需先安稳）"
+                    else:
+                        t["note"] += "|超出实控区（支持建筑请先稳固防线）"
                     continue
                 # 危险判定三家：防守类防线圈(≤1200px)内挨打照盖（防线挨打正是该盖的时候）；
                 # 家圈工厂看安全值地板（被袭时家圈全线危险会彻底停产，危险不一刀切，
                 # 安全值<0=威胁压过一切才否）；扩张类(采集器/远征)危险照样禁（治开局乱跑送死）
-                defense_types = ("c_turret", "c_antiAirTurret", "laserDefence", "repairbay", "wall")
                 near_home = cc and (spot[0] - cc["x"]) ** 2 + (spot[1] - cc["y"]) ** 2 <= 1200 ** 2
                 is_factory = "actory" in btype.lower() or btype.startswith("fabricator")
-                if btype.startswith(defense_types) and near_home:
+                if btype.startswith(self._WO_DEFENSE_TYPES) and near_home:
                     pass
                 elif is_factory and near_home:
                     if self.control.safety(spot[0], spot[1]) < FACTORY_SAFE_FLOOR:
@@ -532,7 +556,7 @@ class Executor:
             if len(batch) == 1:
                 t, s, _p = batch[0]
                 ok = emit({"cmd": "build", "action": t["action"], "builder": b["id"],
-                           "x": float(s[0]), "y": float(s[1])}, f"wo:{t['idx']}:{b['id']}", 3.0)
+                           "x": float(s[0]), "y": float(s[1])}, f"wo:{t['wo_id']}:{b['id']}", 3.0)
             else:
                 items = ";".join(f"{t['action']}@{s[0]:.0f},{s[1]:.0f}" for t, s, _p in batch)
                 ok = emit({"cmd": "buildq", "builder": b["id"], "items": items},
@@ -543,7 +567,7 @@ class Executor:
                     t["builder"] = b["id"]
                     t["ts"] = now
                     t["x"], t["y"] = s
-                idle_builders = idle_builders[1:]
+                idle_builders[:] = idle_builders[1:]  # 原地消耗：调用方同拍可见
         # 完成/烂尾判定
         live = {(u["x"], u["y"], u["t"]) for u in own if u.get("bld")}
         for task in self.work_order:
@@ -617,6 +641,37 @@ class Executor:
             self.army_goal["rally"] = (float(rally[0]), float(rally[1]))
             self.rallied.clear()
 
+    def _effective_comp(self):
+        """有效构成：LLM 构成优先（set_composition 一到即覆盖），真空时回退默认构成——
+        2026-07-26 问题1 根治：构成只能由战斗/军种 LLM 设，平静期军种中层零召唤
+        （multiagent._branch_event"无兵无队零召唤"条款）→ 构成永远空 →
+        _military_reserve 的 ready 恒真 → 储备线挂 4500 升级款 → ⑦ 长期断产 →
+        兵力到不了蓄势门槛(≥8) → 死锁（实局指挥 note："中盘仍无地面战力"）。默认构成只在真空生效。"""
+        return self.army_goal["composition"] or self._default_composition()
+
+    def _default_composition(self):
+        """开局默认构成兜底（按 pedia 保守给，不用静态表 DEFAULT_PROD 那套型号名）：
+        陆 T1 主战×8 + 防空~20%（AA_RATIO 口径）；水图（既有 is_naval_map 判定）加海军主战×4。
+        可产性/科技过滤交给 _next_production 既有管道（与 LLM 构成同路，produce_focus 让路同样生效）。"""
+        if self._default_comp is None:
+            comp = {}
+            land = self.factory_actions.get("landFactory") or set()
+            main = next((a for a in ("u_c_tank", "u_hoverTank") if a in land), None) \
+                or next((a for a in sorted(land)
+                         if a not in AA_PROD and a not in ("u_builder", "u_scout")), None)
+            if main:
+                comp[main] = 8
+                aa = next((a for a in sorted(AA_PROD) if a in land), None)
+                if aa:  # 防空 ~20%：8×0.25/0.75≈2
+                    comp[aa] = max(1, int(comp[main] * AA_RATIO / (1 - AA_RATIO)))
+            if self.is_naval_map():
+                sea = self.factory_actions.get("seaFactory") or set()
+                boat = next((a for a in ("u_gunBoat", "u_missileShip") if a in sea), None)
+                if boat:
+                    comp[boat] = 4
+            self._default_comp = comp
+        return self._default_comp
+
     def set_stance(self, stance):
         self.stance = str(stance)
 
@@ -674,6 +729,30 @@ class Executor:
             if m:
                 self.action_bad[m.group(1)] = time.time() + 120  # 科技未达：120s 后重试
                 self.log("status", f"⚙ 动作科技未达，120s后重试: {m.group(1)}")
+            # 资金不足（agent 入队预检 "funds X < price Y"）：点没问题只是钱不够——
+            # 对应工单任务回退 pending 等攒钱重派，不判死、不 site_bad 毒化点位
+            # （此前无匹配分支=零学习，bchat 直派单卡 assigned 最长 ~330s 烂尾时限）
+            m = re.search(r"funds\s+(\d+)\s*<\s*price\s+(\d+)", msg)
+            if m:
+                reverted = None
+                try:
+                    c = json.loads(r.get("cmd") or "{}")
+                except (TypeError, ValueError):
+                    c = {}
+                if c.get("cmd") == "build" and c.get("action"):
+                    for t in self.work_order:
+                        if t["status"] == "assigned" and t["action"] == c["action"] \
+                                and t.get("x") is not None and c.get("x") is not None \
+                                and abs(t["x"] - float(c["x"])) < 60 \
+                                and abs(t["y"] - float(c["y"])) < 60:
+                            t["status"] = "pending"
+                            t["builder"] = None
+                            t["note"] += "|资金不足回退"
+                            reverted = t
+                            break
+                self.log("status", f"⚙ 资金不足（{m.group(1)}<{m.group(2)}）"
+                                   + (f"，工单 {reverted['action']} 回退 pending 重派" if reverted else ""))
+                continue
             # 池点被占（agent 全盘拒绝）：归因到最近采集器下单点位，120s 跳过
             if "找不到合法建造位置" in msg and self._last_ext_xy \
                     and time.time() - self._last_ext_xy[2] < 10:
@@ -806,6 +885,8 @@ class Executor:
         if not self.autopilot:
             # 多 agent 模式：本层保留进度跟踪 + 抢修兜底；routine=True 时再加规则快层。
             # 铁律：无委托单位=完全旁观（用户在手动玩/沙盒时，机器一拍都不许动）
+            # idle_builders 是共享列表：抢修/工单/routine 各段全在同一对象上原地消耗
+            # （局部重绑曾让同一建造者一拍内被抢修+工单派两单，2026-07-26 根治）
             if snap.get("delegated"):
                 self._dispatch_rescue(own, emit, stalled, idle_builders, danger, now, cc)
                 if self.routine:
@@ -888,7 +969,7 @@ class Executor:
                     fcmd["x"], fcmd["y"] = float(spot[0]), float(spot[1])
             if fcmd:
                 emit(fcmd, f"build:fac:{b['id']}", 4.0)
-                idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
 
         # 4.4) 生产调度（提到炮塔/升级之前：军力是之本，防止被经济动作饿死）
         #    按构成目标或默认优先级补队列；资金低于储备线且经济未达标时暂停
@@ -1177,7 +1258,7 @@ class Executor:
                 self.resume_by[u["id"]] = (b["id"], now)
                 what = "烂尾续建" if kind == 0 else "修理受损"
                 self.log("status", f"⚙ {what}：{u['t']}#{u['id']} ← 建造者#{b['id']}")
-                idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
+                idle_builders[:] = [x for x in idle_builders if x["id"] != b["id"]]  # 原地消耗：同拍工单/routine 段可见
 
     def _routine_tick(self, snap, emit, now, own, funds, builders, idle_builders,
                       ext_done, factories, safe_pools, cc, mw, mh, danger):
@@ -1231,7 +1312,7 @@ class Executor:
                            "x": px, "y": py}, f"build:ext:{b['id']}", 4.0):
                 self._last_ext_xy = (px, py, now)
             if b:
-                idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
         # ③ 防线工程（网格版：格距=建筑宽+3格，主通道留空；防空压后排对空侧不占弧尖）
         land_factories = [u for u in factories if u["t"] != "commandCenter"]
         turrets = [u for u in own if "turret" in u["t"].lower() and u.get("bld")]
@@ -1269,7 +1350,7 @@ class Executor:
                 b = self._mobile_builder(idle_builders, spot[0], spot[1], cc)
                 if b and emit({"cmd": "build", "action": tur_action, "builder": b["id"],
                                "x": float(spot[0]), "y": float(spot[1])}, f"build:tur:{b['id']}", 6.0):
-                    idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                    idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
         # 内圈维修湾（网格版：主线后 6 格）：≥2 座炮塔后配，cap 2
         bays = sum(1 for u in own if u["t"] == "repairbay" and u.get("bld"))
         bay_inflight = sum(1 for t, _ in self.issued_builds if t == "repairbay")
@@ -1285,7 +1366,7 @@ class Executor:
                 b = self._mobile_builder(idle_builders, spot[0], spot[1], cc)
                 if b and emit({"cmd": "build", "action": "b_repairbay", "builder": b["id"],
                                "x": float(spot[0]), "y": float(spot[1])}, f"build:bay:{b['id']}", 8.0):
-                    idle_builders = [x for x in idle_builders if x["id"] != b["id"]]
+                    idle_builders[:] = [x for x in idle_builders if x["id"] != b["id"]]
 
         # ③.5 池点哨戒：家圈(>600px)外的采集器各配 1 座炮塔护矿（远池不再裸奔）
         if self.routine_defense and cc and idle_builders and funds >= 1600:
@@ -1307,7 +1388,7 @@ class Executor:
                 if b and emit({"cmd": "build", "action": "b_c_turret_t1", "builder": b["id"],
                                "x": float(gx), "y": float(gy)},
                               f"build:pg:{ext['id']}", 30.0):
-                    idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                    idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
                 if not idle_builders:
                     break
 
@@ -1336,7 +1417,7 @@ class Executor:
                     if b and emit({"cmd": "build", "action": "b_seaFactory", "builder": b["id"],
                                    "x": float(ax), "y": float(ay)},
                                   f"build:sea:{b['id']}", 8.0):
-                        idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                        idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
             friendly = own + snap.get("allies", [])
             free_water = [p for p in self.resources if p.get("w") and not danger(p["x"], p["y"])
                           and not any(abs(u["x"] - p["x"]) < 40 and abs(u["y"] - p["y"]) < 40
@@ -1377,7 +1458,7 @@ class Executor:
                 b = self._mobile_builder(idle_builders, spot[0], spot[1], cc)
                 if b and emit({"cmd": "build", "action": "b_landFactory", "builder": b["id"],
                                "x": float(spot[0]), "y": float(spot[1])}, f"build:fac:{b['id']}", 6.0):
-                    idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                    idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
             elif now >= self.cool.get("fac:unreach", 0):
                 self.cool["fac:unreach"] = now + 60
                 self.log("status", "⚙ 厂区扩建暂缓：候选槽位陆军不可达（水/隔断），等新方向（防原地撞墙）")
@@ -1434,7 +1515,7 @@ class Executor:
                 if b and emit({"cmd": "build", "action": "b_c_turret_t1", "builder": b["id"],
                                "x": fx2, "y": fy2},
                               f"build:fwd:{b['id']}", 10.0):
-                    idle_builders = [u for u in idle_builders if u["id"] != b["id"]]
+                    idle_builders[:] = [u for u in idle_builders if u["id"] != b["id"]]
 
         # ⑦ 军工生产：构成由战斗域/计划书定（set_composition），队列补水归规则层——
         #    稳态期零 LLM 也持续产兵（科技过滤/防空占比/队列上限都在 _next_production 内）。
@@ -1455,6 +1536,68 @@ class Executor:
                 if price and funds < price:
                     continue  # 资金不够就憋着（此前无视价格每 2s 刷一次失败）
                 emit({"cmd": "train", "action": act, "factory": fac["id"]}, f"train:{fac['id']}")
+
+        # ⑧ 规则层主动侦察（2026-07-26 问题3，设计已定：平静期全黑区零 LLM 探路）——
+        #    三条件同时满足才派：无敌情（沿用既有 danger 判定：可见敌+记忆威胁）、距上次
+        #    ≥45s、存在全黑迷雾（fog_map 没接/数据不新鲜就跳过不动作）。挑 1 个最快的
+        #    空闲战斗单位（优先非小队成员 + SCOUT_PREF 快兵种），move（非 attackmove，
+        #    纯探路不恋战）到朝敌方向最近全黑格；受击保命归 reflex 层，这里不重复造；
+        #    派单走与其他段一致的 emit/冷却/委托口径，同一单位 45s 内不重复派。
+        if self.scout_enabled and cc and now - self.last_scout >= SCOUT_INTERVAL:
+            fog = self.control.fog
+            if (fog is not None and fog.fresh() and fog.enabled() and fog.rows
+                    and not snap.get("enemy") and not danger(cc["x"], cc["y"])):
+                delg = snap.get("delegated")
+                delg = set(delg) if isinstance(delg, (list, tuple, set)) else None
+                pool = [u for u in own
+                        if not u.get("bld") and not _is_builder(u) and not _busy(u)
+                        and now >= self.scout_unit_cd.get(u["id"], 0)
+                        and (delg is None or u["id"] in delg)]
+                nonsq = [u for u in pool if u["id"] not in self.squad_ids]
+                pool = nonsq or pool  # 优先非小队成员；实在没有才借空闲小队成员
+                if pool:
+                    cand = max(pool, key=lambda u: (
+                        any(k in u["t"] for k in SCOUT_PREF),
+                        {"AIR": 3, "HOVER": 2}.get(self.move_type.get(u["t"]), 1)))
+                    tgt = self._scout_target(cand, fog)
+                    if tgt and emit({"cmd": "move", "x": tgt[0], "y": tgt[1],
+                                     "units": str(cand["id"])}, f"scout:{cand['id']}", 5.0):
+                        self.last_scout = now
+                        self.scout_unit_cd[cand["id"]] = now + SCOUT_INTERVAL
+                        self.log("status", f"⚙ 侦察： {cand['t']}#{cand['id']} → "
+                                           f"({tgt[0]:.0f},{tgt[1]:.0f})（全黑探路）")
+
+    def _scout_target(self, cand, fog):
+        """侦察落点：朝敌方向（敌出生点 DangerMap.enemy_bases 优先，缺省 front_dir）
+        最近的全黑格（前半球 cos≥0.5 锥内取最近）；锥内没有全黑再退全局最近。"""
+        ux, uy = cand["x"], cand["y"]
+        bases = (self.dmap.enemy_bases if self.dmap else None) or []
+        if bases:
+            bx, by = min(bases, key=lambda b: (b[0] - ux) ** 2 + (b[1] - uy) ** 2)
+            dx, dy = bx - ux, by - uy
+        else:
+            dx, dy = self.front_dir or (0.0, 1.0)
+        dl = max(1.0, math.hypot(dx, dy))
+        dx, dy = dx / dl, dy / dl
+        best_cone = best_any = None
+        for gy in range(fog.h):
+            row = fog.rows[gy]
+            for gx in range(fog.w):
+                if row[gx] != 2:
+                    continue
+                wx, wy = (gx + 0.5) * fog.tile, (gy + 0.5) * fog.tile
+                vx, vy = wx - ux, wy - uy
+                d2 = vx * vx + vy * vy
+                if d2 < 100 * 100:
+                    continue  # 可见圈内不会有全黑（防御性跳过）
+                if best_any is None or d2 < best_any[0]:
+                    best_any = (d2, wx, wy)
+                proj = vx * dx + vy * dy
+                if proj > 0 and proj / math.sqrt(d2) >= 0.5 \
+                        and (best_cone is None or d2 < best_cone[0]):
+                    best_cone = (d2, wx, wy)
+        best = best_cone or best_any
+        return (best[1], best[2]) if best else None
 
     # ---------- 布局槽位（全局长持方向，建筑成行成排而非螺旋散点） ----------
     def factory_slot(self, cc, idx, existing, occ=None, btype="landFactory"):
@@ -1572,9 +1715,9 @@ class Executor:
             for j in range(oy, oy + h):
                 occ.add((gx + i, gy + j))
 
-    def _occupancy(self, snap, exclude_idx=None):
+    def _occupancy(self, snap, exclude_wo=None):
         """占位图：己方/盟友建筑（按 fp）+ 在途下单（45s 窗口）+ 工单待派/在途坐标
-        （exclude_idx=派发自查时豁免本任务——否则阵地展开总被当成"撞占位"挪散）。"""
+        （exclude_wo=派发自查时按 wo_id 豁免本任务——否则阵地展开总被当成"撞占位"挪散）。"""
         occ = set()
         for u in snap.get("own", []) + snap.get("allies", []):
             if u.get("bld"):
@@ -1587,7 +1730,7 @@ class Executor:
                 self._mark_fp(occ, t, x, y)
         # 工单坐标统一进图（阵地展开与 defense:k 撞点的根治：两套槽位共享一张图）
         for t in self.work_order:
-            if t["idx"] == exclude_idx or t["status"] not in ("pending", "assigned"):
+            if t.get("wo_id") == exclude_wo or t["status"] not in ("pending", "assigned"):
                 continue
             xy = (t.get("x"), t.get("y")) if t["status"] == "assigned" and t.get("x") is not None else None
             if xy is None:
@@ -1736,7 +1879,7 @@ class Executor:
             if t["status"] == "pending":
                 bt = t["action"][2:]
                 wo_due += self.price.get("u_" + bt) or self.price.get(bt) or 0
-        comp = self.army_goal["composition"] or {}
+        comp = self._effective_comp()  # 默认构成兜底参与七成判定（问题1：真空时 ready 恒真=升级款压死生产）
         ready = True
         if comp:
             counts_ = Counter(u["t"] for u in own if not u.get("bld"))
@@ -1778,18 +1921,22 @@ class Executor:
         now = time.time()
         ftype = fac["t"]
         learned = self.fac_avail.get(fac["id"])
+        learned_fresh = learned and now - learned[1] < 120
         # 该厂真实可用表（从失败回执学到，120s 内有效）优先于型号级并集——T1/T2 档按厂区分
-        avail = (learned[0] if learned and now - learned[1] < 120 else None) \
-            or self.factory_actions.get(ftype)
-        # 有 T2+ 可产就不产 T1（按可产列表最高科技算，不看厂名——空军/改名厂同样生效）
-        max_tech = max((self.action_tech.get(a, 1) for a in (avail or []) if not self._bad(a, now)),
-                       default=1)
+        avail = (learned[0] if learned_fresh else None) or self.factory_actions.get(ftype)
+        # 有 T2+ 可产就不产 T1——但科技档按【厂实际】算（2026-07-26 §二十二：pedia 把 T1/T2 厂
+        # 可产合并进同名条目，型号级 max 恒 2 → T1 主战被永久滤死=实局"纯防空军队"的根）：
+        # fac_upgraded=回执可用列表实证 T2（永久；升级悬案"回执 ok 不落地"不算——只有实证才进）；
+        # 否则按 avail 来源算最高档：学习表新鲜=该厂真实档（无 T2 动作=T1，c_tank 主战解锁）；
+        # 学不到=pedia 合并 max（保守现状，与修复前同）。
+        max_tech = 2 if fac["id"] in self.fac_upgraded else max(
+            (self.action_tech.get(a, 1) for a in (avail or []) if not self._bad(a, now)), default=1)
 
         def tech_ok(action):
             return max_tech <= 1 or self.action_tech.get(action, 1) >= 2
 
         # 构成目标模式：按缺口最大者优先；全部达标/被过滤时回落默认优先级（防工厂空转）
-        comp = self.army_goal["composition"]
+        comp = self._effective_comp()  # 无 LLM 构成时默认构成兜底（问题1：平静期也要持续产兵）
         if comp:
             counts = Counter()
             for u in own:

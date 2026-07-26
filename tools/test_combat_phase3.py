@@ -80,14 +80,28 @@ def main():
     snap = {"own": tanks(3)}
     multiagent._squad_watchdog(ctx4, st4, snap, 1000.0)
     assert any(m.get("cmd") == "attackmove" and m.get("x") == 2000.0 for m in link.sent), \
-        f"45s 未动应代打: {link.sent}"
+        f"超时未动应代打: {link.sent}"
     assert st4.squads["S1"]["last_act_ts"] == 1000.0
     assert any("看门狗" in t for t in logs)
     # 宽限内不动
     link.sent.clear()
     multiagent._squad_watchdog(ctx4, st4, snap, 1010.0)
     assert not link.sent, "last_act 刚更新，宽限内不动"
+    # 46s 未动仍在 90s 宽限内（曾 45s 即代打——与 LLM 往返撞车，抢在决策返回前开火）
+    multiagent._squad_watchdog(ctx4, st4, snap, 1046.0)
+    assert not link.sent, "90s 宽限内（46s）不应代打"
+    # 91s → 代打
+    multiagent._squad_watchdog(ctx4, st4, snap, 1091.0)
+    assert any(m.get("cmd") == "attackmove" for m in link.sent), "90s 宽限过后应代打"
+    assert st4.squads["S1"]["last_act_ts"] == 1091.0
+    # config 覆盖：squad_watchdog_sec=45 → 46s 即代打（阈值可调）
+    link.sent.clear()
+    ctx4["cfg"] = {"squad_watchdog_sec": 45}
+    multiagent._squad_watchdog(ctx4, st4, snap, 1137.0)
+    assert any(m.get("cmd") == "attackmove" for m in link.sent), "config 覆盖 45s 应生效"
+    del ctx4["cfg"]
     # 危险让位反射
+    link.sent.clear()
     st4.danger_map = DM(True)
     multiagent._squad_watchdog(ctx4, st4, snap, 2000.0)
     assert not link.sent, "质心危险应让位反射层"
@@ -125,7 +139,60 @@ def main():
                                             {"x": 1010, "y": 1010}, {"enemy": []}, g5)
     assert cmd and cmd["cmd"] == "attackmove", f"过窗应放行: {desc}"
 
-    print("PASS test_combat_phase3：触发器/看门狗/去重放宽 全部符合预期")
+    # 4. 清场完成→属主军种 pending 上报+召唤（2026-07-26 问题2①）
+    st6 = mk_st(pending={"commander": deque(), "build": deque(), "combat": deque(),
+                         "land": deque(), "air": deque(), "navy": deque()},
+                mission_stale=False, enemy_spawns=[], move_map={})
+    st6.squads = {"L1": {"mission": {"任务": "attack", "目标": [2000, 2000]}, "members": {1, 2}}}
+    ctx6 = mk_ctx()
+    snap6 = {"own": [{"id": 1, "t": "c_tank", "x": 2010, "y": 2000},
+                     {"id": 2, "t": "c_tank", "x": 1990, "y": 2010}], "enemy": []}
+    multiagent._mission_clear_tick(ctx6, st6, snap6)
+    assert st6.squads["L1"]["mission"] is None and st6.mission_stale, "清场应完成任务并置失效信号"
+    assert len(st6.pending["land"]) == 1 and "清场" in st6.pending["land"][0], \
+        f"完成上报必须落到属主军种 pending: {list(st6.pending['land'])}"
+    # 任务完成事件触发军种召唤（_branch_event 最先查本军种 pending）
+    r6 = multiagent._branch_event(ctx6, st6, snap6, [], time.time(),
+                                  {"plan_ts_fired": 0.0, "last_fire": time.time()}, "land")
+    assert r6 == "待读消息", f"属主军种应被完成事件召唤: {r6}"
+    st6.mission_stale = False  # 旧全局信号仍会漏给别军种（legacy 保留项），此断言只验 pending 必达属主
+    r6b = multiagent._branch_event(ctx6, st6, snap6, [], time.time(),
+                                   {"plan_ts_fired": 0.0, "last_fire": time.time()}, "air")
+    assert r6b is None and not st6.pending["air"], "空军无兵无队无消息不应被误召唤"
+    # harass 同款完成
+    st6.squads["L2"] = {"mission": {"任务": "harass", "目标": [2000, 2000]}, "members": {1, 2}}
+    multiagent._mission_clear_tick(ctx6, st6, snap6)
+    assert st6.squads["L2"]["mission"] is None, "harass 清场同样完成"
+    # 目标点有敌 → 不完成
+    st6.squads["L3"] = {"mission": {"任务": "attack", "目标": [2000, 2000]}, "members": {1, 2}}
+    multiagent._mission_clear_tick(ctx6, st6, dict(snap6, enemy=[{"id": 9, "t": "tank",
+                                                                 "x": 2100, "y": 2000}]))
+    assert st6.squads["L3"]["mission"] is not None, "目标点有敌不许完成"
+
+    # 4b. 实控前沿推进≥400px→总指挥战报，10min 冷却（2026-07-26 问题2②）
+    class ExFA:
+        def __init__(self):
+            self.pt = (1000.0, 1000.0, 40.0)
+
+        def frontier_anchor(self, cc, axis, now):
+            return self.pt
+
+    ex6 = ExFA()
+    ctx6b = mk_ctx(ex6)
+    st6b = mk_st(pending={"commander": deque()}, enemy_spawns=[(3000, 1000)],
+                 frontier_proj=None, frontier_report_ts=0.0)
+    snap6b = {"own": [{"id": 1, "t": "commandCenter", "bld": True, "x": 0, "y": 1000}], "enemy": []}
+    multiagent._frontier_report_tick(ctx6b, st6b, snap6b)
+    assert not st6b.pending["commander"], "首见只建档不战报"
+    ex6.pt = (1500.0, 1000.0, 40.0)  # 沿敌向(+x)推进 500px
+    multiagent._frontier_report_tick(ctx6b, st6b, snap6b)
+    assert len(st6b.pending["commander"]) == 1 and "推进" in st6b.pending["commander"][0], \
+        f"推进≥400px 应呈战报: {list(st6b.pending['commander'])}"
+    ex6.pt = (2000.0, 1000.0, 40.0)  # 又推进 500px 但 10min 冷却内
+    multiagent._frontier_report_tick(ctx6b, st6b, snap6b)
+    assert len(st6b.pending["commander"]) == 1, "10min 冷却内不重复呈报"
+
+    print("PASS test_combat_phase3：触发器/看门狗/去重放宽/清场上报/前沿战报 全部符合预期")
 
 
 if __name__ == "__main__":

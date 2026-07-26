@@ -187,6 +187,8 @@ class SharedState:
         self.pending = {"commander": deque(maxlen=8), "build": deque(maxlen=8),
                         "combat": deque(maxlen=8),  # squad chat 总闸遗留键（反射通报路由前的兜底）
                         "land": deque(maxlen=8), "air": deque(maxlen=8), "navy": deque(maxlen=8)}  # 军种中层
+        self.frontier_proj = None       # 实控前沿投影基线（_frontier_report_tick：推进≥400px 报总指挥）
+        self.frontier_report_ts = 0.0   # 上次前沿战报时刻（10min 冷却省 token）
         self.danger_map = ctx["danger_map"]
         self.fog_map = fog.FogMap(self.map_msg)  # 迷雾三态（快照 fogGrid/ghosts 驱动，~10s 一跳）
         self.danger_map.fog = self.fog_map       # 幽灵加热 + 可见冷却（可见空格威胁快速消散）
@@ -204,12 +206,24 @@ class SharedState:
 
 # ---------- 系统提示（静态，吃缓存） ----------
 
+def _map_size_class(tw, th):
+    """图尺寸档 + 节奏基准（2026-07-26 回放蒸馏：143 局→115 完整局幸存者 p50）。
+    两条被实证的用户论点：小图憋核=找死（有率 1%）、图越小防线越早。"""
+    m = max(tw, th)
+    if m < 2500:
+        return "小图", "首厂~25s、首塔≤80s、防空紧跟；小图节奏快，防线优先于大建筑，别碰核弹井"
+    if m < 4500:
+        return "中图", "首厂~35s、首塔~90s、首防空~90s、制造仪中盘起量；核弹井只在大优后期考虑"
+    return "大图", "首厂~60s、首塔~180s、首防空~90s、制造仪中盘起量；核弹井是大图后期专属（人类中位 470~1030s）"
+
+
 def _sys_commander(ctx, st):
     m = st.map_msg or {}
     tw = (m.get("tilesW", 0) or 0) * (m.get("tileW", 0) or 0)
     th = (m.get("tilesH", 0) or 0) * (m.get("tileH", 0) or 0)
     rows = ctx["downsample"](m.get("rows", []), max(1, len(m.get("rows", [])) // 24 or 1))
     res = m.get("resources", [])[:40]
+    size_cls, size_hint = _map_size_class(tw, th)
     spawns_txt = f"我方≈{st.mine_spawn}；敌方: " + ",".join(
         f"({int(x)},{int(y)})" for x, y in st.enemy_spawns) if st.enemy_spawns else "未知"
     return f"""你是《Rusted Warfare》的总指挥。你不直接下指令——每 ~50 秒审视全局一次，更新《作战计划书》，建造 agent 与战斗 agent 按它分头执行。
@@ -217,6 +231,7 @@ def _sys_commander(ctx, st):
 【公平】你只看得见本队视野内的信息，迷雾中的敌情未知，不要臆测。
 【迷雾三态】可见=真实（没看到敌人=真没有）；浅黑=记忆区（敌建筑为上次所见，可能已变）；全黑=从未探索，主攻/扩张路径上的全黑区先派侦察确认。
 【坐标】世界 {tw:.0f}x{th:.0f} 像素，y 向下为正。资源点: {",".join(f"({p['x']},{p['y']})" for p in res)}
+【图尺寸】{size_cls} · 节奏基准（人类 143 局回放幸存者中位数）：{size_hint}。基准是参照不是死线，局势优先。
 【地形图例】.=陆地 ~=水域 ==桥 L=岩浆 ^=阶梯(机甲可爬) #=高崖(仅空军)
 {chr(10).join(rows)}
 【出生点（公开信息）】{spawns_txt}
@@ -272,16 +287,19 @@ def _sys_build_thinker(ctx, st):
     m = st.map_msg or {}
     tw = (m.get("tilesW", 0) or 0) * (m.get("tileW", 0) or 0)
     th = (m.get("tilesH", 0) or 0) * (m.get("tileH", 0) or 0)
+    size_cls, size_hint = _map_size_class(tw, th)
     params = getattr(st, "plan_params", None) or {}
     return f"""你是《Rusted Warfare》的建造指挥。规则层（2 秒一拍）负责施工调度、采集器补给、池点哨戒、抢修重建、工厂升级——这些不用你管。你只出**参数化规划**：
+
+【节奏基准】本图={size_cls}（人类 143 局回放幸存者中位数）：{size_hint}。基准是参照不是死线，显著慢于基准要在工单 note 给理由。
 
 【职责：set_work_order（唯一动作面）】
 被召唤时给一份覆盖未来 2~3 分钟的有序建造工单 + 建造者目标数（builders_target，按局势 3~8 个）。工单原则：
 - 序列即规划：先经济（pool:k 从近到远）、再产能（factory:k）、再防线与大建筑
-- 防线点位必须给**精确坐标**（slot=[x,y]），由你按布局规则决定，不许甩给 defense:k：
-  防线弧在基地面朝敌侧展开，格距=建筑宽+3 格；主通道（基地→图心方向±200px 走廊）留空不堵；
-  防空压后排（比炮塔线靠后 60px+）；维修湾在防线内圈；家圈(≤1200px)内是安全区可放心盖
-- 厂区槽位 factory:k 贴死密排成排；大建筑 misc:k 在基地背后
+- **防线一律用阵地单**（{{"action":"position","kind":"defense_ground/defense_aa/defense_mixed","anchor":[x,y],"toward":[x,y],"count":n}}）：
+  你只给锚点/朝向/类型/座数，密集阵型生成器现场展开（100px 节距垂直敌向成线、防空压后排 120px、
+  主通道留空、逐点地形/占位校验）——**禁止自写防线坐标**（实证：LLM 写坐标压水/压崖/撞占位，防线歪扭）
+- 厂区槽位 factory:k 贴死密排成排；大建筑 misc:k 在基地背后；家圈(≤1200px)内是安全区可放心盖
 - 每份工单 4~10 项；阶段匹配计划书参数块
 - 失败点位系统在黑名单里会自动避让，不用重复试
 
@@ -297,6 +315,8 @@ def _sys_build_thinker(ctx, st):
 
 【纪律】
 - 资金纪律：决策看收入率不看余额——收入 <5 先补采集器链；大建筑只在收入 ≥15 时考虑。
+- 支持建筑（制造仪/维修湾外的大建筑）不出防线圈——只放家圈或实控区内；坐标单过系统实控闸，未实控直接判失败。
+- 扩张纪律：军队每夺下一处资源点，安稳后立即跟采集器；护矿炮塔只配靠前线/非深实控的池（纵深安全区不配）。
 - 建造不许停：对照计划书参数逐项核对（池数/厂数/防线座数/建造者数），没达标就在工单执行完毕时立即续下一份。
 - 不许编造原因：资金/收入/单位/警报全部来自快照，没看到的别瞎说。
 - 战斗单位生产与军事调动归战斗域，别碰。"""
@@ -343,6 +363,62 @@ def _build_event(ctx, st, snap, alerts, now, g):
             return "工单执行完毕"
         if open_n <= 2:
             return f"工单低水位（剩{open_n}项，续单防建造者闲置）"
+        # 新池安稳召唤（2026-07-26：用户实局"夺下资源点不巩固"的根治——新池一进安全集
+        # 就叫建造指挥跟采集器+护矿）。跟踪上一份安全池坐标集（pools_seen，存 g，
+        # 换局随 generation 重置）；新进入坐标须同时满足：①该池无 pending/assigned
+        # 状态的采集器工单任务（防重复召唤）②10 分钟内没为它召唤过。
+        # 注入面不用新造：建造 prompt 的"可用安全池"段每拍读 last_safe_pools 即最新
+        pools = getattr(ex, "last_safe_pools", None) or []
+        cur = {(int(p["x"]), int(p["y"])) for p in pools}
+        prev = g.get("pools_seen")
+        g["pools_seen"] = cur
+        if prev is not None:
+            fresh = sorted(cur - prev)
+            if fresh:
+                def _wo_xy(t):
+                    """工单任务的落点坐标（pending 看 slot、assigned 看 x/y、pool:k 现场解析）。"""
+                    s = t.get("slot")
+                    if isinstance(s, (list, tuple)) and len(s) == 2:
+                        return float(s[0]), float(s[1])
+                    if t.get("x") is not None:
+                        return float(t["x"]), float(t["y"])
+                    if isinstance(s, str) and s.startswith("pool:"):
+                        try:
+                            k = int(s.split(":")[1])
+                        except (ValueError, IndexError):
+                            return None
+                        if 0 <= k < len(pools):
+                            return float(pools[k]["x"]), float(pools[k]["y"])
+                    return None
+                ext_xy = [xy for xy in (_wo_xy(t) for t in ex.work_order
+                                        if t.get("status") in ("pending", "assigned")
+                                        and str(t.get("action", "")).startswith("b_extractor"))
+                          if xy]
+                notified = g.setdefault("pools_notified", {})
+                hits = [c for c in fresh
+                        if now - notified.get(c, 0) >= 600
+                        and not any((c[0] - x) ** 2 + (c[1] - y) ** 2 <= 80 ** 2 for x, y in ext_xy)]
+                if hits:
+                    # 护矿塔选择性（2026-07-26 回放蒸馏：人类 50~75% 远池不配塔，每池必配=浪费产能）：
+                    # 池四向 500px 采样安全值，全 ≥30 = 深实控→只跟采集器；任一侧不稳 = 靠前线→配护矿塔
+                    def _deep(cx, cy):
+                        ctl = getattr(ex, "control", None)
+                        if ctl is None:
+                            return False
+                        pts = [(cx, cy), (cx + 500, cy), (cx - 500, cy), (cx, cy + 500), (cx, cy - 500)]
+                        return all(ctl.safety(px, py) >= 30 for px, py in pts)
+                    guard = [c for c in hits if not _deep(c[0], c[1])]
+                    deep = [c for c in hits if _deep(c[0], c[1])]
+                    for c in hits:
+                        notified[c] = now
+                    parts = []
+                    if guard:
+                        parts.append("前线 " + ",".join(f"({c[0]},{c[1]})" for c in guard[:3])
+                                     + "——采集器+1座护矿炮塔跟上")
+                    if deep:
+                        parts.append("纵深 " + ",".join(f"({c[0]},{c[1]})" for c in deep[:3])
+                                     + "——安全区只跟采集器，无需护矿塔")
+                    return "新池安稳 " + "；".join(parts)
     if now - g.get("last_fire", 0) > 180:
         return "心跳"
     return None
@@ -917,15 +993,21 @@ def _current_caps(ctx):
 def squad_assign(ctx, st, snap):
     """战斗单位归队（军种三层）：按 move 类型分军种；军种内编成 hint 加分+人数最少优先；
     无队且未达上限开新队（达上限等下拍）；某队 >2×军种均值且未达上限→拆分一半成新队；
-    阵亡清零且无任务的小队注销。无守家队：新单位全部进军种小队，不囤。"""
+    成员清零即注销小队（任务书一并作废，置失效信号让军种中层重发）。无守家队：新单位全部进军种小队，不囤。"""
     combat = {u["id"]: u for u in snap.get("own", [])
               if not u.get("bld") and not any(k in u["t"] for k in _SUPPORT_KEYS)}
-    # 阵亡清除 + 空队注销
+    # 阵亡清除 + 空队注销：成员清零即注销（曾要求 mission is None——带旧任务书的
+    # 幽灵小队吸新兵、看门狗代打旧目标）；mission 非 None 按 mission_stale 惯例置失效信号
     for sid in list(st.squads):
         sq = st.squads[sid]
         sq["members"] = {i for i in sq["members"] if i in combat}
-        if not sq["members"] and sq.get("mission") is None:
+        if not sq["members"]:
+            had_mission = sq.get("mission") is not None
             del st.squads[sid]
+            if had_mission:
+                st.mission_stale = True  # 军种中层下拍感知失效，重发任务书
+                if ctx.get("log_activity"):
+                    ctx["log_activity"]("status", f"⚙ {sid} 成员清零注销，旧任务书作废待中层重发")
     caps = _current_caps(ctx)
     assigned = set().union(*(sq["members"] for sq in st.squads.values())) if st.squads else set()
     for uid, u in combat.items():
@@ -1002,7 +1084,7 @@ def _translate_missions(ctx, st, args, g):
             mission["数量"] = int(it.get("数量", 4) or 4)
             mission["_done"] = False
         st.squads[sid]["mission"] = mission
-        st.squads[sid]["mission_ts"] = time.time()  # 看门狗宽限起算点（先让 LLM 打，45s 不动才代打）
+        st.squads[sid]["mission_ts"] = time.time()  # 看门狗宽限起算点（先让 LLM 打，超时才代打）
         ok.append(f"{sid}:{mission['任务']}")
     desc = ("set_missions(" + ",".join(ok) + ("；忽略: " + ",".join(errs) if errs else "") + ")") \
         if ok else f"✗ set_missions: 全部非法（当前: {'/'.join(st.squads) or '无'}）: {','.join(errs)}"
@@ -1235,6 +1317,8 @@ def _agent_loop(ctx, st, role):
                 smz.danger_filter = lambda x, y, s=None: st.danger_map.danger(x, y, s)
                 history.clear()
                 g["recent_builds"].clear()
+                g.pop("pools_seen", None)      # 新池安稳跟踪随换局重置（上一局的池集不算"新"）
+                g.pop("pools_notified", None)
                 print(f"[{role['name']}] 系统提示已随对局重建")
             link = ctx["link"]
             snap = link.snapshot()
@@ -1707,17 +1791,20 @@ def _squad_chat_loop(ctx, st, sid):
 
 
 def _squad_watchdog(ctx, st, snap, now):
-    """服从看门狗（系统兜底）：attack/harass 任务下达 45s 小队 LLM 仍无动作，
+    """服从看门狗（系统兜底）：attack/harass 任务下达超时小队 LLM 仍无动作，
     系统直接 attackmove 代执行（与反射层同哲学：LLM 会漏，机器兜底——
     实测 attack 小队以"敌强我弱"拒战 56 分钟零军事指令）。
+    阈值缺省 90s（曾 45s≈LLM 往返时长，看门狗恰在决策即将返回时抢方向盘代打）；
+    note 上报不算"动作"、不刷 last_act——防 note 刷屏抗命（阶段 3 有意设计，勿改）。
     质心有危险时让位反射层（不推人上火线）；阵亡/未委托/角色关闭时不动作。"""
     if st.defeated:
         return
+    wd = float((ctx.get("cfg") or {}).get("squad_watchdog_sec", 90))
     for sid, sq in st.squads.items():
         mi = sq.get("mission") or {}
         if mi.get("任务") not in ("attack", "harass") or not mi.get("目标") or not sq["members"]:
             continue
-        if now - max(sq.get("last_act_ts", 0.0), sq.get("mission_ts", 0.0)) < 45.0:
+        if now - max(sq.get("last_act_ts", 0.0), sq.get("mission_ts", 0.0)) < wd:
             continue
         ms = [u for u in snap.get("own", []) if u["id"] in sq["members"]]
         if not ms:
@@ -1730,7 +1817,74 @@ def _squad_watchdog(ctx, st, snap, now):
         ids = ",".join(str(i) for i in sorted(sq["members"]))
         ctx["link"].send({"cmd": "attackmove", "x": float(tx), "y": float(ty), "units": ids})
         sq["last_act_ts"] = now
-        ctx["log_activity"]("cmd", f"🏳 {sid} 看门狗代执行 attack({int(tx)},{int(ty)})（小队 45s 未动）")
+        ctx["log_activity"]("cmd", f"🏳 {sid} 看门狗代执行 attack({int(tx)},{int(ty)})（小队 {int(wd)}s 未动）")
+
+
+def _mission_clear_tick(ctx, st, snap):
+    """attack/harass 到点清场自动完成（别让任务无限挂着——重复点原地的根治）。
+    2026-07-26 问题2①：完成时往【对应军种】pending 写"清场完成"上报（带时间戳，照 note 惯例）
+    ——旧版只置全局 mission_stale，任一军种事件循环先拍就抢走（_branch_event 谁先看谁消费），
+    属主军种可能永远收不到；pending 按军种分账且 _branch_event 最先查它=必达召唤。"""
+    for sid, sq in st.squads.items():
+        mi = sq.get("mission") or {}
+        if mi.get("任务") not in ("attack", "harass") or not mi.get("目标") or not sq["members"]:
+            continue
+        ms = [u for u in snap.get("own", []) if u["id"] in sq["members"]]
+        if not ms:
+            continue
+        cx = sum(u["x"] for u in ms) / len(ms)
+        cy = sum(u["y"] for u in ms) / len(ms)
+        tx, ty = mi["目标"]
+        if (cx - tx) ** 2 + (cy - ty) ** 2 > 150 ** 2:
+            continue
+        if any((e["x"] - tx) ** 2 + (e["y"] - ty) ** 2 < 500 ** 2
+               for e in snap.get("enemy", [])):
+            continue
+        sq["mission"] = None
+        st.mission_stale = True
+        ts = time.strftime("%H:%M:%S")
+        st.pending[_sid_branch(sid)].append(
+            f"[{ts}] [系统通报] {sid} {mi.get('任务')}目标({int(tx)},{int(ty)})已清场，"
+            "任务完成——可乘胜推进，请改派。")
+        ctx["log_activity"]("status", f"⚙ {sid} {mi.get('任务')}目标已清场，任务完成待改派")
+
+
+def _frontier_report_tick(ctx, st, snap):
+    """实控前沿显著推进→总指挥 pending 战报（2026-07-26 问题2②：打了胜仗要知道继续推）。
+    口径=既有 frontier_anchor（安全值≥30 的最远实控格，executor）沿敌向投影：
+    较基线前进 ≥400px 才报，10min 冷却省 token；前沿回缩/首见则重定基线。"""
+    ex = ctx["exec_holder"].get("ex")
+    if not ex:
+        return
+    now = time.time()
+    if now - getattr(st, "frontier_report_ts", 0.0) < 600:
+        return
+    cc = next((u for u in snap.get("own", []) if u["t"] == "commandCenter" and u.get("bld")), None)
+    if not cc:
+        return
+    if st.enemy_spawns:  # 敌出生点方向优先，缺省 CC→图心（与 executor.front_dir 同口径）
+        ex0, ey0 = min(st.enemy_spawns,
+                       key=lambda s: (s[0] - cc["x"]) ** 2 + (s[1] - cc["y"]) ** 2)
+    else:
+        ex0, ey0 = st.world_w / 2.0, st.world_h / 2.0
+    ax, ay = ex0 - cc["x"], ey0 - cc["y"]
+    alen = max(1.0, math.hypot(ax, ay))
+    axis = (ax / alen, ay / alen)
+    fa = ex.frontier_anchor(cc, axis, now)
+    if not fa:
+        return
+    proj = (fa[0] - cc["x"]) * axis[0] + (fa[1] - cc["y"]) * axis[1]
+    base = getattr(st, "frontier_proj", None)
+    if base is None or proj < base:
+        st.frontier_proj = proj  # 首见/回缩：重定基线
+        return
+    if proj - base >= 400:
+        st.frontier_proj = proj
+        st.frontier_report_ts = now
+        st.pending["commander"].append(
+            f"[系统战报] 实控前沿向敌推进 {int(proj - base)}px（锚点 ({int(fa[0])},{int(fa[1])}) "
+            f"安全值{fa[2]:.0f}）——脚下已稳，可考虑组织下一轮进攻。")
+        ctx["log_activity"]("status", f"⚙ 实控前沿推进 {int(proj - base)}px，战报已呈总指挥")
 
 
 def _squad_manager(ctx, st):
@@ -1753,26 +1907,11 @@ def _squad_manager(ctx, st):
                     if fresh:
                         ex.on_cmd_results(fresh)
                 squad_assign(ctx, st, snap)
+                if ex:
+                    ex.squad_ids = {uid for sq in st.squads.values() for uid in sq["members"]}
                 _produce_tick(ctx, st, snap)
-                # 进攻任务到点清场自动完成（别让任务无限挂着——重复点原地的根治）
-                for sid, sq in st.squads.items():
-                    mi = sq.get("mission") or {}
-                    if mi.get("任务") != "attack" or not mi.get("目标") or not sq["members"]:
-                        continue
-                    ms = [u for u in snap.get("own", []) if u["id"] in sq["members"]]
-                    if not ms:
-                        continue
-                    cx = sum(u["x"] for u in ms) / len(ms)
-                    cy = sum(u["y"] for u in ms) / len(ms)
-                    tx, ty = mi["目标"]
-                    if (cx - tx) ** 2 + (cy - ty) ** 2 > 150 ** 2:
-                        continue
-                    if any((e["x"] - tx) ** 2 + (e["y"] - ty) ** 2 < 500 ** 2
-                           for e in snap.get("enemy", [])):
-                        continue
-                    sq["mission"] = None
-                    st.mission_stale = True
-                    ctx["log_activity"]("status", f"⚙ {sid} 进攻目标已清场，任务完成待改派")
+                _mission_clear_tick(ctx, st, snap)    # 清场完成→军种 pending 上报+召唤（问题2①）
+                _frontier_report_tick(ctx, st, snap)  # 实控前沿推进≥400px→总指挥战报（问题2②）
                 if ctx["ai_enabled"]() and ctx["role_enabled"]("combat") and snap.get("delegated"):
                     _squad_watchdog(ctx, st, snap, time.time())  # 服从看门狗：LLM 不动系统代打
                     for sid, sq in st.squads.items():
@@ -1811,7 +1950,8 @@ def _bchat_gname(gid):
 
 
 def _bchat_slot(ctx, gid):
-    """(域, 组内序号, 同域组数)：工单按 idx 奇偶在同域组间分流（防两组抢同一单）。"""
+    """(域, 组内序号, 同域组数)：工单按 wo_id 奇偶在同域组间分流（防两组抢同一单；
+    续单重排 idx 会变，wo_id 稳定——分流不漂）。"""
     dom = _bchat_dom(gid)
     grp = [g for g in _bchat_gids(ctx["cfg"]) if _bchat_dom(g) == dom]
     return dom, grp.index(gid), len(grp)
@@ -1897,7 +2037,7 @@ def _bchat_anchors(ctx, st, ex, snap, domain, pending=None):
     anchors.append({"label": "家圈", "x": cc["x"], "y": cc["y"], "desc": desc(cc["x"], cc["y"])})
     for t in (pending or [])[:8]:  # 阵地展开等精确坐标任务：自带点进锚点表（不被重锚散开）
         if isinstance(t.get("slot"), (list, tuple)):
-            anchors.append({"label": f"任务#{t['idx']}点", "x": t["slot"][0], "y": t["slot"][1],
+            anchors.append({"label": f"任务#{t['wo_id']}点", "x": t["slot"][0], "y": t["slot"][1],
                             "desc": desc(t["slot"][0], t["slot"][1], "任务点")})
     if domain == "defense":
         anchors.sort(key=lambda a: 0 if a["label"].startswith("弧位") else 1)
@@ -1936,7 +2076,7 @@ def _bchat_loop(ctx, st, gid):
                 time.sleep(2.0)
                 continue
             dom, slot, ngrp = _bchat_slot(ctx, gid)
-            pending = [t for t in ex.wo_pending(dom) if t["idx"] % ngrp == slot]
+            pending = [t for t in ex.wo_pending(dom) if t["wo_id"] % ngrp == slot]
             # 遇袭=敌武器实际够得着（距离≤射程×1.15），不是"近"就怕——
             # 750px 外一座 290 射程的炮塔曾让全队永远处于"遇袭"死循环
             prange = {u["name"]: (u.get("atk") or {}).get("rng", 0)
@@ -1956,7 +2096,7 @@ def _bchat_loop(ctx, st, gid):
             anchors = _bchat_anchors(ctx, st, ex, snap, dom, pending)
             mtxt = " | ".join(f"#{u['id']}@({int(u['x'])},{int(u['y'])}) act={u.get('act') or 'idle'} hp{u['hp']}"
                               for u in members[:6])
-            ttxt = "；".join(f"#{t['idx']} {t['action']}[{t.get('slot')}]"
+            ttxt = "；".join(f"#{t['wo_id']} {t['action']}[{t.get('slot')}]"
                              for t in pending[:8]) or "（无）"
             atxt = "；".join(f"{a['label']}({a['desc']})" for a in anchors)
             etxt = "；".join(f"{e['t']}@({int(e['x'])},{int(e['y'])})距{int(d)}射程{int(rng)}"
@@ -1971,6 +2111,10 @@ def _bchat_loop(ctx, st, gid):
                            [{"role": "system", "content": sysp},
                             {"role": "user", "content": user}], tools=[], timeout=timeout, max_retries=1)
             txt = (msg.get("content") or "").strip()
+            # LLM 有应答即活着（hold/留单等钱/非法输出都算）——fallback 只管 LLM 循环真死；
+            # 任务派不动（等钱/等点）归工单层与资金仲裁，不归"接管"
+            # （真机形态：econ2 每拍积极试派被资金闸门拦，却因 last_act 不刷被判"规则层接管中"）
+            bg["last_act"] = time.time()
             i, j = txt.find("{"), txt.rfind("}")
             try:
                 obj = json.loads(txt[i:j + 1]) if 0 <= i < j else {}
@@ -2025,12 +2169,12 @@ def _bchat_loop(ctx, st, gid):
                     acts.append(f"repair→#{tid}")
                     ctx["log_activity"]("cmd", f"🧰 {gid} repair→#{tid}（建造者#{b['id']}）")
                     continue
-                # build：idx 必须命中本组任务，anchor 必须合法
+                # build：idx（=工单稳定 wo_id）必须命中本组任务，anchor 必须合法
                 try:
                     tidx = int(obj.get("idx"))
                 except (TypeError, ValueError):
                     tidx = None
-                task = next((t for t in pending if t["idx"] == tidx), None)
+                task = next((t for t in pending if t["wo_id"] == tidx), None)
                 if task is None or a is None:
                     acts.append(f"（build 任务/锚点非法已丢弃: idx={obj.get('idx')} {lab}）")
                     continue
@@ -2040,13 +2184,30 @@ def _bchat_loop(ctx, st, gid):
                 if bid is None:
                     free = [u for u in members if u.get("act") in (None, "", "idle")]
                     bid = (free[0] if free else members[0])["id"]
+                # send 前闸门与 _wo_tick 同口径（直派曾是盲区：没钱空派/撞点重派）：
+                # 资金=pedia 价 vs 当前资金；占位=_occupancy/_cell_free 复用（豁免本任务）
+                btype = task["action"][2:]
+                price = ex.price.get("u_" + btype) or ex.price.get(btype) or 0
+                funds = (snap.get("team") or {}).get("funds", 0)
+                if price and funds < price:
+                    acts.append(f"（build #{tidx} 资金不足（{int(funds)}<{price}），留单等钱）")
+                    continue
+                tw, th = ex._tw()
+                occ_ns = ex._occupancy(snap, exclude_wo=task["wo_id"])
+                if not ex._cell_free(occ_ns, btype, int(a["x"] // tw), int(a["y"] // th)):
+                    acts.append(f"（build #{tidx} 锚点{lab}已被占，跳过）")
+                    continue
+                # 先落账后派单（原顺序 send→mark 且 mark 失败被忽略=双重派单）；
+                # 任务已被接走/不存在=跳过不 send，写进行动记录让队长下轮看到
+                if not ex.wo_mark_assigned(tidx, bid, a["x"], a["y"]):
+                    acts.append(f"（build #{tidx} 任务已被接走，跳过派单）")
+                    continue
                 link.send({"cmd": "build", "action": task["action"], "builder": bid,
                            "x": float(a["x"]), "y": float(a["y"])})
-                ex.wo_mark_assigned(tidx, bid, a["x"], a["y"])
                 bg["last_act"] = time.time()
                 acts.append(f"build #{tidx}→{lab}")
                 ctx["log_activity"]("cmd", f"🧰 {gid} build #{tidx} {task['action']}→{lab}（建造者#{bid}）")
-                pending = [t for t in pending if t["idx"] != tidx]  # 连派本拍内不重复命中
+                pending = [t for t in pending if t["wo_id"] != tidx]  # 连派本拍内不重复命中
         except llm.LlmError as e:
             acts.append(f"（LLM 失败: {str(e)[:30]}）")
             time.sleep(3.0)
@@ -2058,8 +2219,8 @@ def _bchat_loop(ctx, st, gid):
 
 
 def _bchat_manager(ctx, st):
-    """建造 chat 管理器（2s/拍）：归队（人少优先、≤cap）/剪除/45s 静默回退（规则层接管）
-    /新工单唤醒/按需开 chat 线程。"""
+    """建造 chat 管理器（2s/拍）：归队（人少优先、≤cap）/剪除/LLM 90s 无应答回退（规则层接管 45s）
+    /新工单唤醒/按需开 chat 线程。注：last_act 由 LLM 成功应答刷新，待命/等钱不误判。"""
     seen_gen = st.generation
     seen_wo = -1
     while True:
@@ -2098,11 +2259,11 @@ def _bchat_manager(ctx, st):
             now = time.time()
             for gid, bg in st.bgroups.items():
                 dom, slot, ngrp = _bchat_slot(ctx, gid)
-                pend = [t for t in ex.wo_pending(dom) if t["idx"] % ngrp == slot]
+                pend = [t for t in ex.wo_pending(dom) if t["wo_id"] % ngrp == slot]
                 if pend and now - bg["last_act"] > 90 and now > bg["fallback_until"]:
                     bg["fallback_until"] = now + 45
                     if bg["last_act"]:
-                        ctx["log_activity"]("status", f"🧰 {gid} 90s 未动，规则层接管 45s")
+                        ctx["log_activity"]("status", f"🧰 {gid} LLM 90s 无应答，规则层接管 45s")
                 if bg["members"] and not (bg["thread"] and bg["thread"].is_alive()):
                     bg["thread"] = threading.Thread(target=_bchat_loop, args=(ctx, st, gid), daemon=True)
                     bg["thread"].start()
@@ -2238,6 +2399,7 @@ def supervisor_loop(ctx, st):
                     ex.routine = bool(ctx["cfg"].get("routine_layer", True))  # 规则快层：例行+炮塔弧
                     ex.routine_defense = bool(ctx["cfg"].get("routine_defense", True))  # 脚本防线（false=只听阵地单）
                     ex.auto_production = bool(ctx["cfg"].get("auto_production", True))  # 规则层自动补军工队列
+                    ex.scout_enabled = bool(ctx["cfg"].get("scout_enabled", True))  # 规则层主动侦察（问题3）
                     ex.dmap = st.danger_map
                     ex.control.fog = st.fog_map  # 安全值迷雾惩罚（全黑/浅黑）
                     ex.on_action = lambda c: _push_chat(ctx, "system", "⚙ " + _cmd_brief(c))

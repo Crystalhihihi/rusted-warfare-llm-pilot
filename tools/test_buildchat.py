@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """建造 chat 层离线验证（mock llm.chat）：
 ①域让位（defense 有员则不自动派，econ 无员照自动派）②合法 build 输出→指令+落账
-③非法锚点→拒绝 ④hold→不动 ⑤45s 回退期→规则层恢复自动派。
+③非法锚点→拒绝 ④hold→不动但刷 last_act（待命不误判接管）⑤45s 回退期→规则层恢复自动派
+⑥落账返 False（任务已被接走）→不重复派单+行动记录反馈。
 用法: python tools/test_buildchat.py
 """
 import json
@@ -120,11 +121,14 @@ ex.chat_yield_fn = _yield
 with ex.lock:
     ex.tick(SNAP)
 
-# 工单：防御(turret) + 经济(extractor)
-ex.set_work_order([{"action": "b_c_turret_t1", "slot": "defense:0", "note": "防线"},
-                   {"action": "b_extractorT1", "slot": "pool:0", "note": "经济"}], SNAP)
-tur_idx = ex.work_order[0]["idx"]
-ext_idx = ex.work_order[1]["idx"]
+# 工单：经济(extractor) + 防御(turret)。
+# 注意顺序：wo_id 单调递增（1=extractor 2=turret），bchat 按 wo_id 奇偶分流——
+# turret 须落 defense 组（slot0=偶数），extractor 归 econ 无员照规则层派
+ex.set_work_order([{"action": "b_extractorT1", "slot": "pool:0", "note": "经济"},
+                   {"action": "b_c_turret_t1", "slot": "defense:0", "note": "防线"}], SNAP)
+ext_wo = ex.work_order[0]["wo_id"]
+tur_wo = ex.work_order[1]["wo_id"]
+assert tur_wo % 2 == 0, f"防御任务须落 defense 组（偶数 wo_id）: {tur_wo}"
 
 # ① 域让位：defense 组有员 → turret 不自动派；econ 无员 → extractor 自动派
 st.bgroups["defense"] = multiagent._new_bgroup()
@@ -137,25 +141,26 @@ assert any("extractor" in str(c) for c in auto_build), f"econ 无员应自动派
 assert not any("turret" in str(c) for c in auto_build), f"defense 有员应让位不派炮塔: {cmds}"
 # 清掉 econ 自动派的任务，免得干扰后面断言
 for t in ex.work_order:
-    if t["idx"] == ext_idx:
+    if t["wo_id"] == ext_wo:
         t["status"] = "done"
 print("① 域让位 OK")
 
 # ② 合法 build：mock 返回 build turret@弧位D → link.sent 有 build + 任务落账
-RESP.append('{"action":"build","idx":%d,"anchor":"弧位D","reason":"先起防线"}' % tur_idx)
+RESP.append('{"action":"build","idx":%d,"anchor":"弧位D","reason":"先起防线"}' % tur_wo)
 th = threading.Thread(target=multiagent._bchat_loop, args=(ctx, st, "defense"), daemon=True)
 th.start()
 time.sleep(3.5)
 chat_build = [c for c in link.sent if c["cmd"] == "build" and c["action"] == "b_c_turret_t1"]
 assert chat_build, f"chat 合法 build 应发出: {link.sent}"
-task = next(t for t in ex.work_order if t["idx"] == tur_idx)
+task = next(t for t in ex.work_order if t["wo_id"] == tur_wo)
 assert task["status"] == "assigned" and "chat派" in task["note"], f"任务应落账: {task}"
 assert st.bgroups["defense"]["last_act"] > 0, "last_act 应更新"
 print("② 合法 build 执行+落账 OK")
 
 # ③ 非法锚点：mock 返回 火星 → 无新增 build
-ex.work_order.append({"idx": 90, "action": "b_c_antiAirTurret", "slot": "defense:1",
-                      "note": "", "status": "pending"})
+ex.work_order.append({"wo_id": 90, "action": "b_c_antiAirTurret", "slot": "defense:1",
+                      "note": "", "status": "pending", "builder": None,
+                      "ts": 0.0, "x": None, "y": None})
 n0 = len([c for c in link.sent if c["cmd"] == "build"])
 RESP.append('{"action":"build","idx":90,"anchor":"火星","reason":"瞎编"}')
 time.sleep(2.5)
@@ -165,12 +170,16 @@ assert any("非法" in a for a in st.bgroups["defense"]["actions"]), \
     f"非法应记入最近行动: {list(st.bgroups['defense']['actions'])}"
 print("③ 非法锚点拒绝 OK")
 
-# ④ hold：无动作
+# ④ hold：无动作；但 LLM 成功应答即刷 last_act（fallback 只管 LLM 循环真死，
+#    正确待命/等钱不再被误判"接管中"——真机 econ2 等钱被误判的形态）
+t0 = time.time()
 RESP.append('{"action":"hold","reason":"先观望"}')
 time.sleep(2.0)
 n2 = len([c for c in link.sent if c["cmd"] in ("build", "move", "resume")])
 assert n2 == n1, "hold 不应发任何指令"
-print("④ hold 不动 OK")
+assert st.bgroups["defense"]["last_act"] >= t0, \
+    "LLM 成功应答（hold）应刷 last_act（待命=活着，不误判接管）"
+print("④ hold 不动+应答刷 last_act（待命不误判接管）OK")
 
 # ⑤ 回退：组 45s 静默（fallback_until 内）→ 规则层恢复自动派该域
 th._dummy = None  # 线程仍在跑，无害
@@ -181,5 +190,21 @@ with ex.lock:
 aa_build = [c for c in cmds if c["cmd"] in ("build", "buildq") and "antiAir" in str(c)]
 assert aa_build, f"回退期规则层应恢复自动派防空: {cmds}"
 print("⑤ 45s 回退规则层接管 OK")
+
+# ⑥ mark-first：落账返 False（任务已被他组接走）→ 不发 build，反馈写进行动记录
+n3 = len([c for c in link.sent if c["cmd"] == "build"])
+ex.wo_mark_assigned = lambda *a, **k: False  # 模拟他组抢先落账（45s 往返窗口的真实竞态）
+ex.work_order.append({"wo_id": 92, "action": "b_c_antiAirTurret", "slot": "defense:1",
+                      "note": "", "status": "pending", "builder": None,
+                      "ts": 0.0, "x": None, "y": None})
+time.sleep(1.5)  # 循环 pending 是拍首捕获的：先等一拍含 92 再上 RESP（否则被旧捕获窗口抢走）
+RESP.append('{"action":"build","idx":92,"anchor":"池B","reason":"再试"}')
+time.sleep(2.5)
+del ex.wo_mark_assigned  # 还原类方法
+n4 = len([c for c in link.sent if c["cmd"] == "build"])
+assert n4 == n3, "任务已被接走不应再 send（mark-first 防双重派单）"
+assert any("已被接走" in a for a in st.bgroups["defense"]["actions"]), \
+    f"已被接走应写进行动记录让队长下轮看到: {list(st.bgroups['defense']['actions'])}"
+print("⑥ mark-first 已被接走不重复派单 OK")
 
 print("ALL PASS")

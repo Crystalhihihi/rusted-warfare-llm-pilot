@@ -7,6 +7,7 @@ from collections import deque
 
 sys.path.insert(0, "bridge")
 import executor as exec_mod
+import fog as fog_mod
 import multiagent
 
 TILE = 20
@@ -147,7 +148,7 @@ def main():
     assert m["_done"] is True and st.mission_stale is True
     assert ex.produce_focus == {}, f"完成后 focus 应清空: {ex.produce_focus}"
 
-    # 6. 槽位安全值择优：威胁覆盖首选位 → 沿排走向第一个 safety ≥ floor 的槽位
+    # 6. 槽位安全值择优（地板 SAFE_PICK_FLOOR=10）：威胁覆盖首选位 → 沿排走向第一个过地板的槽位
     MAP_BIG = {"tilesW": 300, "tilesH": 300, "tileW": TILE, "tileH": TILE,
                "rows": ["." * 300 for _ in range(300)],
                "resources": [{"x": 1300, "y": 1000}], "path": ""}
@@ -155,17 +156,36 @@ def main():
     cc = {"x": 2000, "y": 1000}
     s0 = ex._row_slot_safe(set(), "landFactory", cc, 0, 1.0, 0.0, 0)
     assert s0, "首选位应存在"
-    assert ex.control.safety(s0[0], s0[1]) == 0.0, "无数据时安全值为 0（退化为顺排）"
+    assert ex.control.safety(s0[0], s0[1]) == 0.0, "无数据时安全值为 0（全冷兜底退回首选，不空手）"
     k0 = (int(s0[0] // 400), int(s0[1] // 400))
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             ex.control.cells[(k0[0] + dx, k0[1] + dy)] = \
                 {"army": [0, 0], "struct": [0, 0], "threat": 5.0}
     assert ex.control.safety(s0[0], s0[1]) < exec_mod.SAFE_PICK_FLOOR, "首选位已被压到地板下"
+    # 地板=10 下沿途空格 safety=0 也不过地板：给远排脱开威胁邻域的槽位放友军军力顶过地板
+    # （safety 威胁取 3x3 邻域 max，邻格仍被 5.0 压制，须隔 ≥3 格）
+    slot1 = k1 = None
+    for n in range(1, 30):
+        cand = ex._row_slot(set(), "landFactory", cc, n, 1.0, 0.0, 0)
+        if cand is None:
+            break
+        ck = (int(cand[0] // 400), int(cand[1] // 400))
+        if abs(ck[0] - k0[0]) > 2 or abs(ck[1] - k0[1]) > 2:
+            slot1, k1 = cand, ck
+            break
+    assert slot1, "排内应找到脱开威胁邻域的槽位"
+    ex.control.cells[k1] = {"army": [12.0, 0.0], "struct": [0, 0], "threat": 0.0}
     s1 = ex._row_slot_safe(set(), "landFactory", cc, 0, 1.0, 0.0, 0)
     assert s1 and s1 != s0, f"威胁覆盖后应移位: {s0} -> {s1}"
     assert ex.control.safety(s1[0], s1[1]) >= exec_mod.SAFE_PICK_FLOOR, \
         f"新位应过地板: {ex.control.safety(s1[0], s1[1])}"
+    # 全热兜底：威胁铺满整排时退回已见最安全候选（不空手，由派发闸安全值地板终判）
+    for gx in range(k0[0] - 2, k0[0] + 13):
+        for gy in range(k0[1] - 1, k0[1] + 2):
+            ex.control.cells[(gx, gy)] = {"army": [0, 0], "struct": [0, 0], "threat": 5.0}
+    s2 = ex._row_slot_safe(set(), "landFactory", cc, 0, 1.0, 0.0, 0)
+    assert s2 == s0, f"全热应退回已见最安全候选（不空手）: {s2}"
 
     # 7. 阵亡判定：own 全空 15s → 待机；有单位立刻复活；不误判
     logs = []
@@ -200,10 +220,15 @@ def main():
     ]
     assert ex._military_reserve([]) == 700 + 700 + 700, "工单两项估价进线"
     fac_u2 = {"id": 9, "t": "landFactory", "bld": True, "hp": 1, "maxHp": 1, "x": 1, "y": 1}
-    assert ex._military_reserve([fac_u2]) == 700 + 1400 + 4500, "兵力不设防(无构成)+T1厂→攒 4500"
+    # 2026-07-26 问题1 语义变更：无 LLM 构成=默认构成兜底（缺口全满）→先补兵不攒升级
+    # （旧语义"无构成=兵力不设防直接攒 4500"正是平静期⑦断产→蓄势死锁的根，见 PROGRESS §二十一）
+    assert ex._military_reserve([fac_u2]) == 700 + 1400, "默认构成缺口全满→不攒升级先补兵"
     ex.fac_upgraded.add(9)
     ext_u = {"id": 10, "t": "extractorT1", "bld": True, "hp": 1, "maxHp": 1, "x": 1, "y": 1}
-    assert ex._military_reserve([fac_u2, ext_u]) == 700 + 1400 + 3200, "厂已 T2→退而攒采集器 3200"
+    army8 = ([{"id": i, "t": "c_tank", "hp": 1, "maxHp": 1, "x": 1, "y": 1} for i in range(30, 38)]
+             + [{"id": i, "t": "missileTank", "hp": 1, "maxHp": 1, "x": 1, "y": 1} for i in range(40, 42)])
+    assert ex._military_reserve([fac_u2, ext_u] + army8) == 700 + 1400 + 3200, \
+        "默认构成达标+厂已 T2→退而攒采集器 3200"
     # 构成缺口大 → 先造兵不攒升级
     ex2 = make_ex()
     ex2.set_army_goal(composition={"u_c_tank": 10})
@@ -288,14 +313,120 @@ def main():
     for x, y in fpts:
         assert not ex13._cell_free(occ13, "c_turret_t1", int(x // TILE), int(y // TILE)), \
             f"展开坐标必须进占位图: ({x},{y})"
-    # 自身豁免：排除本任务 idx 后，自己的点应恢复 free（不被当成"撞占位"）
-    idx0 = ex13.work_order[0]["idx"]
-    occ_self = ex13._occupancy({"own": [], "allies": []}, exclude_idx=idx0)
+    # 自身豁免：排除本任务 wo_id 后，自己的点应恢复 free（不被当成"撞占位"）
+    wo0 = ex13.work_order[0]["wo_id"]
+    occ_self = ex13._occupancy({"own": [], "allies": []}, exclude_wo=wo0)
     assert ex13._cell_free(occ_self, "c_turret_t1",
                            int(fpts[0][0] // TILE), int(fpts[0][1] // TILE)), \
         "豁免本任务后自身坐标应恢复 free"
 
-    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一 全部符合预期")
+    # 14. 新池安稳召唤：新坐标进安全池集 → 召唤一次；同集/10 分钟内回锅/有采集工单在干 → 不重复
+    class ExPools:
+        def __init__(self, wo, pools):
+            self.work_order = wo
+            self.last_safe_pools = pools
+
+    def evp(wo, pools, g):
+        ctx = {"exec_holder": {"ex": ExPools(wo, pools)}}
+        st = type("S", (), {"pending": {"build": deque()}, "plan_ts": 0.0,
+                            "requests": deque(), "lock": __import__("threading").Lock()})()
+        return multiagent._build_event(ctx, st, {}, [], time.time(), g)
+
+    wo3 = [{"status": "pending", "action": "b_landFactory", "slot": "factory:0"},
+           {"status": "pending", "action": "b_landFactory", "slot": "factory:1"},
+           {"status": "pending", "action": "b_c_turret_t1", "slot": "defense:0"}]
+    p_home = [{"x": 100, "y": 100}]
+    p_new = [{"x": 100, "y": 100}, {"x": 500, "y": 500}]
+    g14 = {"last_fire": time.time()}  # 压住心跳，单测新池链路
+    assert evp(wo3, p_home, g14) is None, "首拍只建档不召唤"
+    r = evp(wo3, p_new, g14)
+    assert r and "新池安稳" in r and "(500,500)" in r, f"新池进安全集应召唤: {r}"
+    assert evp(wo3, p_new, g14) is None, "同一池集不重复召唤"
+    assert evp(wo3, p_home, g14) is None
+    assert evp(wo3, p_new, g14) is None, "池丢了再回来 10 分钟内也不重复召唤"
+    # 该池已有 pending 采集器工单在干 → 不召唤（防重复；坐标 slot 与 pool:k 两种写法都算）
+    g15 = {"last_fire": time.time()}
+    assert evp(wo3, p_home, g15) is None
+    wo_ext = wo3 + [{"status": "pending", "action": "b_extractorT1", "slot": [500, 500]}]
+    assert evp(wo_ext, p_new, g15) is None, "已有采集器坐标单盖住该池不应召唤"
+    g16 = {"last_fire": time.time()}
+    assert evp(wo3, p_home, g16) is None
+    wo_pool = wo3 + [{"status": "pending", "action": "b_extractorT1", "slot": "pool:1"}]
+    assert evp(wo_pool, p_new, g16) is None, "pool:k 在干工单盖住该池不应召唤"
+
+    # 15. 默认构成兜底（2026-07-26 问题1：无 LLM 构成时补水层也要按默认构成产兵）
+    #     根因：构成真空→reserve 恒挂升级款→⑦断产→兵力到不了蓄势门槛→死锁
+    ex15 = make_ex()  # 无任何 set_army_goal（零 LLM 输入）
+    assert ex15._default_composition() == {"u_c_tank": 8, "u_missileTank": 2}, \
+        f"默认构成=陆T1主战×8+防空~20%: {ex15._default_composition()}"
+    fac15 = {"id": 3, "t": "landFactory"}
+    act15 = ex15._next_production(fac15, [])
+    assert act15 == "u_missileTank", \
+        f"无 LLM 输入也应按默认构成产兵（c_tank 被 T2 过滤，missileTank 缺口2）: {act15}"
+    # LLM 构成优先级更高：一到即覆盖默认值
+    ex15.set_army_goal(composition={"u_plasmaTank": 5})
+    assert ex15._next_production(fac15, []) == "u_plasmaTank", "LLM 构成必须覆盖默认兜底"
+    # 储备线：默认构成未达七成→不挂升级款（修复前 ready 恒真→reserve=700+4500 压死平静期生产）
+    ex15b = make_ex()
+    own15 = [{"id": 9, "t": "landFactory", "bld": True, "x": 0, "y": 0, "hp": 1, "maxHp": 1}]
+    assert ex15b._military_reserve(own15) == exec_mod.FUNDS_RESERVE, \
+        f"默认构成缺口大时储备线不许挂升级款: {ex15b._military_reserve(own15)}"
+
+    # 16. 规则层主动侦察（2026-07-26 问题3：平静期+全黑→move 探路；冷却不重复；警报不派）
+    def mk_scout_ex():
+        ex = make_ex()
+        ex.autopilot = False
+        ex.routine = True
+        ex.routine_defense = False
+        fm = fog_mod.FogMap(MAP)
+        fm.update({"fogGrid": {"e": True, "f": False, "g": False,
+                               "rows": ["2x100"] * 100}})  # 全图全黑
+        ex.control.fog = fm
+        return ex
+
+    def scout_snap(enemy=None):
+        own = [{"id": 1, "t": "commandCenter", "bld": True, "q": 0,
+                "x": 1500, "y": 1000, "hp": 1, "maxHp": 1},
+               {"id": 5, "t": "c_tank", "x": 1500, "y": 1000, "hp": 1, "maxHp": 1}]
+        return {"tick": 100, "own": own, "allies": [], "enemy": enemy or [],
+                "team": {"id": 0, "funds": 0, "ai": False}, "delegated": [1, 5]}
+
+    ex16 = mk_scout_ex()
+    cmds16 = ex16.tick(scout_snap())
+    mv = [c for c in cmds16 if c["cmd"] == "move"]
+    assert len(mv) == 1 and mv[0]["units"] == "5" and not mv[0].get("action"), \
+        f"平静期+全黑应发 1 条纯 move 侦察（非 attackmove）: {cmds16}"
+    assert mv[0]["x"] < 1450, f"应朝敌向（front_dir=图心方向，-x）探: {mv[0]}"
+    assert not [c for c in ex16.tick(scout_snap()) if c["cmd"] == "move"], \
+        "45s 冷却内不得重复派侦察"
+    ex16b = mk_scout_ex()
+    snap_alert = scout_snap(enemy=[{"id": 9, "t": "tank", "x": 1800, "y": 1000}])
+    assert not [c for c in ex16b.tick(snap_alert) if c["cmd"] == "move"], \
+        "警报期（可见敌/danger）不得派侦察"
+
+    # 17. 按厂实际科技档（2026-07-26 §二十二：max_tech 不再被 pedia T1/T2 合并条目恒推 2）
+    # 17a. 回执学到 T1 表（可用列表无 T2 动作）→ T1 主战 c_tank 解锁可产
+    #      （修复前：pedia max 恒 2，c_tank 被永久滤死=实局纯防空军队的根）
+    ex17 = make_ex()
+    ex17.on_cmd_results([{"ok": False, "msg": "工厂#3 没有此动作: u_plasmaTank；可用: "
+                                              "u_builder,u_scout,u_c_tank,u_hoverTank,u_c_artillery"}])
+    assert 3 not in ex17.fac_upgraded, "可用列表无 T2 不得进 fac_upgraded"
+    act17 = ex17._next_production({"id": 3, "t": "landFactory"}, [])
+    assert act17 == "u_c_tank", f"学习表=T1 档：默认构成 c_tank 主战必须可产: {act17}"
+    # 17b. 升级单在途（回执 ok 不落地悬案）不得提前按 T2 产——仍是 c_tank
+    ex17.up_pending[3] = time.time()
+    act17b = ex17._next_production({"id": 3, "t": "landFactory"}, [])
+    assert act17b == "u_c_tank", f"升级在途不提前按 T2 产: {act17b}"
+    ex17.up_pending.clear()
+    # 17c. 回执实证 T2（可用列表含 T2 动作）→ fac_upgraded 永久免探，T1 主战滤掉只产 T2
+    ex17.on_cmd_results([{"ok": False, "msg": "工厂#3 没有此动作: u_heavyTank；可用: "
+                                              "u_c_tank,u_missileTank,u_heavyTank"}])
+    assert 3 in ex17.fac_upgraded, "可用列表含 T2 动作=实证已 T2，应进 fac_upgraded"
+    ex17.set_army_goal(composition={"u_c_tank": 8, "u_missileTank": 2})
+    act17c = ex17._next_production({"id": 3, "t": "landFactory"}, [])
+    assert act17c == "u_missileTank", f"实证 T2 后 T1 主战滤掉、只产 T2: {act17c}"
+
+    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一/新池召唤/默认构成兜底/主动侦察/按厂科技档 全部符合预期")
 
 
 if __name__ == "__main__":

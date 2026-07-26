@@ -397,7 +397,8 @@ class AgentLink:
         self.latest_snap = None
         self.fog_snap = None   # 最近一帧带迷雾附件的快照（附件 ~10s 一跳，latest_snap 0.5s 后就被普通帧冲掉）
         self.map_msg = None
-        self.map_version = 0  # 新对局（新地图消息）递增，pilot 据此重置上下文
+        self.map_version = 0  # 新对局（新地图消息/tick 回退）递增，pilot 据此重置上下文
+        self._last_tick = None  # 上一帧快照 tick（对局内单调递增；重开/读档归零重计=新对局铁证）
         self.pedia = None
         self.ai_control = {}
         self.cmd_results = deque(maxlen=20)
@@ -435,6 +436,7 @@ class AgentLink:
                         with self.lock:
                             if t == "snapshot":
                                 self.latest_snap = msg
+                                self._track_tick(msg)
                                 if "fogGrid" in msg or "ghosts" in msg:
                                     self.fog_snap = msg  # 迷雾附件单帧易逝，单独留存
                             elif t == "map":
@@ -473,6 +475,19 @@ class AgentLink:
                     os._exit(0)
                 print(f"[link] 断开 ({e})，2s 后重连")
                 time.sleep(2)
+
+    def _track_tick(self, msg):
+        """快照 tick 记账：严格回退（cur < last）即游戏内重开/读档——
+        同图重开 rows hash 不变、map 消息去重不触发重置，tick 归零才是铁证
+        （暂停 tick 冻结不动不算回退；重连补发同局 tick 不回退；首帧只建档）。"""
+        cur = msg.get("tick")
+        if cur is None:
+            return
+        if self._last_tick is not None and cur < self._last_tick:
+            self.map_version += 1  # 走既有 map_version 重置消费路径（pilot 主循环/multiagent 督导）
+            print(f"[link] 检测到对局重开（tick {self._last_tick}→{cur} 回退），上下文将重置")
+            log_activity("status", f"↻ 对局重开（tick {self._last_tick}→{cur}），AI 上下文重置")
+        self._last_tick = cur
 
     def snapshot(self):
         with self.lock:
@@ -902,6 +917,7 @@ def main():
         executor.autopilot = False
         executor.routine = bool(cfg.get("routine_layer", True))  # 规则快层：例行+炮塔弧跟随集结点
         executor.auto_production = bool(cfg.get("auto_production", True))  # 规则层自动补军工队列
+        executor.scout_enabled = bool(cfg.get("scout_enabled", True))  # 规则层主动侦察（问题3）
         import multiagent
         return multiagent.run({
             "link": link, "cfg": cfg, "api_key": api_key, "pedia": pedia,

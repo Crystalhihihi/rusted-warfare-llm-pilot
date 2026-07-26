@@ -223,4 +223,29 @@ assert multiagent._train_domain("landFactory train 110") == "build"
 assert multiagent._train_domain("动作当前不可用（科技/条件不满足）: extractorT2_0") == "build"
 
 print("闭环规则 ALL PASS")
+
+# ---- 同图重开检测：快照 tick 严格回退 → map_version 递增 ----
+# （游戏内重开同图 rows hash 不变、map 消息去重不触发重置，tick 归零重计才是铁证）
+lnk = pilot.AgentLink.__new__(pilot.AgentLink)  # 裸对象：不开 socket 线程，只测 _track_tick
+lnk._last_tick = None
+lnk.map_version = 1
+_orig_log = pilot.log_activity
+pilot.log_activity = lambda k, t: None  # 测试不污染 activity.jsonl
+try:
+    lnk._track_tick({"tick": 500})   # 首帧只建档
+    assert lnk.map_version == 1
+    lnk._track_tick({"tick": 500})   # 暂停冻结（不动）不算回退
+    assert lnk.map_version == 1
+    lnk._track_tick({"tick": 620})   # 对局内单调递增
+    assert lnk.map_version == 1
+    lnk._track_tick({})              # 缺 tick 字段忽略
+    assert lnk.map_version == 1
+    lnk._track_tick({"tick": 3})     # 重开/读档归零重计 → 新对局
+    assert lnk.map_version == 2, "tick 严格回退应触发 map_version 递增"
+    lnk._track_tick({"tick": 4})     # 新对局内递增不再触发
+    assert lnk.map_version == 2
+finally:
+    pilot.log_activity = _orig_log
+print("tick 回退检测 OK")
+
 print("ALL PASS")

@@ -28,4 +28,9 @@ bridge/delegation.json
 bridge/map.txt
 bridge/pilot.log
 tools/screen.png
+tools/replay-*.ndjson
+tools/replay-*-save.bin
+tools/_chart_llm_latency.png
+pilot.log
+/回放/
 docs/DATASETS.md
