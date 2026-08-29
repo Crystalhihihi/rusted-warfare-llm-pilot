@@ -29,6 +29,20 @@ through the normal queue, and everything is rate-limited to human-like APM.
 Engineering log and data assets: `PROGRESS.md` (bug history, playtest quotes, baselines)
 and `docs/DATASETS.md` (dataset index).
 
+## Screenshots
+
+![In-game AI console overlay: stance, force layout, JSON plan blocks and system event stream](docs/images/ingame-console.jpg)
+
+*In-game overlay: the commander's stance and layout reasoning, dispatched JSON plan blocks, and the rules-layer event stream*
+
+![Web dashboard: planbook, build work orders, squad missions and map understanding](docs/images/console-plan.jpg)
+
+*Browser dashboard (127.0.0.1:8321): the commander planbook, work-order execution, per-squad missions, and the three-state fog map*
+
+![Dashboard side by side with the game: the AI only sees what the team sees](docs/images/console-map.jpg)
+
+*Fairness made visible: the map panel renders only team-vision information; red dots are AI-visible enemies*
+
 ## Current status
 
 - The AI cannot yet reliably beat the highest-difficulty built-in AI; aggression, build

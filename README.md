@@ -1,6 +1,22 @@
+<div align="center">
+
 # Rusted Warfare LLM Pilot
 
+**把 LLM 接上《铁锈战争》的战场：无侵入实时取数，LLM 慢思考出意图，确定性层快执行。**
+
 中文 | **[English](README.en.md)**
+
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![Rusted Warfare](https://img.shields.io/badge/game-Rusted%20Warfare-8B4513)](https://rustedwarfare.com)
+[![单机研究](https://img.shields.io/badge/use-%E5%8D%95%E6%9C%BA%E7%A0%94%E7%A9%B6%E4%B8%93%E7%94%A8-red)](#合规声明)
+
+[实机画面](#实机画面) · [工作原理](#工作原理) · [快速开始](#快速开始) · [合规声明](#合规声明)
+
+![游戏内 AI 指挥台 overlay：攻防姿态、兵力布局、JSON 计划块与系统事件流](docs/images/ingame-console.jpg)
+
+*游戏内 overlay：总指挥的攻防姿态与布局判断、下发的 JSON 计划块、规则层事件流实时滚动*
+
+</div>
 
 > **实验阶段，严禁用于多人/联机对战。** 自动化操控在多人环境中违反公平竞技原则，
 > AI 的失误也会拖累队友。**仅限单机环境与本地逆向工程研究使用，因违规使用造成的一切后果由使用者自负。**
@@ -22,6 +38,16 @@
 
 工程记录见 `PROGRESS.md`（bug 实录、实测语录、基准数字）。
 数据集索引文档（`docs/DATASETS.md`）涉及回放来源信息，按脱敏纪律不公开发布。
+
+## 实机画面
+
+![网页总控台：作战计划书、建造工单、小队任务书与地图理解](docs/images/console-plan.jpg)
+
+*浏览器总控台（127.0.0.1:8321）：总指挥《作战计划书》、建造工单执行状态、各小队任务书与迷雾三态地图*
+
+![总控台与游戏画面并排：AI 所见即迷雾内的真实战场](docs/images/console-map.jpg)
+
+*公平性设计可见化：地图理解面板只呈现本队视野内信息，红点为 AI 可见敌情*
 
 ## 当前状态
 
