@@ -7,6 +7,8 @@ import time
 from collections import deque
 
 sys.path.insert(0, "bridge")
+import connmap
+import executor as exec_mod
 import multiagent
 
 
@@ -192,7 +194,108 @@ def main():
     multiagent._frontier_report_tick(ctx6b, st6b, snap6b)
     assert len(st6b.pending["commander"]) == 1, "10min 冷却内不重复呈报"
 
-    print("PASS test_combat_phase3：触发器/看门狗/去重放宽/清场上报/前沿战报 全部符合预期")
+    # 5. attackmove 目标连通域预检（②）：陆队隔水拦/换点；同域照常；空军不受限；海队判水域
+    # 图：70x50 格，x∈[600,800) 为贯通水带（左右两块陆域隔断）
+    rows5 = ["." * 30 + "~" * 10 + "." * 30 for _ in range(50)]
+    comp5, _n5 = connmap.build_components(rows5)
+    map5 = {"tileW": 20, "tileH": 20, "tilesW": 70, "tilesH": 50, "rows": rows5}
+    logs5 = []
+
+    def ctx5b():
+        return {"exec_holder": {"ex": None}, "clamp": lambda v, a, b: max(a, min(b, v)),
+                "log_activity": lambda k, t: logs5.append(t)}
+
+    def st5b(squads, **kw):
+        base = {"squads": squads, "world_w": 1400.0, "world_h": 1000.0, "map_msg": map5,
+                "conn_comp": comp5, "conn_wcomp": exec_mod.water_components(rows5),
+                "defeated": False, "mission_stale": False,
+                "pending": {"land": deque(), "air": deque(), "navy": deque()}}
+        base.update(kw)
+        return type("S", (), base)()
+
+    U5 = lambda i, x, y: {"id": i, "t": "c_tank", "hp": 100, "maxHp": 100, "x": x, "y": y}
+    # 5a. 小队指令：陆队（质心 300,500）打对岸 (1200,500) → 换可达近点（近岸格心 590,510）
+    stA = st5b({"L1": {"mission": None, "members": {1, 2}}})
+    cmd, desc = multiagent._translate_squad(ctx5b(), stA, "L1", "attack",
+                                            {"x": 1200, "y": 500}, {"own": [U5(1, 300, 500), U5(2, 300, 500)], "enemy": []}, {})
+    assert cmd and cmd["cmd"] == "attackmove" and (cmd["x"], cmd["y"]) == (590.0, 490.0), \
+        f"隔水目标应换可达近点: {cmd} {desc}"
+    assert any("换可达近点" in t for t in logs5), f"换点应记活动流: {logs5}"
+    # 5b. 同 comp 目标照常
+    logs5.clear()
+    cmd, desc = multiagent._translate_squad(ctx5b(), stA, "L1", "attack",
+                                            {"x": 400, "y": 500}, {"own": [U5(1, 300, 500), U5(2, 300, 500)], "enemy": []}, {})
+    assert cmd and (cmd["x"], cmd["y"]) == (400.0, 500.0), f"同域目标不许动: {cmd}"
+    assert not logs5, "同域不记活动流"
+    # 5c. 已在最近岸（590,510）仍打对岸 → 换不了：拦截+回执劝换目标（不进游戏）
+    stA2 = st5b({"L1": {"mission": None, "members": {1, 2}}})
+    cmd, desc = multiagent._translate_squad(ctx5b(), stA2, "L1", "attack",
+                                            {"x": 1200, "y": 500}, {"own": [U5(1, 590, 490), U5(2, 590, 490)], "enemy": []}, {})
+    assert cmd is None and "不可达" in desc and "换目标" in desc, f"换不了应拦截回执: {cmd} {desc}"
+    # 5d. 空军不受限（同坐标直接过）
+    stA3 = st5b({"A1": {"mission": None, "members": {3}}})
+    cmd, desc = multiagent._translate_squad(ctx5b(), stA3, "A1", "attack",
+                                            {"x": 1200, "y": 500}, {"own": [U5(3, 300, 500)], "enemy": []}, {})
+    assert cmd and (cmd["x"], cmd["y"]) == (1200.0, 500.0), f"空军恒真: {cmd}"
+    # 5e. 看门狗：不可达换近点代打；换不了任务作废+军种 pending 通报
+    class DM5:
+        def danger(self, x, y, snap=None):
+            return False
+    link5 = Link()
+    ctxW = {"link": link5, "log_activity": lambda k, t: logs5.append(t)}
+    stW = st5b({"L1": {"mission": {"任务": "attack", "目标": [1200.0, 500.0]},
+                       "members": {1, 2}, "last_act_ts": 0.0, "mission_ts": 0.0}},
+               danger_map=DM5())
+    multiagent._squad_watchdog(ctxW, stW, {"own": [U5(1, 300, 500), U5(2, 300, 500)]}, 1000.0)
+    assert any(m.get("cmd") == "attackmove" and (m["x"], m["y"]) == (590.0, 490.0)
+               for m in link5.sent), f"看门狗应代打可达近点: {link5.sent}"
+    assert stW.squads["L1"]["mission"] is not None, "换点代打不许作废任务"
+    link5.sent.clear()
+    stW2 = st5b({"L1": {"mission": {"任务": "attack", "目标": [1200.0, 500.0]},
+                        "members": {1, 2}, "last_act_ts": 0.0, "mission_ts": 0.0}},
+                danger_map=DM5())
+    multiagent._squad_watchdog(ctxW, stW2, {"own": [U5(1, 590, 490), U5(2, 590, 490)]}, 1000.0)
+    assert not link5.sent, "换不了不许代打进游戏"
+    assert stW2.squads["L1"]["mission"] is None and stW2.mission_stale, "换不了任务应作废待改派"
+    assert len(stW2.pending["land"]) == 1 and "不可达" in stW2.pending["land"][0], \
+        f"作废须通报军种中层: {list(stW2.pending['land'])}"
+    # 5f. 任务书目标校验（军种中层派单路径）：不可达换近点落盘；换不了该项拒绝
+    stM = st5b({"L1": {"mission": None, "members": {1, 2}},
+                "A1": {"mission": None, "members": {3}}})
+    snapM = {"own": [U5(1, 300, 500), U5(2, 300, 500), U5(3, 300, 500)]}
+    _c, desc = multiagent._translate_missions(
+        ctx5b(), stM, {"squads": [{"id": "L1", "任务": "attack", "目标": [1200, 500]},
+                                  {"id": "A1", "任务": "attack", "目标": [1200, 500]}]}, {}, snapM)
+    assert stM.squads["L1"]["mission"]["目标"] == [590.0, 490.0], f"任务书目标应换近点: {stM.squads['L1']['mission']}"
+    assert "换可达近点" in desc, f"desc 应告知换点: {desc}"
+    assert stM.squads["A1"]["mission"]["目标"] == [1200.0, 500.0], "空军任务书目标不动"
+    stM2 = st5b({"L1": {"mission": None, "members": {1, 2}}})
+    _c, desc = multiagent._translate_missions(
+        ctx5b(), stM2, {"squads": [{"id": "L1", "任务": "attack", "目标": [1200, 500]}]}, {},
+        {"own": [U5(1, 590, 490), U5(2, 590, 490)]})
+    assert stM2.squads["L1"]["mission"] is None and "不可达" in desc, f"换不了应拒绝并回执: {desc}"
+    # 5g. 海队判水域 comp：两湖隔断，N1 在湖1 打湖2 → 换湖1 近岸点；同湖目标照常
+    rows7 = [list("." * 70) for _ in range(50)]
+    for gy in range(10, 20):
+        for gx in range(10, 20):
+            rows7[gy][gx] = "~"  # 湖1
+    for gy in range(30, 40):
+        for gx in range(30, 40):
+            rows7[gy][gx] = "~"  # 湖2
+    rows7 = ["".join(r) for r in rows7]
+    map7 = {"tileW": 20, "tileH": 20, "tilesW": 70, "tilesH": 50, "rows": rows7}
+    stN = st5b({"N1": {"mission": None, "members": {5}}})
+    stN.map_msg = map7
+    stN.conn_wcomp = exec_mod.water_components(rows7)
+    boat = {"id": 5, "t": "gunBoat", "hp": 100, "maxHp": 100, "x": 300, "y": 300}  # 湖1 内
+    cmd, desc = multiagent._translate_squad(ctx5b(), stN, "N1", "attack",
+                                            {"x": 700, "y": 700}, {"own": [boat], "enemy": []}, {})
+    assert cmd and (cmd["x"], cmd["y"]) == (390.0, 390.0), f"跨湖目标应换本湖近岸点: {cmd} {desc}"
+    cmd, desc = multiagent._translate_squad(ctx5b(), stN, "N1", "attack",
+                                            {"x": 250, "y": 250}, {"own": [boat], "enemy": []}, {})
+    assert cmd and (cmd["x"], cmd["y"]) == (250.0, 250.0), f"同湖目标照常: {cmd}"
+
+    print("PASS test_combat_phase3：触发器/看门狗/去重放宽/清场上报/前沿战报/目标连通域预检 全部符合预期")
 
 
 if __name__ == "__main__":

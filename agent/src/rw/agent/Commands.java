@@ -328,6 +328,7 @@ public final class Commands {
         try {
             actionIdClass = Class.forName("com.corrodinggames.rts.game.units.a.c");
             actionIdOf = actionIdClass.getMethod("a", String.class);
+            actionIdOf.setAccessible(true); // 该类可能包私有（反射加载、编译期不可见）
             eSetAction = e.class.getMethod("a", actionIdClass);
             eSetActionAt = e.class.getMethod("a", actionIdClass, PointF.class, am.class);
             Log.info("action-id reflection ok");
@@ -345,6 +346,15 @@ public final class Commands {
         } else {
             eSetAction.invoke(cmdObj, actId);
         }
+    }
+
+    /** 反射调用目标可能属于包私有游戏类（如 units.d.u）的 public 方法：
+     *  Java 规则下 invoke 前必须 setAccessible(true)，否则 IllegalAccessException。
+     *  对已是 public 的类，setAccessible 是 no-op。 */
+    private static Object invokePub(Object target, String name, Class<?>[] sig, Object... args) throws Exception {
+        java.lang.reflect.Method m = target.getClass().getMethod(name, sig);
+        m.setAccessible(true);
+        return m.invoke(target, args);
     }
 
     // ---- build / train / rally ----
@@ -478,7 +488,7 @@ public final class Commands {
         }
         action = resolvedB;
         Object actOnB = lookupAction(builder, action);
-        Boolean availB = (Boolean) actOnB.getClass().getMethod("b", am.class).invoke(actOnB, builder);
+        Boolean availB = (Boolean) invokePub(actOnB, "b", new Class<?>[]{am.class}, builder);
         if (availB == null || !availB) {
             reply(false, cmd, "动作当前不可用（科技/条件不满足）: " + action);
             return;
@@ -540,7 +550,7 @@ public final class Commands {
         }
         action = resolvedT;
         Object actOnUnit = lookupAction(fac, action);
-        Boolean avail = (Boolean) actOnUnit.getClass().getMethod("b", am.class).invoke(actOnUnit, fac);
+        Boolean avail = (Boolean) invokePub(actOnUnit, "b", new Class<?>[]{am.class}, fac);
         if (avail == null || !avail) {
             reply(false, cmd, "动作当前不可用（科技/条件不满足）: " + action);
             return;
@@ -626,7 +636,7 @@ public final class Commands {
         int count = 0;
         for (Object a : u.N()) {
             try {
-                String id = (String) a.getClass().getMethod("O").invoke(a);
+                String id = (String) invokePub(a, "O", new Class<?>[0]);
                 if (id == null) {
                     continue;
                 }
@@ -642,7 +652,7 @@ public final class Commands {
 
     private static Object lookupAction(am u, String actionId) throws Exception {
         Object actId = actionIdOf.invoke(null, actionId);
-        return u.getClass().getMethod("a", actionIdClass).invoke(u, actId);
+        return invokePub(u, "a", new Class<?>[]{actionIdClass}, actId);
     }
 
     private static String availableActions(am u, int cap) {
@@ -651,7 +661,7 @@ public final class Commands {
             int n = 0;
             for (Object a : u.N()) {
                 try {
-                    String id = (String) a.getClass().getMethod("O").invoke(a);
+                    String id = (String) invokePub(a, "O", new Class<?>[0]);
                     if (id == null || id.isEmpty() || id.charAt(0) == '<') {
                         continue;
                     }
@@ -715,7 +725,7 @@ public final class Commands {
             java.util.ArrayList acts = u.N();
             for (Object a : acts) {
                 try {
-                    sb.append((String) a.getClass().getMethod("O").invoke(a)).append(',');
+                    sb.append((String) invokePub(a, "O", new Class<?>[0])).append(',');
                 } catch (Throwable ignored) {
                 }
             }

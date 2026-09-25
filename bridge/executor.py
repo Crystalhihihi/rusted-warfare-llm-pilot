@@ -54,6 +54,38 @@ SCOUT_PREF = ("scout", "lightGunship", "interceptor", "hoverTank")  # 侦察优�
 MAX_CMDS_PER_TICK = 4      # 每拍指令上限（2 会被经济/升级占满，生产饿死）
 ACTION_COOLDOWN = 2.0      # 同类指令最小间隔
 UPGRADE_COOLDOWN = 30.0    # 同一建筑升级冷却
+FAC_GRID = 40              # 工厂位点格化粒度(px)：升级换代(T1→T2)游戏换发新 id，厂不挪窝
+POOL_RESOLVE_GRACE = 45.0  # pool: 槽位解析失败宽限（秒）：开局首拍安全池是冷启动瞬态
+#                            （CC 未入 factories/secured 需持续 20s），立即判死会把开局经济单
+#                            全灭在热身期——保持 pending 逐拍重试，连续失败满 45s 才判 failed
+
+
+def fac_key(t, x, y):
+    """工厂位点键 = (类型, 格化坐标)：升级相关知识按位点继承，不按会换代的单位 id。"""
+    return (t, int(x // FAC_GRID), int(y // FAC_GRID))
+
+
+def water_components(rows):
+    """水域连通域（connmap 陆域同款洪水填充，走 "~"）：海上单位可达性判定用。"""
+    h = len(rows)
+    w = len(rows[0]) if h else 0
+    comp = [[-1] * w for _ in range(h)]
+    n = 0
+    for y in range(h):
+        for x in range(w):
+            if rows[y][x] != "~" or comp[y][x] >= 0:
+                continue
+            stack = [(x, y)]
+            comp[y][x] = n
+            while stack:
+                cx, cy = stack.pop()
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < w and 0 <= ny < h and rows[ny][nx] == "~" and comp[ny][nx] < 0:
+                        comp[ny][nx] = n
+                        stack.append((nx, ny))
+            n += 1
+    return comp
 
 
 def _is_builder(u):
@@ -133,13 +165,16 @@ class Executor:
         self.stance = "expand"
         self.action_bad = {}           # 动作 -> 解封时间（None=永久：ID不存在；限时=科技未达，120s重试）
         self.fac_action_bad = {}       # (工厂id, 动作) -> 解封时间：该厂当前产不了（T1 被下 T2 单），120s 重试
-        self.fac_avail = {}            # 工厂id -> (可用动作集合, 学到时刻)：从"没有此动作"回执的可用列表学习；120s 过期防升级后卡死
-        self.fac_upgraded = set()      # 已 T2 的工厂 id（可用列表含 T2 兵）——升级轨永久跳过，不再每 120s 探针
+        self.fac_avail = {}            # (类型,格化坐标) -> (可用动作集合, 学到时刻)：从"没有此动作"回执的可用列表学习；120s 过期防升级后卡死
+        self.fac_upgraded = set()      # 已 T2 的工厂位点键（可用列表含 T2 兵实证/换代继承）——升级轨永久跳过，不再每 120s 探针
+        self.fac_pos = {}              # 上拍工厂 id -> (类型,x,y)：换代检测（旧 id 消失+同位新厂）用
+        self.fac_mem = {}              # 工厂 id -> (类型,x,y) 长记忆：换代/被毁后回执归位与 train 重解析仍知旧 id 机型位点
         self.cool = {}                 # 冷却：键 -> 到期时间
         self.rallied = set()           # 已设过集结点的工厂 id
         self.issued_builds = []        # [(建筑类型, 到期时间)] 刚下单、实体未出现的窗口期，防重复下单
         self.issued_cells = {}         # 类型 -> [(x, y, 到期时间)] 在途建筑占位（槽位网格用）
         self._comp = None              # 陆地连通域缓存（connmap，可达性判定用）
+        self._wcomp = None             # 水域连通域缓存（builderShip 落点可达性判定用，地图不变懒建）
         self.custom_builds = []        # LLM 指定建造队列 [(action, x, y)]
         # 建造工单（BuilderManager）：有序建造任务队列，规则层调度建造者连干
         # 任务 = {"action": str, "slot": spec, "status": pending/assigned/done/failed,
@@ -173,6 +208,9 @@ class Executor:
         self.squad_ids = set()          # 小队成员 id 集（multiagent 注入）：侦察优先派非小队成员
         self.move_type = {u["name"]: u.get("move") for u in (pedia or {}).get("units", [])}
         self.routine = False            # 多 agent 模式的规则快层：例行（建造者/采集器）2s 级执行
+        self.cli_mode = False           # 架构二期新循环（cliloop）：_routine_tick 只跑
+        #                                 工单调度/①建造者/②采集器/⑦显式构成生产；
+        #                                 ①.5/③/③.5/③.7/④/⑤/⑥/⑧ 与默认构成补水全跳（旧模式 false 行为不变）
         self.routine_defense = True     # 脚本自动防线（防线弧/池点哨戒/前线哨戒/内圈维修湾）——
         #                                 用户 2026-07-25 拍板取消（"实在太乱"）：防御只听计划书/阵地单
         self.naval = None               # 水图判定（lazy）：水域占比>=20% 或 水池>=2
@@ -204,6 +242,40 @@ class Executor:
             if hov:
                 return hov
         return idle_builders[0]
+
+    def _fac_track(self, own):
+        """随拍维护工厂 id→(类型,坐标) 映射 + 升级换代继承：
+        T1→T2 游戏换发新单位 id（类型名不变只换动作表），按 id 学的升级知识全落空——
+        旧 id 消失+同位(≤40px)同类型新厂出现=换代，新位点直接标 upgraded（零学费）；
+        换代后旧格可用表（T1 档）作废，等回执按新厂重学。"""
+        cur = {}
+        for u in own:
+            t = u["t"]
+            if not u.get("bld") or "actory" not in t.lower() or "editor" in t.lower():
+                continue  # editorOrBuilder 等脏东西不收（与 _is_builder 的 editor 排除同口径）
+            cur[u["id"]] = (t, u["x"], u["y"])
+        prev = self.fac_pos
+        for fid, (t, x, y) in cur.items():
+            if fid in prev:
+                continue
+            gone = next(((ot, ox, oy) for ofid, (ot, ox, oy) in prev.items()
+                         if ofid not in cur and ot == t
+                         and abs(ox - x) <= FAC_GRID and abs(oy - y) <= FAC_GRID), None)
+            if gone:
+                self.fac_avail.pop(fac_key(t, x, y), None)
+                self.fac_avail.pop(fac_key(*gone), None)
+                self.fac_upgraded.add(fac_key(t, x, y))
+                self.log("status", f"⚙ 厂#{fid} 换代继承（{t} @{int(x)},{int(y)}）："
+                                   "旧 id 消失同位新厂，位点标 T2 永久免探")
+        self.fac_pos = cur
+        self.fac_mem.update(cur)
+
+    def _fac_key(self, fac):
+        """工厂位点键：带坐标的单位 dict 直接算；只有 id+t 的摘要 dict 回退 fac_mem 长记忆。"""
+        if fac.get("x") is not None and fac.get("y") is not None:
+            return fac_key(fac["t"], fac["x"], fac["y"])
+        fp = self.fac_mem.get(fac["id"])
+        return fac_key(*fp) if fp else None
 
     # ---------- LLM 目标接口 ----------
     def set_work_order(self, tasks, snap=None):
@@ -456,14 +528,26 @@ class Executor:
                     continue
                 spot = self._wo_resolve(t, snap, cc, safe_pools, occ)
                 if not spot:
+                    if isinstance(t["slot"], str) and t["slot"].startswith("pool:"):
+                        # pool: 独有热身期瞬态（开局物化首拍 CC 未入列/secured 需持续 20s，
+                        # safe_pools=0 是暂时态）——宽限重试：保持 pending 逐拍再试，
+                        # 连续失败满 POOL_RESOLVE_GRACE(45s) 才判死；misc:/factory:/defense:/
+                        # 坐标单无此瞬态，维持立即 failed（见下）。
+                        # 注：set_work_order 全量替换只并回 assigned 任务——pending 任务被新单
+                        # 换掉即丢弃（_pool_fail0 随之清零），重新下单=重新计宽限，语义正确。
+                        t.setdefault("_pool_fail0", now)
+                        if now - t["_pool_fail0"] < POOL_RESOLVE_GRACE:
+                            if now - t.get("_pool_fail_log", 0) > 20:  # 节流：20s 一条
+                                t["_pool_fail_log"] = now
+                                self.log("note", f"⚙ {t['slot']} 解析暂失败：安全池共{len(safe_pools)}个"
+                                                 "（热身期/迷雾卡闸/威胁未清），宽限重试中")
+                            continue
+                        t["status"] = "failed"
+                        t["note"] += f"|槽位解析失败（安全池共{len(safe_pools)}个，宽限45s已尽）"
+                        continue
                     t["status"] = "failed"
                     t["note"] += "|槽位解析失败"
-                    if isinstance(t["slot"], str) and t["slot"].startswith("pool:"):
-                        # 无声失败曾是全灭盲区（Dividing_River 工单 3/3 失败零归因）
-                        t["note"] += f"（安全池共{len(safe_pools)}个）"
-                        self.log("note", f"⚙ {t['slot']} 解析失败：安全池仅{len(safe_pools)}个"
-                                         "（迷雾卡闸/威胁未清/家圈有敌）")
-                    elif isinstance(t["slot"], str) and t["slot"].startswith("misc:"):
+                    if isinstance(t["slot"], str) and t["slot"].startswith("misc:"):
                         t["note"] += "（背后排满/出界，含 idx=0 降级）"
                         self.log("note", f"⚙ {t['slot']} 解析失败：基地背后排满或出界（制造仪农场局）")
                     continue
@@ -545,6 +629,30 @@ class Executor:
                 elif danger(spot[0], spot[1], 400):
                     t["status"] = "failed"
                     t["note"] += "|点位危险"
+                    continue
+                # 落点可达性预检（④a）：派单前校验"领单建造者能走到目标 85px 内"——
+                # agent 侧硬闸（无法靠近=水域/隔断），此前派了才吃回执空转。
+                # 顺排领单者够不着 → 按 _mobile_builder 哲学换可达建造者直派（悬浮/同域）；
+                # 换不了 → 留 pending 带原因（不判死不 site_bad 毒化，等悬浮/新建造者上线）
+                if idle_builders and not self._buildable85(idle_builders[0], spot[0], spot[1]):
+                    alt = next((u for u in idle_builders
+                                if self._buildable85(u, spot[0], spot[1])), None)
+                    if alt is None:
+                        if "|建造者无法靠近" not in t["note"]:
+                            t["note"] += "|建造者无法靠近目标85px（水域/隔断），留单等可达建造者"
+                            self.log("note", f"⚙ 工单 {t['action']}@{int(spot[0])},{int(spot[1])} "
+                                             "建造者无法靠近85px内（水域/隔断），留单等可达建造者")
+                        continue
+                    if emit({"cmd": "build", "action": t["action"], "builder": alt["id"],
+                             "x": float(spot[0]), "y": float(spot[1])},
+                            f"wo:{t['wo_id']}:{alt['id']}", 3.0):
+                        t["status"] = "assigned"
+                        t["builder"] = alt["id"]
+                        t["ts"] = now
+                        t["x"], t["y"] = float(spot[0]), float(spot[1])
+                        t["note"] += "|可达建造者接手"
+                        idle_builders[:] = [u for u in idle_builders if u["id"] != alt["id"]]  # 原地消耗：同拍各段共享
+                        funds_left -= price
                     continue
                 batch.append((t, spot, price))
                 funds_left -= price
@@ -646,7 +754,10 @@ class Executor:
         2026-07-26 问题1 根治：构成只能由战斗/军种 LLM 设，平静期军种中层零召唤
         （multiagent._branch_event"无兵无队零召唤"条款）→ 构成永远空 →
         _military_reserve 的 ready 恒真 → 储备线挂 4500 升级款 → ⑦ 长期断产 →
-        兵力到不了蓄势门槛(≥8) → 死锁（实局指挥 note："中盘仍无地面战力"）。默认构成只在真空生效。"""
+        兵力到不了蓄势门槛(≥8) → 死锁（实局指挥 note："中盘仍无地面战力"）。默认构成只在真空生效。
+        cli 模式（架构二期）：只认显式 composition（任务单/总指挥设置），默认构成补水取消。"""
+        if self.cli_mode:
+            return self.army_goal["composition"]
         return self.army_goal["composition"] or self._default_composition()
 
     def _default_composition(self):
@@ -704,15 +815,19 @@ class Executor:
             if m:
                 # 按厂封禁（回执带厂号）：T1 厂被下 T2 单只封该厂，120s 后重试（升级后放行）；
                 # 同时学走该厂真实可用动作表——比逐个动作试错快一档，打地鼠式刷屏的根治
+                # （① 落账改按 (类型,格化坐标) 位点键：厂升级换代换 id 不挪窝，知识跟着位点走）
                 fid = int(m.group(1))
                 self.fac_action_bad[(fid, m.group(2))] = time.time() + 120
                 if m.group(3):
                     avail_set = set(m.group(3).split(","))
-                    self.fac_avail[fid] = (avail_set, time.time())
-                    if any(self.action_tech.get(a, 1) >= 2 for a in avail_set):
-                        self.fac_upgraded.add(fid)  # 可用列表含 T2 兵=已是 T2，升级轨永久免探
-                        self.up_tries.pop(fid, None)   # 升级落地：清空转/让路窗口
-                        self.up_pending.pop(fid, None)
+                    fp = self.fac_mem.get(fid)
+                    if fp:
+                        fkey = fac_key(*fp)
+                        self.fac_avail[fkey] = (avail_set, time.time())
+                        if any(self.action_tech.get(a, 1) >= 2 for a in avail_set):
+                            self.fac_upgraded.add(fkey)  # 可用列表含 T2 兵=已是 T2，升级轨永久免探
+                            self.up_tries.pop(fid, None)   # 升级落地：清空转/让路窗口
+                            self.up_pending.pop(fid, None)
                 self.log("status", f"⚙ 厂#{fid} 无此动作，120s后重试: {m.group(2)}")
                 continue
             m = re.search(r"没有此动作[:：]\s*([A-Za-z0-9_]+)", msg)
@@ -784,6 +899,7 @@ class Executor:
         self.issued_builds = [e for e in self.issued_builds if e[1] > now]
         cmds = []
         own = snap.get("own", [])
+        self._fac_track(own)  # ① 升级换代继承：工厂 id→位点映射随拍维护（110 学费按位点不交第二发）
         funds = (snap.get("team") or {}).get("funds", 0)
         mw = (self.map.get("tilesW", 0) or 0) * (self.map.get("tileW", 0) or 0)
         mh = (self.map.get("tilesH", 0) or 0) * (self.map.get("tileH", 0) or 0)
@@ -1129,8 +1245,8 @@ class Executor:
             if funds < need:
                 return
             for u in units:
-                if u["id"] in self.fac_upgraded:
-                    continue  # 已 T2（可用列表含 T2 兵学来的），不再探升级
+                if fac_key(u["t"], u["x"], u["y"]) in self.fac_upgraded:
+                    continue  # 已 T2（可用列表含 T2 兵学来/换代继承），不再探升级
                 if self._upgrade_pending(u["id"], now):
                     continue  # 升级在途 60s 内不重发（自打断疑云：上一发没落地又来一发）
                 up = self.upgrade_action.get(u["t"])
@@ -1274,7 +1390,8 @@ class Executor:
                 emit({"cmd": "train", "action": "u_builder", "factory": cc["id"]}, "train:cc")
         # ①.5 战斗工程师（HOVER 过水过岩浆）：只从实验系厂产（tech2——landFactory 可用表
         #     没有 u_combatEngineer，实测 T1 陆厂刷失败；builderShip 才是水图前期答案）
-        if cc:
+        #     cli 模式跳过（工程师自补归任务单/中层）
+        if cc and not self.cli_mode:
             ce_count = sum(1 for u in own if u["t"] == "combatEngineer")
             ce_target = 3 if self.is_naval_map() else 2
             ce_facs = [u for u in factories if "experimental" in u["t"].lower()]
@@ -1330,7 +1447,8 @@ class Executor:
         else:
             tur_action, need, back = "b_c_turret_t1", 1600, 0
         t_cap = min(10, 2 + int(funds // 10000))  # 防线是大工程：2 座起步，资金每万 +1，上限 10
-        if (self.routine_defense and land_factories and funds >= need and n < t_cap
+        # cli 模式跳过整段自动防线（防线只认计划书/阵地单/中层任务单）
+        if (not self.cli_mode and self.routine_defense and land_factories and funds >= need and n < t_cap
                 and idle_builders and not self._bad(tur_action, now) and cc and mw and mh):
             anchor = self.army_goal.get("rally")
             tx, ty = anchor if anchor else (mw / 2, mh / 2)
@@ -1354,7 +1472,7 @@ class Executor:
         # 内圈维修湾（网格版：主线后 6 格）：≥2 座炮塔后配，cap 2
         bays = sum(1 for u in own if u["t"] == "repairbay" and u.get("bld"))
         bay_inflight = sum(1 for t, _ in self.issued_builds if t == "repairbay")
-        if (self.routine_defense and land_factories and n >= 2 and bays + bay_inflight < 2
+        if (not self.cli_mode and self.routine_defense and land_factories and n >= 2 and bays + bay_inflight < 2
                 and funds >= 2600 and idle_builders and not self._bad("b_repairbay", now) and cc and mw and mh):
             anchor = self.army_goal.get("rally")
             tx, ty = anchor if anchor else (mw / 2, mh / 2)
@@ -1368,8 +1486,8 @@ class Executor:
                                "x": float(spot[0]), "y": float(spot[1])}, f"build:bay:{b['id']}", 8.0):
                     idle_builders[:] = [x for x in idle_builders if x["id"] != b["id"]]
 
-        # ③.5 池点哨戒：家圈(>600px)外的采集器各配 1 座炮塔护矿（远池不再裸奔）
-        if self.routine_defense and cc and idle_builders and funds >= 1600:
+        # ③.5 池点哨戒：家圈(>600px)外的采集器各配 1 座炮塔护矿（远池不再裸奔）；cli 模式跳过
+        if not self.cli_mode and self.routine_defense and cc and idle_builders and funds >= 1600:
             for ext in [u for u in ext_done
                         if (u["x"] - cc["x"]) ** 2 + (u["y"] - cc["y"]) ** 2 > 600 ** 2]:
                 if not self.control.secured(ext["x"], ext["y"], now):
@@ -1393,8 +1511,9 @@ class Executor:
                     break
 
         # ③.7 海军链路（水图限定，autopilot 同款移植——此前整段死在 autopilot 里，
-        #      多 agent 模式从不见天日，"海军压根没碰过"的病根）：海厂落地→产 builderShip→水池采集
-        if self.is_naval_map():
+        #      多 agent 模式从不见天日，"海军压根没碰过"的病根）：海厂落地→产 builderShip→水池采集；
+        #      cli 模式跳过（海军链路等中层任务单）
+        if not self.cli_mode and self.is_naval_map():
             if now >= self.cool.get("naval:dbg", 0):  # TODO 临时诊断：海厂不发的逐项原因，查明后删
                 self.cool["naval:dbg"] = now + 30
                 self.log("status", f"⚙ 海军诊断: ext_done={len(ext_done)} idle={len(idle_builders)} "
@@ -1439,11 +1558,11 @@ class Executor:
                         f"build:wext:{nb['id']}", 8.0):
                     self._wext_issued = now + 45.0
 
-        # ④ 工厂：首座陆厂 + 按资金扩到 3 座（工单里有工厂任务时避让）
+        # ④ 工厂：首座陆厂 + 按资金扩到 3 座（工单里有工厂任务时避让）；cli 模式跳过（扩厂只认工单）
         facs = [u for u in factories if u["t"] != "commandCenter"]
         fac_inflight = sum(1 for t, _ in self.issued_builds if "actory" in t)
         fac_want = min(3, 1 + int(funds // 4000))
-        if (len(ext_done) >= 2 and len(facs) + fac_inflight < fac_want
+        if (not self.cli_mode and len(ext_done) >= 2 and len(facs) + fac_inflight < fac_want
                 and not any(self._wo_pending(p) for p in ("b_landFactory", "b_airFactory", "b_mechFactory"))
                 and funds >= 700 and idle_builders and cc and not self._bad("b_landFactory", now)):
             occ4 = self._occupancy(snap)
@@ -1468,8 +1587,8 @@ class Executor:
             if funds < need:
                 return
             for u in units:
-                if u["id"] in self.fac_upgraded:
-                    continue  # 已 T2（可用列表含 T2 兵学来的），不再探升级
+                if fac_key(u["t"], u["x"], u["y"]) in self.fac_upgraded:
+                    continue  # 已 T2（可用列表含 T2 兵学来/换代继承），不再探升级
                 if self._upgrade_pending(u["id"], now):
                     continue  # 升级在途 60s 内不重发（自打断疑云：上一发没落地又来一发）
                 up = self.upgrade_action.get(u["t"])
@@ -1493,15 +1612,16 @@ class Executor:
                                          "判死 2 分钟（疑似资金不足/机制不吃）")
                 return
 
-        _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
-                      and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))
-                      and "overclocked" not in u["t"] and "reinforced" not in u["t"]], 3200)
-        _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
-                      and "actory" in u["t"].lower()], 4500)
+        if not self.cli_mode:  # ⑤ 升级：cli 模式跳过（升级只认任务单/中层 train 动作）
+            _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                          and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))
+                          and "overclocked" not in u["t"] and "reinforced" not in u["t"]], 3200)
+            _try_upgrade([u for u in own if u.get("bld") and not _constructing(u)
+                          and "actory" in u["t"].lower()], 4500)
 
         # ⑥ 前线哨戒：集结点离家 >900 时在其旁起炮塔（前线占领区要有防御，不是乱逛）
         rally = self.army_goal.get("rally")
-        if (self.routine_defense and rally and cc and mw and mh and land_factories and funds >= 1600
+        if (not self.cli_mode and self.routine_defense and rally and cc and mw and mh and land_factories and funds >= 1600
                 and idle_builders and not self._bad("b_c_turret_t1", now)):
             d_home = math.hypot(rally[0] - cc["x"], rally[1] - cc["y"])
             fwd = [u for u in own if "turret" in u["t"].lower() and u.get("bld")
@@ -1522,8 +1642,10 @@ class Executor:
         #    战斗 LLM 的 produce 条目=定向猛造例外通道，补水经 produce_focus 让路防撞车。
         # 预算仲裁（治"工厂一直下单、没钱升级/建造"）：军事只花盈余，储备线见 _military_reserve；
         # ⑤ 在 ⑦ 前拍，钱到线先拿升级，军建不再互抢。
+        # cli 模式：只认显式 composition（任务单/总指挥设置）；构成真空=不产（默认构成补水取消）
+        prod_on = self.auto_production and (self.army_goal.get("composition") or not self.cli_mode)
         reserve = self._military_reserve(own)
-        for fac in ([u for u in factories if u["t"] != "commandCenter"] if self.auto_production else []):
+        for fac in ([u for u in factories if u["t"] != "commandCenter"] if prod_on else []):
             if self._q(fac, now) >= QUEUE_MAX:
                 continue
             if funds < reserve:
@@ -1543,7 +1665,8 @@ class Executor:
         #    空闲战斗单位（优先非小队成员 + SCOUT_PREF 快兵种），move（非 attackmove，
         #    纯探路不恋战）到朝敌方向最近全黑格；受击保命归 reflex 层，这里不重复造；
         #    派单走与其他段一致的 emit/冷却/委托口径，同一单位 45s 内不重复派。
-        if self.scout_enabled and cc and now - self.last_scout >= SCOUT_INTERVAL:
+        #    cli 模式跳过（侦察改任务单/中层 mission）
+        if not self.cli_mode and self.scout_enabled and cc and now - self.last_scout >= SCOUT_INTERVAL:
             fog = self.control.fog
             if (fog is not None and fog.fresh() and fog.enabled() and fog.rows
                     and not snap.get("enemy") and not danger(cc["x"], cc["y"])):
@@ -1835,6 +1958,57 @@ class Executor:
             return True
         return connmap.comp_at(self._comp, x, y, tw, th) == home_c
 
+    def _builder_domain(self, u):
+        """建造者行走域（落点可达性预检口径，与 _mobile_builder 挑人同哲学）：
+        water=海上建造者（builderShip，水域连通域判）；hover=悬浮/战斗工程师（过水过岩浆，
+        预检放行）；其余=land（陆连通域判）。pedia move 域优先，无名单位回退类型名。"""
+        mv = (self.move_type.get(u["t"]) or "").upper()
+        if mv == "WATER" or u["t"] == "builderShip":
+            return "water"
+        if mv == "HOVER" or u["t"] == "combatEngineer" or "hover" in u["t"].lower():
+            return "hover"
+        return "land"
+
+    def _buildable85(self, u, x, y):
+        """建造者能否走到目标 85px 内（agent 派单硬闸"无法靠近目标85px内（水域/隔断）"的
+        桥侧预检）：行走域连通域内存在距目标 ≤85px(+1格量化冗余) 的格即放行；
+        无地图数据/建造者不在可走格（贴边/施工中）不拦——拦错比漏拦糟，交游戏原生判定。"""
+        dom = self._builder_domain(u)
+        if dom == "hover":
+            return True
+        rows = self.map.get("rows") or []
+        if dom == "water":
+            if self._wcomp is None:
+                self._wcomp = water_components(rows)
+            comp = self._wcomp
+        else:
+            if self._comp is None:
+                self._comp = connmap.build_components(rows)[0] if rows else []
+            comp = self._comp
+        if not comp:
+            return True
+        tw, th = self._tw()
+        home = connmap.comp_at(comp, u["x"], u["y"], tw, th)
+        if home < 0:
+            return True
+        _pt, d = connmap.path_hint(comp, home, x, y, tw, th)
+        return _pt is not None and d <= 85.0 + th
+
+    def resolve_factory(self, fid, snap):
+        """train 厂 id 重解析（④b）：先按当前快照核 id；不存在/不归己 → 按"同类型+距旧位
+        最近"重绑定（厂升级换代/被毁后，LLM 拿摘要里的旧 #id 下单的根治）；绑不了 None。"""
+        own = snap.get("own", [])
+        fac = next((u for u in own if u["id"] == fid and u.get("bld")), None)
+        if fac is not None:
+            return fac
+        old = self.fac_mem.get(fid)
+        if not old:
+            return None
+        same = [u for u in own if u.get("bld") and u["t"] == old[0] and not _constructing(u)]
+        if not same:
+            return None
+        return min(same, key=lambda u: (u["x"] - old[1]) ** 2 + (u["y"] - old[2]) ** 2)
+
     def _in_lane(self, cc, x, y, half=200.0):
         """点是否压在主通道上（基地→前线方向 ±half px 走廊、前方 80~1400px 段）。
         建筑堵通道=部队绕路/集结卡死，落点统一过此闸。"""
@@ -1888,7 +2062,7 @@ class Executor:
                            for a, tg in comp.items())
             ready = deficit_ / total_ <= 0.3
         up_due = 0
-        if ready:
+        if ready and not self.cli_mode:  # cli 模式⑤自动升级已跳（升级只认任务单/LLM），不攒升级款
             now_ = time.time()
 
             def _upgradable(u):
@@ -1900,7 +2074,8 @@ class Executor:
                             and now_ < self.upgrade_bad[(u["id"], up)])
 
             if any(u.get("bld") and "actory" in u["t"].lower() and not _constructing(u)
-                   and u["id"] not in self.fac_upgraded and _upgradable(u) for u in own):
+                   and fac_key(u["t"], u["x"], u["y"]) not in self.fac_upgraded
+                   and _upgradable(u) for u in own):
                 up_due = 4500
             elif any(u.get("bld") and not _constructing(u)
                      and (u["t"].startswith("extractor") or u["t"].startswith("fabricator"))
@@ -1911,8 +2086,10 @@ class Executor:
 
     def _upgrade_pending(self, fid, now):
         """升级窗口判定：升级单已发未满 60s 且未学成 T2——⑦ 应对该厂停产让路。"""
+        fp = self.fac_mem.get(fid)
+        upgraded = fp is not None and fac_key(*fp) in self.fac_upgraded
         ts = self.up_pending.get(fid)
-        if ts is None or fid in self.fac_upgraded or now - ts > 60:
+        if ts is None or upgraded or now - ts > 60:
             self.up_pending.pop(fid, None)
             return False
         return True
@@ -1920,16 +2097,23 @@ class Executor:
     def _next_production(self, fac, own):
         now = time.time()
         ftype = fac["t"]
-        learned = self.fac_avail.get(fac["id"])
+        fkey = self._fac_key(fac)  # ① 位点键：换代新 id 继承旧位学习表/T2 档
+        learned = self.fac_avail.get(fkey) if fkey else None
         learned_fresh = learned and now - learned[1] < 120
         # 该厂真实可用表（从失败回执学到，120s 内有效）优先于型号级并集——T1/T2 档按厂区分
         avail = (learned[0] if learned_fresh else None) or self.factory_actions.get(ftype)
+        if self.cli_mode and not learned_fresh and not (fkey and fkey in self.fac_upgraded) and avail:
+            # cli 模式构成消费加厂科技档过滤（实机实锤：T1 陆厂被 pedia 合并表误导，
+            # train u_missileTank 吃"没有此动作"刷屏）：厂真实动作表未知（没学到/未实证 T2）
+            # 时只试 T1 动作——该厂动作表里没有（推定没有）的单位跳过不试，
+            # T2 兵等回执可用列表学到 / 换代继承实证后再产（§二十二 同口径，cli 专用分支）
+            avail = {a for a in avail if self.action_tech.get(a, 1) <= 1}
         # 有 T2+ 可产就不产 T1——但科技档按【厂实际】算（2026-07-26 §二十二：pedia 把 T1/T2 厂
         # 可产合并进同名条目，型号级 max 恒 2 → T1 主战被永久滤死=实局"纯防空军队"的根）：
         # fac_upgraded=回执可用列表实证 T2（永久；升级悬案"回执 ok 不落地"不算——只有实证才进）；
         # 否则按 avail 来源算最高档：学习表新鲜=该厂真实档（无 T2 动作=T1，c_tank 主战解锁）；
         # 学不到=pedia 合并 max（保守现状，与修复前同）。
-        max_tech = 2 if fac["id"] in self.fac_upgraded else max(
+        max_tech = 2 if (fkey and fkey in self.fac_upgraded) else max(
             (self.action_tech.get(a, 1) for a in (avail or []) if not self._bad(a, now)), default=1)
 
         def tech_ok(action):

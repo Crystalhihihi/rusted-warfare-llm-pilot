@@ -222,4 +222,88 @@ e8.tick(snap8)
 fac8 = [t for t in e8.work_order if t["action"] == "b_landFactory" and t["slot"] == [2200, 1000]]
 assert fac8 and fac8[0]["status"] == "assigned", f"安稳过的坐标单应放行: {fac8}"
 print("S8 OK:", {a: t["status"] for a, t in st8.items()}, fac8[0]["status"])
+
+# ---- S9：110 升级换代继承——T1→T2 游戏换发新 id，同位新厂不再吃第二发 110 学费（①） ----
+PEDIA9 = {"units": [
+    {"name": "commandCenter", "price": 3000, "tech": 1, "builds": ["u_builder"]},
+    {"name": "builder", "price": 250, "tech": 1, "builds": ["b_extractorT1"]},
+    {"name": "extractorT1", "price": 700, "tech": 1, "builds": []},
+    {"name": "landFactory", "price": 700, "tech": 1,
+     "builds": ["u_c_tank", "u_missileTank", "110"]},
+    {"name": "c_tank", "price": 400, "tech": 1, "builds": []},
+    {"name": "missileTank", "price": 700, "tech": 2, "builds": []},
+]}
+e9 = ex.Executor(mk_map(water_cols=0), PEDIA9, log)
+e9.autopilot = False
+e9.routine = True
+e9.routine_defense = False
+cc9 = U("commandCenter", 1500, 1000, bld=True, q=0)
+b9s = [U("builder", 1500 + i * 10, 1000) for i in range(3)]
+ext9s = [U("extractorT1", 1400, 1000, bld=True), U("extractorT1", 1450, 1050, bld=True)]
+facA = U("landFactory", 1500, 740, bld=True, q=0)
+own9 = [cc9] + b9s + ext9s + [facA]
+snap9 = snap(own9, 9000)
+snap9["delegated"] = [u["id"] for u in own9]
+c9a = e9.tick(snap9)
+assert any(c.get("action") == "110" and c.get("factory") == facA["id"] for c in c9a), \
+    f"T1 厂资金到位应发升级 110: {c9a}"
+# T1→T2：游戏换发新 id，同位同类型（快照类型名不变）
+facB = U("landFactory", 1500, 740, bld=True, q=0)
+own9b = [cc9] + b9s + ext9s + [facB]
+snap9b = snap(own9b, 9000)
+snap9b["delegated"] = [u["id"] for u in own9b]
+c9b = e9.tick(snap9b)
+assert ex.fac_key("landFactory", 1500, 740) in e9.fac_upgraded, "换代新位点应直接标 T2"
+assert not any(c.get("action") == "110" for c in c9b), \
+    f"换代后同位新厂不许再吃 110 学费: {c9b}"
+print("S9 OK:", [c.get("action") for c in c9a], "->", [c.get("action") for c in c9b])
+
+# ---- S10：落点可达性预检（④a）——建造者走不到目标 85px 内就不派，换可达建造者/留单 ----
+def mk_map_island():
+    rows = []
+    for y in range(100):
+        rows.append("." * 10 + "~" * 20 + "." * 70)  # 左孤岛 | 水带 | 主陆
+    return {"tilesW": 100, "tilesH": 100, "tileW": TILE, "tileH": TILE, "rows": rows,
+            "resources": [{"x": 1300, "y": 1000}]}
+
+e10 = ex.Executor(mk_map_island(), {}, log)
+b_island = U("builder", 150, 1000)      # 孤岛陆建（与主基地被水带隔断）
+b_main = U("builder", 1520, 1000)       # 主陆陆建
+b_ship = U("builderShip", 400, 1000)    # 海上建造者（水带内）
+b_ce = U("combatEngineer", 1500, 1000)  # 悬浮（HOVER 过水过岩浆）
+# 谓词口径：陆建判陆域、builderShip 判水域、悬浮恒可达
+assert e10._buildable85(b_main, 1400, 760) is True, "同域陆建可达"
+assert e10._buildable85(b_island, 1400, 760) is False, "孤岛陆建够不着主陆目标"
+assert e10._buildable85(b_island, 150, 1000) is True, "孤岛陆建脚下可达"
+assert e10._buildable85(b_ship, 400, 500) is True, "同水域 builderShip 可达"
+assert e10._buildable85(b_ship, 1400, 760) is False, "builderShip 上不了岸"
+assert e10._buildable85(b_ce, 1400, 760) is True and e10._buildable85(b_ce, 150, 1000) is True, "悬浮全域可达"
+# 工单派发：顺排领单者够不着 → 换可达建造者直派；换不了 → 留 pending 带原因（不判死不毒化）
+e10.autopilot = False
+e10.routine = True
+e10.routine_defense = False
+cc10 = U("commandCenter", 1500, 1000, bld=True, q=0)
+def wo_snap(builders):
+    own = [cc10] + builders
+    s = snap(own, 5000)
+    s["delegated"] = [u["id"] for u in own]
+    return s
+e10.set_work_order([{"action": "b_c_turret_t1", "slot": [1400, 1000]}])
+c10 = e10.tick(wo_snap([b_island, b_main]))
+wo10 = e10.work_order[0]
+tur10 = [c for c in c10 if c.get("action") == "b_c_turret_t1"]
+assert tur10 and tur10[0]["builder"] == b_main["id"], f"孤岛领单者够不着应换主陆建造者: {c10}"
+assert wo10["status"] == "assigned" and wo10["builder"] == b_main["id"], f"任务应落账给可达建造者: {wo10}"
+assert "可达建造者接手" in wo10["note"], wo10["note"]
+e10b = ex.Executor(mk_map_island(), {}, log)
+e10b.autopilot = False
+e10b.routine = True
+e10b.routine_defense = False
+e10b.set_work_order([{"action": "b_c_turret_t1", "slot": [1400, 1000]}])
+c10b = e10b.tick(wo_snap([U("builder", 150, 1000)]))
+wo10b = e10b.work_order[0]
+assert wo10b["status"] == "pending" and "无法靠近" in wo10b["note"], f"换不了应留 pending 带原因: {wo10b}"
+assert not any(c.get("action") == "b_c_turret_t1" for c in c10b), f"不可达不许硬派: {c10b}"
+assert not e10b.site_bad, "不许 site_bad 毒化点位"
+print("S10 OK:", tur10, "|", wo10b["status"], wo10b["note"])
 print("ALL PASS")

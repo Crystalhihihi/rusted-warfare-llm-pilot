@@ -223,7 +223,7 @@ def main():
     # 2026-07-26 问题1 语义变更：无 LLM 构成=默认构成兜底（缺口全满）→先补兵不攒升级
     # （旧语义"无构成=兵力不设防直接攒 4500"正是平静期⑦断产→蓄势死锁的根，见 PROGRESS §二十一）
     assert ex._military_reserve([fac_u2]) == 700 + 1400, "默认构成缺口全满→不攒升级先补兵"
-    ex.fac_upgraded.add(9)
+    ex.fac_upgraded.add(exec_mod.fac_key("landFactory", 1, 1))  # ① 位点键（fac_u2 id=9 @1,1）
     ext_u = {"id": 10, "t": "extractorT1", "bld": True, "hp": 1, "maxHp": 1, "x": 1, "y": 1}
     army8 = ([{"id": i, "t": "c_tank", "hp": 1, "maxHp": 1, "x": 1, "y": 1} for i in range(30, 38)]
              + [{"id": i, "t": "missileTank", "hp": 1, "maxHp": 1, "x": 1, "y": 1} for i in range(40, 42)])
@@ -243,7 +243,8 @@ def main():
     assert ex2._upgrade_pending(11, 1000.0) is True
     assert ex2._upgrade_pending(11, 1100.0) is False, "60s 超时解除"
     ex2.up_pending[11] = 990.0
-    ex2.fac_upgraded.add(11)
+    ex2.fac_mem[11] = ("landFactory", 1.0, 1.0)  # ① 回执/窗口判定走 fac_mem 定位
+    ex2.fac_upgraded.add(exec_mod.fac_key("landFactory", 1, 1))
     assert ex2._upgrade_pending(11, 1000.0) is False, "学成 T2 解除"
 
     # 9. 海厂锚点：岸边可达才锚定；对岸孤岛水域不锚；_in_bounds
@@ -407,7 +408,9 @@ def main():
     # 17. 按厂实际科技档（2026-07-26 §二十二：max_tech 不再被 pedia T1/T2 合并条目恒推 2）
     # 17a. 回执学到 T1 表（可用列表无 T2 动作）→ T1 主战 c_tank 解锁可产
     #      （修复前：pedia max 恒 2，c_tank 被永久滤死=实局纯防空军队的根）
+    #      ① 起：回执按 fac_mem 长记忆定位落 (类型,格化坐标) 位点键，先种映射
     ex17 = make_ex()
+    ex17.fac_mem[3] = ("landFactory", 500.0, 500.0)
     ex17.on_cmd_results([{"ok": False, "msg": "工厂#3 没有此动作: u_plasmaTank；可用: "
                                               "u_builder,u_scout,u_c_tank,u_hoverTank,u_c_artillery"}])
     assert 3 not in ex17.fac_upgraded, "可用列表无 T2 不得进 fac_upgraded"
@@ -421,12 +424,75 @@ def main():
     # 17c. 回执实证 T2（可用列表含 T2 动作）→ fac_upgraded 永久免探，T1 主战滤掉只产 T2
     ex17.on_cmd_results([{"ok": False, "msg": "工厂#3 没有此动作: u_heavyTank；可用: "
                                               "u_c_tank,u_missileTank,u_heavyTank"}])
-    assert 3 in ex17.fac_upgraded, "可用列表含 T2 动作=实证已 T2，应进 fac_upgraded"
+    assert exec_mod.fac_key("landFactory", 500, 500) in ex17.fac_upgraded, \
+        "可用列表含 T2 动作=实证已 T2，应进 fac_upgraded（① 位点键）"
     ex17.set_army_goal(composition={"u_c_tank": 8, "u_missileTank": 2})
     act17c = ex17._next_production({"id": 3, "t": "landFactory"}, [])
     assert act17c == "u_missileTank", f"实证 T2 后 T1 主战滤掉、只产 T2: {act17c}"
 
-    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一/新池召唤/默认构成兜底/主动侦察/按厂科技档 全部符合预期")
+    # 18. 110 升级知识换代继承（①：厂 T1→T2 游戏换发新 id，升级知识按 (类型,格化坐标) 继承）
+    # 18a. _fac_track 换代检测：旧 id 消失+同位(≤40px)同类型新厂 → 新位点直接标 upgraded
+    ex18 = make_ex()
+    fac_old = {"id": 100, "t": "landFactory", "bld": True, "x": 1500.0, "y": 740.0}
+    ex18._fac_track([fac_old])
+    ex18.fac_avail[exec_mod.fac_key("landFactory", 1500, 740)] = ({"u_c_tank"}, time.time())  # 旧 T1 档学习表
+    fac_new = {"id": 200, "t": "landFactory", "bld": True, "x": 1510.0, "y": 745.0}
+    ex18._fac_track([fac_new])
+    k_new = exec_mod.fac_key("landFactory", 1510, 745)
+    assert k_new in ex18.fac_upgraded, "换代新位点应直接标 T2（零学费）"
+    assert not ex18.fac_avail, "换代后旧位学习表（T1 档）应作废等回执重学"
+    assert ex18.fac_mem[100] == ("landFactory", 1500.0, 740.0), "旧 id 机型/位点入长记忆（④b 用）"
+    # 旧厂未消失（另起炉灶的远处新厂）/旧厂消失但太远 → 都不许误判换代
+    ex18b = make_ex()
+    ex18b._fac_track([fac_old])
+    far_new = {"id": 201, "t": "landFactory", "bld": True, "x": 800.0, "y": 740.0}
+    ex18b._fac_track([fac_old, far_new])
+    assert not ex18b.fac_upgraded, "旧厂还在+远处新厂不许误判换代"
+    ex18b._fac_track([far_new])
+    assert not ex18b.fac_upgraded, "旧 id 消失但新厂不同位不许误判换代"
+    # 18b. fac_avail 120s 过期仍生效（新鲜 T1 表解锁 c_tank；过期回退 pedia 合并档滤 T1）
+    ex18c = make_ex()
+    ex18c.fac_mem[3] = ("landFactory", 500.0, 500.0)
+    ex18c.on_cmd_results([{"ok": False, "msg": "工厂#3 没有此动作: u_plasmaTank；可用: "
+                                               "u_builder,u_scout,u_c_tank,u_hoverTank,u_c_artillery"}])
+    k18c = exec_mod.fac_key("landFactory", 500, 500)
+    assert ex18c._next_production({"id": 3, "t": "landFactory"}, []) == "u_c_tank", "新鲜 T1 学习表解锁主战"
+    av, ts = ex18c.fac_avail[k18c]
+    ex18c.fac_avail[k18c] = (av, ts - 121)
+    assert ex18c._next_production({"id": 3, "t": "landFactory"}, []) == "u_missileTank", \
+        "120s 过期回退 pedia 型号表（T1 主战被合并档滤掉）"
+    # 18c. 回执厂 id 无任何位置记忆 → 跳过学习不炸（无法归位宁缺，别再按 id 瞎学）
+    ex18d = make_ex()
+    ex18d.on_cmd_results([{"ok": False, "msg": "工厂#999 没有此动作: 110；可用: u_c_tank"}])
+    assert not ex18d.fac_avail and not ex18d.fac_upgraded
+
+    # 19. train 厂引用重解析（④b）：旧 id 不存在/不归己 → 同类型+距旧位最近重绑定；绑不了退单记活动流
+    ex19 = make_ex()
+    logs19 = []
+    ctx19 = {"exec_holder": {"ex": ex19}, "known_actions": {"u_c_tank"}, "link": None,
+             "log_activity": lambda k, t: logs19.append(t)}
+    st19 = type("S", (), {})()
+    g19 = {"fail_perm": set(), "fail_temp": {}}
+    ex19.fac_mem[50] = ("landFactory", 1500.0, 740.0)  # 旧 id（换代/被毁前）的机型与位点
+    facB = {"id": 60, "t": "landFactory", "bld": True, "x": 1510.0, "y": 745.0, "q": 0}  # 旧位附近
+    facC = {"id": 70, "t": "landFactory", "bld": True, "x": 300.0, "y": 300.0, "q": 0}   # 远处
+    snap19 = {"own": [facB, facC], "team": {"funds": 5000}}
+    cmd, desc = multiagent._translate_combat(ctx19, st19, "train",
+                                             {"action": "u_c_tank", "factory": 50}, snap19, g19)
+    assert cmd and cmd["factory"] == 60, f"旧 id 应重绑定同类型最近厂#60: {cmd} {desc}"
+    assert any("重绑定" in t for t in logs19), f"重绑定应记活动流: {logs19}"
+    # id 存在 → 直用不重绑
+    cmd, desc = multiagent._translate_combat(ctx19, st19, "train",
+                                             {"action": "u_c_tank", "factory": 70}, snap19, g19)
+    assert cmd and cmd["factory"] == 70, f"存在的厂 id 必须直用: {cmd}"
+    # 无同类型厂 → 退单 + 活动流
+    ex19.fac_mem[88] = ("airFactory", 100.0, 100.0)
+    cmd, desc = multiagent._translate_combat(ctx19, st19, "train",
+                                             {"action": "u_c_tank", "factory": 88}, snap19, g19)
+    assert cmd is None and "退单" in desc, f"绑不了应退单: {desc}"
+    assert any("退单" in t for t in logs19), f"退单应记活动流: {logs19}"
+
+    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一/新池召唤/默认构成兜底/主动侦察/按厂科技档/升级换代继承/train厂重解析 全部符合预期")
 
 
 if __name__ == "__main__":

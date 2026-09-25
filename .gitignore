@@ -5,6 +5,9 @@ bridge/secret.toml
 decompiled/
 decompile.log
 
+# 外部依赖（Kev 等第三方仓库克隆、权重、venv）
+extern/
+
 # 编译产物
 agent/classes/
 agent/dist/
@@ -23,6 +26,7 @@ bridge/pilot-stdout.log
 tools/__pycache__/
 bridge/activity.jsonl
 bridge/activity-*.jsonl
+bridge/matches/
 bridge/control.json
 bridge/delegation.json
 bridge/map.txt

@@ -1,16 +1,16 @@
 # rw-pilot 配置：OpenAI 兼容 API（DeepSeek）
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"      # 从环境变量读 key，不写进文件
-model = "deepseek-reasoner"   # 推理型：deepseek-chat 实测优柔寡断不敢进攻；reasoner 决策果断（输出含思维链，单次略贵）
-# 模型分路（2026-07-25 用户拍板：pro 全换 flash，省钱提速）
-commander_model = "deepseek-v4-flash"
-build_model = "deepseek-v4-flash"
-combat_thinker_model = "deepseek-v4-flash"
-combat_squad_model = "deepseek-v4-flash"
+model = "deepseek-flash"   # DeepSeek-V4.1-Flash（默认 thinking 模式，1M 上下文）
+# 模型分路（2026-09-26 用户拍板：LLM 全部统一 deepseek-flash；V4-Pro 09-14 已退役被官方路由，reasoner/chat 旧 id 弃用）
+commander_model = "deepseek-flash"
+build_model = "deepseek-flash"
+combat_thinker_model = "deepseek-flash"
+combat_squad_model = "deepseek-flash"
 routine_defense = false      # 脚本自动防线取消（防线弧/哨戒"实在太乱"）：防御只听计划书/阵地单+建造 chat
-# 战斗执行层（squad chat）第二供应商：硅基流动小模型（基准实测 16.4s/轮、工具调用 10/10 合法）
-squad_base_url = "https://api.siliconflow.cn/v1"
-squad_model_sf = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+# 战斗执行层第二供应商（硅基流动）已停用（2026-09-26 全统一 deepseek-flash）；恢复=填回 base_url 且 secret.toml 有 siliconflow_key
+squad_base_url = ""
+# squad_model_sf = "Qwen/Qwen3-30B-A3B-Instruct-2507"  # 硅基流动小模型留档（基准 16.4s/轮、契约 10/10）
 build_chat_enabled = false   # 建造 chat 退役：建造指挥(pro)直接出 JSON 工单，确定性层执行（true=旧 chat 自由发挥模式）
 # 建造小队 chat（小模型现场执行层，2026-07-25 探针实证 Qwen3-30B 契约 10/10 后落地）：
 # 工单按域分流（econ 经济/defense 防御阵型），各挂 ≤cap 建造者；事件触发召唤不轮询；
@@ -31,7 +31,7 @@ multi_agent = true         # 多 agent 架构：总指挥+建造/战斗三循环
 dashboard = true           # 外部监控面板总控台（浏览器开 http://127.0.0.1:8321）：三角色在想什么/发高层指令/角色开关
 dashboard_port = 8321
 routine_layer = true       # 规则快层（多 agent 模式）：executor 例行执行（建造者维持/采集器补池/炮塔弧跟随集结点），2s 级
-model_fast = "deepseek-chat"  # 建造/战斗 agent 起步模型（空转自动升级 model=reasoner 兜底）
+model_fast = "deepseek-flash"  # 起步与兜底同一模型；空转升级机制保留（同模型+强制工具追问）
 commander_interval_sec = 50 # 总指挥节拍：多久修订一次《作战计划书》
 build_interval_sec = 10    # 建造 agent 节拍
 combat_interval_sec = 6    # 战斗 agent 节拍（警报时由 fast_interval_sec 兜底）
@@ -49,3 +49,26 @@ apm_cap = 40              # 每分钟指令上限（拟人）
 map_downsample = 3        # ASCII 地图降采样倍数（230x230 -> 77x77，省 token 降延迟）
 history_turns = 4         # 滚动上下文长度
 timeout_sec = 45          # API 超时
+
+# ---- 架构二期（2026-09-27 评审定论）：CLI 三层新循环 bridge/cliloop.py ----
+# 总指挥 1 个 CLI 会话（60s+ 拍，只看大局出布局，产物=局文件夹 plan.md）→
+# 中层四席（陆/海/空/建造各 1 个 CLI 会话，25s 拍，产物=tasks/<branch>.json，本阶段 stub 关闭）→
+# 快速执行层（executor 2s 裁剪拍 + 谓词任务单状态机 + Jev 事件查询；撤退/保命全归 Jev，不接 reflex）。
+# 旧 multiagent 三循环保留可跑：cli_mode=false（默认）时行为一字不变。
+cli_mode = true
+cli_middle_enabled = true   # 中层四席（CLI 会话）总闸
+cli_middle_seats = "land,build"  # 总闸开启时启用的席位名单（逗号列表，land/navy/air/build 任选）
+kimi_bin = "kimi"           # CLI 可执行文件（spawn 模式：kimi -c --output-format stream-json）
+middle_interval_sec = 25    # 中层节拍（spawn 地板实测 ~12s/拍、带读文件 ~18s，25s 有余量）
+# 总指挥节拍沿用上面 commander_interval_sec
+jev_url = "http://127.0.0.1:8009"  # 本地 Kev 服务（Jev 类接口 POST /v1/systemone）
+jev_enabled = true          # 撤退/保命判断全归 Jev（仅 cli_mode 下生效；服务不在线=降级不动+记事件）
+jev_drive = true            # Jev 直驾小队（仅 cli_mode）：有现场的小队按节拍问三题（engage/retreat/focus）并翻译执行
+jev_drive_interval_sec = 3.0  # 直驾节拍（秒）；完全平静的队不问，state 未变不重复发问
+# Jev 置信阈值（0.8B 本地档绝对置信度系统性偏低，choice 顶概率实测上限 ~0.47——focus 用"地板+相对 margin"：
+# 顶概率 ≥ jev_focus_top 且 ≥ jev_focus_margin×次高概率 才算选中；retreat 的"留下"下沿取镜像 1-hi）
+jev_engage_hi = 0.60      # engage noul ≥ 此值=置信打
+jev_engage_lo = 0.40      # engage noul ≤ 此值=置信拒战；带内=拿不准维持原状
+jev_retreat_hi = 0.60     # retreat noul ≥ 此值=撤退回家（≤0.40=置信留下；带内=拿不准）
+jev_focus_top = 0.35      # focus 顶概率地板
+jev_focus_margin = 1.5    # focus 顶概率对次高的相对倍数

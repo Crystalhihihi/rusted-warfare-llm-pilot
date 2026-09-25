@@ -194,6 +194,7 @@ class SharedState:
         self.danger_map.fog = self.fog_map       # 幽灵加热 + 可见冷却（可见空格威胁快速消散）
         self.conn_comp = ctx["conn_comp"]
         self.conn_n = ctx["conn_n"]
+        self.conn_wcomp = ctx.get("conn_wcomp")  # 水域连通域（海队目标预检用，换图随 conn_comp 重建）
         m = self.map_msg or {}
         self.world_w = (m.get("tilesW", 0) or 0) * (m.get("tileW", 0) or 0)
         self.world_h = (m.get("tilesH", 0) or 0) * (m.get("tileH", 0) or 0)
@@ -766,8 +767,18 @@ def _translate_build(ctx, st, name, args, snap, g):
             return None, f"✗ train action={action}: 非法ID，本局不要再试"
         own_ids = {u["id"] for u in snap.get("own", [])}
         if fid not in own_ids:
-            g["fail_perm"].add(("train", action, fid))
-            return None, f"✗ train factory={fid}: 不是我方单位id，factory 必须取快照里的#id"
+            # ④b 厂引用重解析：旧 id（升级换代/被毁）按"同类型+距旧位最近"重绑定；
+            # 绑不了退单记活动流（此前直接 ✗ 拒了，LLM 拿摘要旧 #id 反复撞）
+            ex = ctx["exec_holder"].get("ex")
+            fac2 = ex.resolve_factory(fid, snap) if ex else None
+            if fac2 is None:
+                g["fail_perm"].add(("train", action, fid))
+                ctx["log_activity"]("status", f"⚙ train 退单：厂#{fid} 不存在/不归己，"
+                                              f"且无同类型厂可重绑定（{action}）")
+                return None, f"✗ train factory={fid}: 工厂不存在/不归己，无同类型厂可重绑定（已退单）"
+            ctx["log_activity"]("status", f"⚙ train 厂#{fid} 已换代/不存在，"
+                                          f"重绑定同类型最近厂#{fac2['id']}（{action}）")
+            fid = fac2["id"]
         fac_u = next((u for u in snap.get("own", []) if u["id"] == fid), None)
         if fac_u is not None and (fac_u.get("q") or 0) >= 3:
             g["fail_temp"][("train", action, fid)] = snap_time + 60
@@ -821,8 +832,18 @@ def _translate_combat(ctx, st, name, args, snap, g):
             return None, f"✗ train action={action}: 非法ID（必须原样取自动作表），本局不要再试"
         own_ids = {u["id"] for u in snap.get("own", [])}
         if fid not in own_ids:
-            g["fail_perm"].add(("train", action, fid))
-            return None, f"✗ train factory={fid}: 不是我方单位id，factory 必须取快照里的#id"
+            # ④b 厂引用重解析：旧 id（升级换代/被毁）按"同类型+距旧位最近"重绑定；
+            # 绑不了退单记活动流（实局 17 次 "factory not found/not ours" 的根治）
+            ex = ctx["exec_holder"].get("ex")
+            fac2 = ex.resolve_factory(fid, snap) if ex else None
+            if fac2 is None:
+                g["fail_perm"].add(("train", action, fid))
+                ctx["log_activity"]("status", f"⚙ train 退单：厂#{fid} 不存在/不归己，"
+                                              f"且无同类型厂可重绑定（{action}）")
+                return None, f"✗ train factory={fid}: 工厂不存在/不归己，无同类型厂可重绑定（已退单）"
+            ctx["log_activity"]("status", f"⚙ train 厂#{fid} 已换代/不存在，"
+                                          f"重绑定同类型最近厂#{fac2['id']}（{action}）")
+            fid = fac2["id"]
         fac_u = next((u for u in snap.get("own", []) if u["id"] == fid), None)
         if fac_u is not None and (fac_u.get("q") or 0) >= 3:
             g["fail_temp"][("train", action, fid)] = time.time() + 60
@@ -974,6 +995,29 @@ def _sid_branch(sid):
     return {"L": "land", "A": "air", "N": "navy"}.get(sid[:1], "land")
 
 
+def _squad_reach(ctx, st, branch, cx, cy, tx, ty):
+    """attackmove 目标连通域预检（②）：陆队=目标与质心同陆域 comp；海队=同水域 comp；
+    空军恒真（无视地形）。无连通域数据/质心不在可走格放行——拦错比漏拦糟。
+    返回 (可否达, 换点 or None)：不可达时给己方域内距目标最近的可达格心当换点；
+    换点不比脚下更靠近目标=换不了（None，调用方拦截+通报）。"""
+    if branch == "air":
+        return True, None
+    m = getattr(st, "map_msg", None) or {}
+    tw, th = (m.get("tileW") or 20), (m.get("tileH") or 20)
+    comp = getattr(st, "conn_comp", None) if branch == "land" else getattr(st, "conn_wcomp", None)
+    if not comp:
+        return True, None
+    home = connmap.comp_at(comp, cx, cy, tw, th)
+    if home < 0:
+        return True, None
+    if connmap.comp_at(comp, tx, ty, tw, th) == home:
+        return True, None
+    pt, d = connmap.path_hint(comp, home, tx, ty, tw, th)
+    if pt is None or d >= math.hypot(tx - cx, ty - cy) - 1:
+        return False, None  # 最近可达点就在脚下=没有可换的近点
+    return False, pt
+
+
 def _next_squad_id(squads, branch):
     k = 1
     while f"{_BRANCH_PREFIX[branch]}{k}" in squads:
@@ -1061,9 +1105,11 @@ SET_MISSIONS_TOOL = {"type": "function", "function": {
                    "required": ["squads"]}}}
 
 
-def _translate_missions(ctx, st, args, g):
-    """任务书校验+落盘：非法编号报错忽略（防混淆），合法项写入 st.squads。"""
-    ok, errs = [], []
+def _translate_missions(ctx, st, args, g, snap=None):
+    """任务书校验+落盘：非法编号报错忽略（防混淆），合法项写入 st.squads。
+    ② attack/harass 目标过连通域预检（snap 到位时）：不可达能换可达近点就换（记活动流），
+    换不了该项拒绝并回执劝换目标——军种中层下轮可见。"""
+    ok, errs, swaps = [], [], []
     for it in (args.get("squads") or [])[:8]:
         if not isinstance(it, dict):
             errs.append("非对象项")
@@ -1079,6 +1125,22 @@ def _translate_missions(ctx, st, args, g):
             mission["目标"] = [float(tgt[0]), float(tgt[1])]
         else:
             mission["目标"] = None
+        if mission["目标"] is not None and mission["任务"] in ("attack", "harass") and snap:
+            ms = [u for u in snap.get("own", []) if u["id"] in st.squads[sid]["members"]]
+            if ms:
+                cx = sum(u["x"] for u in ms) / len(ms)
+                cy = sum(u["y"] for u in ms) / len(ms)
+                ok_r, fix = _squad_reach(ctx, st, _sid_branch(sid), cx, cy,
+                                         mission["目标"][0], mission["目标"][1])
+                if not ok_r:
+                    if fix:
+                        ctx["log_activity"]("status", f"⚙ 任务书 {sid} 目标不可达（水/崖隔断），"
+                                                      f"换可达近点({int(fix[0])},{int(fix[1])})")
+                        mission["目标"] = [float(fix[0]), float(fix[1])]
+                        swaps.append(sid)
+                    else:
+                        errs.append(f"{sid}目标不可达（水/崖隔断），换目标")
+                        continue
         if mission["任务"] == "produce":
             mission["动作"] = str(it.get("动作", ""))
             mission["数量"] = int(it.get("数量", 4) or 4)
@@ -1086,7 +1148,9 @@ def _translate_missions(ctx, st, args, g):
         st.squads[sid]["mission"] = mission
         st.squads[sid]["mission_ts"] = time.time()  # 看门狗宽限起算点（先让 LLM 打，超时才代打）
         ok.append(f"{sid}:{mission['任务']}")
-    desc = ("set_missions(" + ",".join(ok) + ("；忽略: " + ",".join(errs) if errs else "") + ")") \
+    desc = ("set_missions(" + ",".join(ok)
+            + ("；换可达近点: " + ",".join(swaps) if swaps else "")
+            + ("；忽略: " + ",".join(errs) if errs else "") + ")") \
         if ok else f"✗ set_missions: 全部非法（当前: {'/'.join(st.squads) or '无'}）: {','.join(errs)}"
     return None, desc
 
@@ -1130,7 +1194,7 @@ def _produce_tick(ctx, st, snap):
             if (fac.get("q") or 0) >= 3 or ex._fac_bad(fac["id"], action, now) \
                     or ex._bad(action, now):
                 continue
-            learned = ex.fac_avail.get(fac["id"])
+            learned = ex.fac_avail.get(exec_mod.fac_key(fac["t"], fac["x"], fac["y"]))  # ① 位点键（换代继承）
             avail = (learned[0] if learned and now - learned[1] < 120 else None) \
                 or ex.factory_actions.get(fac["t"])
             if avail is not None and action not in avail:
@@ -1196,6 +1260,21 @@ def _translate_squad(ctx, st, sid, name, args, snap, g):
     if name in ("attack", "harass"):
         tx = ctx["clamp"](float(args.get("x", 0)), 0, st.world_w)
         ty = ctx["clamp"](float(args.get("y", 0)), 0, st.world_h)
+        # 目标连通域预检（②）：隔水/崖目标不进游戏——能换可达近点就换（记活动流），
+        # 换不了回执劝换目标（实局 146 次"目标点对全部受令单位不可达"的根治）
+        ms = [u for u in snap.get("own", []) if u["id"] in members]
+        if ms:
+            cx = sum(u["x"] for u in ms) / len(ms)
+            cy = sum(u["y"] for u in ms) / len(ms)
+            ok_r, fix = _squad_reach(ctx, st, _sid_branch(sid), cx, cy, tx, ty)
+            if not ok_r:
+                if fix:
+                    ctx["log_activity"]("status", f"⚙ {sid} 目标({int(tx)},{int(ty)})不可达"
+                                                  f"（水/崖隔断），换可达近点({int(fix[0])},{int(fix[1])})")
+                    tx, ty = fix
+                else:
+                    return None, (f"✗ 目标({int(tx)},{int(ty)})不可达（水/崖隔断），"
+                                  "换目标或 note 上报等改派")
         # 同目标去重（放宽）：25s 内同点且到点无敌才拦——敌人在场的连续进攻不受限（治正当进攻被误杀）
         last = st.squads[sid].get("last_atk")
         now = time.time()
@@ -1600,7 +1679,7 @@ def _user_branch(ctx, st, snap, text, alerts, receipts, branch):
     return "\n\n".join(parts)
 
 
-def _translate_branch_missions(ctx, st, args, g, branch):
+def _translate_branch_missions(ctx, st, args, g, branch, snap=None):
     """军种任务书：跨军种编号直接拒绝（军种绝不越界的系统保证），其余走共享校验。"""
     ok_items, bad = [], []
     for it in (args.get("squads") or [])[:12]:
@@ -1609,7 +1688,7 @@ def _translate_branch_missions(ctx, st, args, g, branch):
             bad.append(sid)
             continue
         ok_items.append(it)
-    _c, desc = _translate_missions(ctx, st, {"squads": ok_items}, g)
+    _c, desc = _translate_missions(ctx, st, {"squads": ok_items}, g, snap)
     if bad:
         desc += f"；拒绝跨军种编号({','.join(bad)})——你只管{_BRANCH_META[branch]['ids']}"
     return None, desc
@@ -1641,7 +1720,7 @@ def _branch_role(ctx, branch):
             "make_system": lambda c, s: _sys_branch(c, s, branch),
             "make_user": lambda c, s, snap, text, alerts, rc: _user_branch(c, s, snap, text, alerts, rc, branch),
             "translate": lambda c, s, name, args, snap, g: (
-                _translate_branch_missions(c, s, args, g, branch)
+                _translate_branch_missions(c, s, args, g, branch, snap)
                 if name == "set_missions" else (None, None))}
 
 
@@ -1814,6 +1893,24 @@ def _squad_watchdog(ctx, st, snap, now):
         if st.danger_map.danger(cx, cy, snap):
             continue  # 挨打中：反射层管撤退，看门狗不抢方向盘
         tx, ty = mi["目标"]
+        # 目标连通域预检（②，与小队指令同口径）：不可达能换近点就换；换不了任务作废
+        # 通报军种中层改派（不进游戏空转，下轮中层可见）
+        ok_r, fix = _squad_reach(ctx, st, _sid_branch(sid), cx, cy, tx, ty)
+        if not ok_r:
+            if fix:
+                ctx["log_activity"]("status", f"⚙ {sid} 看门狗：目标({int(tx)},{int(ty)})不可达"
+                                              f"（水/崖隔断），换可达近点({int(fix[0])},{int(fix[1])})")
+                tx, ty = fix
+            else:
+                sq["mission"] = None
+                st.mission_stale = True
+                ts = time.strftime("%H:%M:%S")
+                st.pending[_sid_branch(sid)].append(
+                    f"[{ts}] [系统通报] {sid} {mi.get('任务')}目标({int(tx)},{int(ty)})不可达"
+                    "（水/崖隔断），任务作废——请改派可达目标。")
+                ctx["log_activity"]("status", f"⚙ {sid} 看门狗：目标({int(tx)},{int(ty)})不可达"
+                                              "（水/崖隔断），任务作废通报改派")
+                continue
         ids = ",".join(str(i) for i in sorted(sq["members"]))
         ctx["link"].send({"cmd": "attackmove", "x": float(tx), "y": float(ty), "units": ids})
         sq["last_act_ts"] = now
@@ -2197,6 +2294,17 @@ def _bchat_loop(ctx, st, gid):
                 if not ex._cell_free(occ_ns, btype, int(a["x"] // tw), int(a["y"] // th)):
                     acts.append(f"（build #{tidx} 锚点{lab}已被占，跳过）")
                     continue
+                # 落点可达性预检（④a，与 _wo_tick 同口径）：选定建造者够不着目标 85px 就不落账——
+                # 组内换可达的（悬浮/同域）；换不了留 pending 写行动记录，队长下轮可见
+                bu = next((u for u in members if u["id"] == bid), None)
+                if bu is not None and not ex._buildable85(bu, a["x"], a["y"]):
+                    altb = next((u for u in members
+                                 if u.get("act") in (None, "", "idle")
+                                 and ex._buildable85(u, a["x"], a["y"])), None)
+                    if altb is None:
+                        acts.append(f"（build #{tidx} 建造者无法靠近目标85px（水域/隔断），留单等可达建造者）")
+                        continue
+                    bid = altb["id"]
                 # 先落账后派单（原顺序 send→mark 且 mark 失败被忽略=双重派单）；
                 # 任务已被接走/不存在=跳过不 send，写进行动记录让队长下轮看到
                 if not ex.wo_mark_assigned(tidx, bid, a["x"], a["y"]):
@@ -2384,6 +2492,7 @@ def supervisor_loop(ctx, st):
                         st.requests.clear()
                         st.last_rally = None
                         st.conn_comp, st.conn_n = connmap.build_components(new_map.get("rows", []))
+                        st.conn_wcomp = exec_mod.water_components(new_map.get("rows", []))  # ② 海队目标预检
                         st.danger_map = danger_mod.DangerMap()
                         st.fog_map = fog.FogMap(new_map)  # 换图重建迷雾模型（网格随新快照到位）
                         st.danger_map.fog = st.fog_map

@@ -904,6 +904,33 @@ def main():
         threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
                          daemon=True, name="rw-executor").start()
 
+    # 架构二期新循环（config cli_mode=true，2026-09-27 评审定论）：总指挥 CLI 慢层 +
+    # 确定性 2s 快层（executor 裁剪段+谓词任务单）+ Jev 事件查询，见 cliloop.py。
+    # 旧 multiagent 三循环保留可跑（cli_mode=false 默认，行为一字不变）。
+    if cfg.get("cli_mode", False) and not llm_off:
+        if executor is None:  # cliloop 依赖 executor 机械层，强制补齐（同 multiagent 分支）
+            executor = exec_mod.Executor(map_msg, pedia, log_activity)
+            executor.dmap = danger_map
+            exec_holder["ex"] = executor
+            threading.Thread(target=executor_worker, args=(link, exec_holder, cmd_times),
+                             daemon=True, name="rw-executor").start()
+        executor.autopilot = False
+        executor.routine = True         # 快层 2s 拍走 _routine_tick（cli_mode 裁剪段）
+        executor.cli_mode = True        # 裁剪：自动防线/扩厂/升级/侦察/默认构成补水/工程师自补全跳
+        executor.auto_production = True  # ⑦ 显式 composition 生产保留
+        import cliloop
+        return cliloop.run({
+            "link": link, "cfg": cfg, "api_key": api_key, "pedia": pedia,
+            "map_msg": map_msg, "map_msg_holder": {"m": map_msg},
+            "known_actions": known_actions, "naval_types": naval_types,
+            "exec_holder": exec_holder, "reflex": reflex,
+            "danger_map": danger_map, "conn_comp": conn_comp, "conn_n": conn_n,
+            "mine_spawn": mine_spawn, "enemy_spawns": enemy_spawns,
+            "log_activity": log_activity,
+            "ai_enabled": lambda: not (link.ai_control_state()
+                                       and not link.ai_control_state().get("enabled", True)),
+        })
+
     # 多 agent 架构（config multi_agent=true）：总指挥+建造/战斗三循环并行，
     # executor 退为执行内核（autopilot=False：只跟踪进度/抢修兜底/槽位服务）。
     # LLM_OFF=1 时不进此分支（executor 保持全托管，留作基准对照）。
