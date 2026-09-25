@@ -8,6 +8,8 @@
   cli_middle_enabled=false 先关）→ 快速执行层（executor 2s 拍裁剪段 + 谓词状态机 + Jev 事件查询）。
 - 跨角色通信=留言板文件（board.md 追加段落），角色间不许直接对话。
 - 本循环不接 reflex.py：撤退/保命判断全归 Jev（旧 multiagent 循环里的 reflex 不动）。
+- Jev 是驾驶位不是顾问：领了 active 任务的小队由 Jev 连续开车（菜单题点菜，
+  系统只翻译执行）；事件急查（受击/敌情突现）并入同一菜单，与直驾共用去重。
 - 局文件夹 bridge/matches/<开局时间戳>/：state.json（2s 覆写）/board.md/plan.md/
   tasks/*.json（任务单）/logs/events.jsonl（状态迁移+事件）。换局=换文件夹。
 
@@ -54,7 +56,8 @@ TASK_CHAT_CD = 10.0       # 任务单状态迁移推聊天台节流：同任务 
 # ---------- Jev 置信阈值（config 可配，仅 cli_mode 读；0.8B 档绝对置信度系统性偏低） ----------
 
 def _th(ctx):
-    """阈值包：engage/retreat 的 noul 置信上下沿 + focus 的顶概率地板与相对 margin。"""
+    """阈值包：菜单题=focus_top/focus_margin（地板+相对 margin）；engage_hi/lo 现仅用于
+    卡死放弃题（noul）；retreat_hi 菜单化后不再被读（撤退并入菜单项，键保留备用）。"""
     cfg = ctx["cfg"]
     return {"engage_hi": float(cfg.get("jev_engage_hi", 0.60)),
             "engage_lo": float(cfg.get("jev_engage_lo", 0.40)),
@@ -349,7 +352,7 @@ def _jev_tick(ctx, match, snap, now):
             continue
         match.jev_cd[sid] = now + JEV_CD
         push_chat(ctx, "警戒", f"{sid} {'；'.join(reasons)}")  # 受击/敌情突现上聊天台
-        _ask_jev(ctx, match, sid, sq, ms, snap, "；".join(reasons), now)
+        _jev_event_ask(ctx, match, sid, sq, ms, snap, "；".join(reasons), now)
     match.seen_enemies |= enemy_ids
     # 任务卡死（mission 类）：问 Jev 是否放弃
     for t in match.engine.tasks.values():
@@ -375,76 +378,28 @@ def _send_squad_cmd(ctx, match, sid, cmd, now):
     return False
 
 
-def _ask_jev(ctx, match, sid, sq, ms, snap, reason, now):
-    """小队受击/敌情突现 → Jev 现场判断：撤不撤（noul）+ 打哪个（choice）。"""
+def _jev_event_ask(ctx, match, sid, sq, ms, snap, reason, now):
+    """事件急查（受击/敌情突现）：同一套菜单题立即问（不等直驾节拍节拍）。
+    取舍注记：顾问时代的"撤退 noul + 集火 choice"两题并入菜单（"撤退回家"就是菜单项）——
+    只有一条问答/翻译/标定路径，比保留两套题省一份翻译逻辑与置信口径（用户定调"Jev 接取并执行"）。
+    拿不准（不置信）要上板请中层裁决（15s 节流）；服务 down=不动+记事件。"""
     cx = sum(u["x"] for u in ms) / len(ms)
     cy = sum(u["y"] for u in ms) / len(ms)
-    hp = sum(u["hp"] for u in ms)
-    mhp = sum(u.get("maxHp", u["hp"]) for u in ms) or 1
-    comp = ",".join(f"{k}x{v}" for k, v in Counter(u["t"] for u in ms).most_common(6))
-    m = sq.get("mission") or {}
-    hx, hy = match.home_xy or (0, 0)
-    near = sorted(snap.get("enemy", []),
-                  key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)[:4]
-    near_txt = "; ".join(f"{e['t']}#{e['id']}(hp{e.get('hp')}/{e.get('maxHp')})"
-                         f"@({e['x']},{e['y']}) 距队{math.hypot(e['x'] - cx, e['y'] - cy):.0f}px"
-                         for e in near) or "无可见敌"
-    state = (f"本队 {sid}({len(ms)}员,{hp / mhp:.0%}血)@({cx:.0f},{cy:.0f}): {comp}。"
-             f"任务: {m.get('任务', '无')}" + (f"→({int(m['目标'][0])},{int(m['目标'][1])})"
-                                              if m.get("目标") else "") + "。"
-             f"主基地@({hx},{hy})。近敌: {near_txt}。事件: {reason}。")
-    ids = ",".join(str(u["id"]) for u in ms)
-    questions = {"retreat": {"type": "noul",
-                             "instructions": "当前态势下，本队应该立即撤退回主基地保命吗？"}}
-    if near:
-        crit = {f"{e['t']}#{e['id']}": f"{e['t']}(hp{e.get('hp')}/{e.get('maxHp')})"
-                                       f" 距队{math.hypot(e['x'] - cx, e['y'] - cy):.0f}px"
-                for e in near[:3]}
-        crit["保持距离"] = "不集火，继续当前任务"
-        questions["focus"] = {"type": "choice",
-                              "instructions": "若不撤退，优先攻击哪个目标？",
-                              "criteria": crit}
+    state, questions = _drive_menu(sid, sq, ms, snap, cx, cy, reason=reason)
     ans = match.jev.ask(state, questions)
     if ans is None:
         _write_event(match, {"ev": "jev_down", "squad": sid, "why": reason,
                              "act": "不动（服务不可用降级）"})
         return
-    th = _th(ctx)
-    r = ans.get("retreat") or {}
-    v = r.get("noul")
-    if v is None or jev_mod.unsure_noul(r, lo=th["retreat_lo"], hi=th["retreat_hi"]):
-        if _unsure_ok(match, ("retreat", sid), now):  # unsure 节流：同队同结论 15s 一条
-            post_board(match.dir, "jev",
-                       f"{sid} {reason}，Jev 拿不准（noul={v}），未动——请中层裁决。")
-            _write_event(match, {"ev": "jev_unsure", "squad": sid, "noul": v, "why": reason})
-        return
-    if v >= th["retreat_hi"]:
-        _send_squad_cmd(ctx, match, sid,
-                        {"cmd": "move", "x": float(hx), "y": float(hy), "units": ids}, now)
-        match.log("alert", f"⚔ Jev 撤退：{sid}（noul={v:.2f}，{reason}）→ 回主基地({hx},{hy})")
-        _write_event(match, {"ev": "jev_retreat", "squad": sid, "noul": round(v, 3),
-                             "why": reason})
-        return
-    # 留下（v ≤ 镜像下沿）：再答打哪个
-    f = ans.get("focus")
-    if not f:
-        _write_event(match, {"ev": "jev_hold", "squad": sid, "noul": round(v, 3)})
-        return
-    if jev_mod.unsure_choice(f, top=th["focus_top"], margin=th["focus_margin"]):
-        if _unsure_ok(match, ("choice", sid), now):
-            post_board(match.dir, "jev",
-                       f"{sid} 不撤退（noul={v:.2f}）但集火目标拿不准"
-                       f"（{json.dumps(f.get('probabilities') or {}, ensure_ascii=False)}），未动——请中层裁决。")
-            _write_event(match, {"ev": "jev_unsure", "squad": sid, "choice": f.get("choice")})
-        return
-    pick = re.search(r"#(\d+)$", str(f.get("choice") or ""))
-    if pick:
-        _send_squad_cmd(ctx, match, sid,
-                        {"cmd": "attack", "id": int(pick.group(1)), "units": ids}, now)
-        match.log("cmd", f"⚔ Jev 集火：{sid} → {f.get('choice')}")
-        _write_event(match, {"ev": "jev_focus", "squad": sid, "target": f.get("choice")})
-    else:
-        _write_event(match, {"ev": "jev_hold", "squad": sid, "choice": f.get("choice")})
+    match.drive_mem[sid] = (state, ans, now)  # 与直驾共用缓存/去重（同 state 不重答）
+    act, chat_txt, category = _drive_act(ctx, match, sid, sq, ms, ans, snap, now,
+                                         event_why=reason)
+    if chat_txt:
+        push_chat(ctx, "Jev", chat_txt)
+    ch = (ans.get("action") or {}).get("choice")
+    print(f"[jev-event] {sid} 事件[{reason}] 菜单={ch} → {act}")
+    _write_event(match, {"ev": "jev_event", "squad": sid, "choice": ch,
+                         "act": act, "why": reason})
 
 
 def _ask_jev_stuck(ctx, match, task, now):
@@ -474,11 +429,21 @@ def _ask_jev_stuck(ctx, match, task, now):
         _write_event(match, {"ev": "jev_keep", "task": task.get("id"), "noul": round(v, 3)})
 
 
-# ---------- Jev 直驾（config jev_drive=true，仅 cli_mode） ----------
+# ---------- Jev 驾驶位（config jev_drive=总开关，仅 cli_mode） ----------
+# 用户定调"Jev 接取并执行"：领了 active 任务的小队由 Jev 连续开车。
+# 问法=一题菜单（"系统出菜单 Jev 点菜"），翻译执行归系统（不自作主张）。
 
-def _drive_state(sid, sq, ms, snap, cx, cy):
-    """直驾问答的紧凑战况串 + 三题。敌人按类型分组（类型×数量×均血×距离），
-    focus 候选键带最近个体 id（"#id" 尾码，翻译时解析）；state 串供 hash 去重。"""
+MENU_PUSH = "执行任务/推进"   # 朝 mission 目标（attack/harass=attackmove，hold/defend=move）
+MENU_HOLD = "原地驻守"        # stop
+MENU_RETREAT = "撤退回家"     # move 回主基地（撤退语义并入菜单，独立 retreat 题已删）
+MENU_FOCUS = "集火"           # 前缀：集火<类型#id> → attack id（#id 尾码沿用）
+
+
+def _drive_menu(sid, sq, ms, snap, cx, cy, reason=None):
+    """驾驶位问答的紧凑战况串 + 菜单题。敌人按类型分组（类型×数量×均血×距离）。
+    候选：三个基础项（推进/驻守/撤退）恒定 + 每个可见敌组一个"集火<类型#id>"——
+    恒 ≥3 个候选（少于 3 个的菜单对 0.8B 档没有区分度）。
+    state 串供 drive_mem 去重；事件急查时 reason 拼进 state（Jev 知道为什么被问）。"""
     comp = ",".join(f"{k}x{v}" for k, v in Counter(u["t"] for u in ms).most_common(6))
     hp = sum(u["hp"] for u in ms)
     mhp = sum(u.get("maxHp", u["hp"]) for u in ms) or 1
@@ -487,109 +452,118 @@ def _drive_state(sid, sq, ms, snap, cx, cy):
     for e in snap.get("enemy", []):
         groups.setdefault(e["t"], []).append(e)
     glines = []
-    criteria = {}
+    focuses = {}
     for t, es in sorted(groups.items(),
                         key=lambda kv: min((e["x"] - cx) ** 2 + (e["y"] - cy) ** 2 for e in kv[1])):
         ne = min(es, key=lambda e: (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2)
         dm = math.hypot(ne["x"] - cx, ne["y"] - cy)
         ah = sum(e["hp"] for e in es) / max(1, sum(e.get("maxHp", e["hp"]) for e in es))
         glines.append(f"{t}x{len(es)}({ah:.0%}血,{dm:.0f}px)")
-        if len(criteria) < 4:
-            criteria[f"{t}#{ne['id']}"] = f"{t}x{len(es)} 均血{ah:.0%} 距{dm:.0f}px"
-    criteria["原地待命"] = "不主动攻击，保持当前位置"
+        if len(focuses) < 4:
+            focuses[f"{MENU_FOCUS}{t}#{ne['id']}"] = f"{t}x{len(es)} 均血{ah:.0%} 距{dm:.0f}px"
     tgt = m.get("目标")
     tgt_txt = (f"→({int(tgt[0])},{int(tgt[1])}) 距{math.hypot(tgt[0] - cx, tgt[1] - cy):.0f}px"
                if tgt else "")
+    criteria = {MENU_PUSH: (f"朝任务目标{tgt_txt or ''}推进/执行" if tgt
+                            else "按任务意图推进/执行"),
+                MENU_HOLD: "原地驻守，不主动行动"}
+    criteria.update(focuses)
+    criteria[MENU_RETREAT] = "撤回主基地保命"
     state = (f"本队 {sid}({len(ms)}员,{hp / mhp:.0%}血)@({cx:.0f},{cy:.0f}): {comp}。"
              f"任务: {m.get('任务', '无')}{tgt_txt}。"
-             f"可见敌: {'; '.join(glines) or '无'}。")
-    questions = {"engage": {"type": "noul",
-                            "instructions": "当前态势下，本队现在应该主动与敌人交战吗？"},
-                 "retreat": {"type": "noul",
-                             "instructions": "本队应该立即撤退回主基地保命吗？"},
-                 "focus": {"type": "choice",
-                           "instructions": "如果交战，优先攻击哪一组敌人？",
+             f"可见敌: {'; '.join(glines) or '无'}。"
+             + (f"事件: {reason}。" if reason else ""))
+    question = {"action": {"type": "choice",
+                           "instructions": "下一步行动？（执行任务=朝任务目标推进；"
+                                           "集火=盯住该组敌打；拿不准就选原地驻守）",
                            "criteria": criteria}}
-    return state, questions
+    return state, question
 
 
-def _drive_act(ctx, match, sid, sq, ms, ans, snap, now):
-    """三题答案 → 指令（系统只做翻译，不自作主张）。
+def _drive_act(ctx, match, sid, sq, ms, ans, snap, now, event_why=None):
+    """菜单答案 → 指令（系统只做翻译，不自作主张）。
     返回 (控制台描述, 聊天台文本 or None, 类别)——chat 文本只在实际发了指令时非 None
-    （unsure/去重跳过/无目标都不推，聊天台不刷噪音）。"""
+    （unsure/去重跳过/无目标都不推，聊天台不刷噪音）。
+    event_why 非 None=事件急查路径：拿不准要上板请中层裁决（15s 节流）。"""
     ids = ",".join(str(u["id"]) for u in ms)
-    r = ans.get("retreat") or {}
-    e = ans.get("engage") or {}
-    f = ans.get("focus") or {}
-    rv, ev = r.get("noul"), e.get("noul")
+    a = (ans or {}).get("action") or {}
     th = _th(ctx)
-    # 撤退置信 → move 回主基地
-    if rv is not None and rv >= th["retreat_hi"]:
+    if jev_mod.unsure_choice(a, top=th["focus_top"], margin=th["focus_margin"]):
+        # 不置信 → 维持上一动作；事件急查的拿不准上板（直驾的只记节流日志）
+        if event_why and _unsure_ok(match, ("menu", sid), now):
+            post_board(match.dir, "jev",
+                       f"{sid} {event_why}，Jev 拿不准"
+                       f"（{json.dumps(a.get('probabilities') or {}, ensure_ascii=False)}），"
+                       "未动——请中层裁决。")
+            _write_event(match, {"ev": "jev_unsure", "squad": sid,
+                                 "choice": a.get("choice"), "why": event_why})
+        return f"unsure(choice={a.get('choice')})→维持上一动作", None, "unsure"
+    ch = str(a.get("choice") or "")
+    if ch == MENU_RETREAT:
         if not match.home_xy:
-            return f"retreat({rv:.2f})→无家坐标，不动", None, "noop"
+            return "菜单撤退→无家坐标，不动", None, "noop"
         hx, hy = match.home_xy
         sent = _send_squad_cmd(ctx, match, sid,
                                {"cmd": "move", "x": float(hx), "y": float(hy), "units": ids}, now)
-        return (f"retreat({rv:.2f})→回家" + ("" if sent else "（去重跳过）"),
-                f"{sid} 撤回家" if sent else None, "retreat")
-    # 关键题（engage/retreat）任一 unsure → 维持上一动作不变
-    if rv is None or ev is None \
-            or jev_mod.unsure_noul(r, lo=th["retreat_lo"], hi=th["retreat_hi"]) \
-            or jev_mod.unsure_noul(e, lo=th["engage_lo"], hi=th["engage_hi"]):
-        return f"unsure(engage={ev},retreat={rv})→维持上一动作", None, "unsure"
-    if ev >= th["engage_hi"]:
-        # engage 置信：focus 置信且选了具体目标 → attack 该目标；否则 attackmove 任务目标点
-        pick = None if jev_mod.unsure_choice(f, top=th["focus_top"], margin=th["focus_margin"]) \
-            else re.search(r"#(\d+)$", str(f.get("choice") or ""))
-        if pick:
-            _send_squad_cmd(ctx, match, sid,
-                            {"cmd": "attack", "id": int(pick.group(1)), "units": ids}, now)
-            return (f"engage({ev:.2f})+focus→attack {f.get('choice')}",
-                    f"{sid} 打 {f.get('choice')}", "attack")
-        tgt = (sq.get("mission") or {}).get("目标")
-        if tgt is None and snap.get("enemy"):  # 无任务目标点：退到最近可见敌
-            cx = sum(u["x"] for u in ms) / len(ms)
-            cy = sum(u["y"] for u in ms) / len(ms)
-            ne = min(snap["enemy"], key=lambda e2: (e2["x"] - cx) ** 2 + (e2["y"] - cy) ** 2)
-            tgt = [ne["x"], ne["y"]]
-        if tgt:
-            sent = _send_squad_cmd(ctx, match, sid,
-                                   {"cmd": "attackmove", "x": float(tgt[0]), "y": float(tgt[1]),
-                                    "units": ids}, now)
-            return (f"engage({ev:.2f})→attackmove({int(tgt[0])},{int(tgt[1])})（focus 待命/拿不准）",
-                    f"{sid} 压向 ({int(tgt[0])},{int(tgt[1])})" if sent else None, "attackmove")
-        return f"engage({ev:.2f})→无目标点，不动", None, "noop"
-    # engage 拒战（≤lo）且 retreat 也不置信 → 原地 stop/hold
-    sent = _send_squad_cmd(ctx, match, sid, {"cmd": "stop", "units": ids}, now)
-    return (f"拒战(engage={ev:.2f})→原地stop",
-            f"{sid} 原地驻守" if sent else None, "stop")
+        if sent:
+            match.log("alert", f"⚔ Jev 撤退：{sid}（菜单）→ 回主基地({hx},{hy})")
+        return "菜单撤退→回家" + ("" if sent else "（去重跳过）"), \
+            f"{sid} 撤回家" if sent else None, "retreat"
+    if ch == MENU_HOLD:
+        sent = _send_squad_cmd(ctx, match, sid, {"cmd": "stop", "units": ids}, now)
+        return "菜单驻守→stop" + ("" if sent else "（去重跳过）"), \
+            f"{sid} 原地驻守" if sent else None, "stop"
+    pick = re.search(r"#(\d+)$", ch) if ch.startswith(MENU_FOCUS) else None
+    if pick:
+        sent = _send_squad_cmd(ctx, match, sid,
+                               {"cmd": "attack", "id": int(pick.group(1)), "units": ids}, now)
+        if sent:
+            match.log("cmd", f"⚔ Jev 集火：{sid} → {ch}")
+        return f"菜单集火→attack {ch}" + ("" if sent else "（去重跳过）"), \
+            f"{sid} 打 {ch}" if sent else None, "attack"
+    if ch == MENU_PUSH:
+        m = sq.get("mission") or {}
+        tgt = m.get("目标")
+        if not tgt:
+            return "菜单推进→无任务目标点，不动", None, "noop"
+        verb = "attackmove" if m.get("任务") in ("attack", "harass") else "move"
+        sent = _send_squad_cmd(ctx, match, sid,
+                               {"cmd": verb, "x": float(tgt[0]), "y": float(tgt[1]),
+                                "units": ids}, now)
+        chat_txt = (f"{sid} 压向 ({int(tgt[0])},{int(tgt[1])})" if verb == "attackmove"
+                    else f"{sid} 前往 ({int(tgt[0])},{int(tgt[1])})")
+        return (f"菜单推进→{verb}({int(tgt[0])},{int(tgt[1])})" + ("" if sent else "（去重跳过）"),
+                chat_txt if sent else None, "push")
+    return f"未知选项({ch})→维持（幻觉兜底）", None, "unsure"
 
 
 def _jev_drive_tick(ctx, match, snap, now):
-    """Jev 直驾循环：每 jev_drive_interval_sec（默认 3s）对"有现场"的小队问一轮三题。
-    有现场=1600px 内有可见敌人 或 mission 是 attack/harass；完全平静的队不问。
-    state 串与上轮相同 → 复用上轮答案不重复发问（动作仍在执行）。"""
+    """Jev 驾驶位循环：每 jev_drive_interval_sec（默认 3s）一拍。
+    接敌（1600px 内有可见敌）=每拍问；行军/驻防（有任务无近敌）=每 jev_drive_calm_every
+    拍（默认 5=15s）或 state 变了才问（drive_mem 去重）；没领任务的小队不问。"""
     interval = float(ctx["cfg"].get("jev_drive_interval_sec", 3.0))
     if now - match.drive_last < interval:
         return
     match.drive_last = now
+    calm_sec = interval * float(ctx["cfg"].get("jev_drive_calm_every", 5))
     own = snap.get("own", [])
     enemies = snap.get("enemy", [])
     for sid, sq in list(match.squad_st.squads.items()):
         ms = [u for u in own if u["id"] in sq["members"]]
         if not ms:
             continue
+        m = sq.get("mission")
+        if not m:
+            continue  # 没领任务的队不问（认领/分配归系统，Jev 只开领了任务的）
         cx = sum(u["x"] for u in ms) / len(ms)
         cy = sum(u["y"] for u in ms) / len(ms)
-        m = sq.get("mission") or {}
-        if m.get("任务") not in ("attack", "harass") and not any(
-                (e["x"] - cx) ** 2 + (e["y"] - cy) ** 2 <= JEV_DRIVE_ENEMY_R ** 2
-                for e in enemies):
-            continue  # 平静的队不问
-        state, questions = _drive_state(sid, sq, ms, snap, cx, cy)
+        engaged = any((e["x"] - cx) ** 2 + (e["y"] - cy) ** 2 <= JEV_DRIVE_ENEMY_R ** 2
+                      for e in enemies)
+        state, questions = _drive_menu(sid, sq, ms, snap, cx, cy)
         mem = match.drive_mem.get(sid)
-        if mem and mem[0] == state:
-            continue  # state 未变：复用上次答案（上局实测同 state 答案相同，重复发问纯浪费）
+        if not engaged and mem and mem[0] == state and now - mem[2] < calm_sec:
+            continue  # 平静队：state 未变且心跳未到点
+        # 接敌队每拍问（敌动=state 变=新现场）；平静队到心跳点或 state 变才问
         ans = match.jev.ask(state, questions)
         if ans is None:
             if now - match.drive_down > DRIVE_DOWN_LOG:
@@ -597,22 +571,16 @@ def _jev_drive_tick(ctx, match, snap, now):
                 _write_event(match, {"ev": "jev_down", "src": "drive",
                                      "act": "本轮跳过（服务不可用）"})
             continue
-        match.drive_mem[sid] = (state, ans)
+        match.drive_mem[sid] = (state, ans, now)
         act, chat_txt, category = _drive_act(ctx, match, sid, sq, ms, ans, snap, now)
         if chat_txt:
             push_chat(ctx, "Jev", chat_txt)  # 实际执行动作才推聊天台（unsure/去重不推）
-        # unsure 且结论连续相同 → 控制台/事件流 15s 节流（state 没变本来就不问；
-        # 敌人位置逐拍在变≠新现场，拿不准刷屏没有信息量）
+        # unsure 且结论连续相同 → 控制台/事件流 15s 节流
         if category == "unsure" and not _unsure_ok(match, ("drive-unsure", sid), now):
             continue
-        r = (ans.get("retreat") or {}).get("noul")
-        e = (ans.get("engage") or {}).get("noul")
-        fc = (ans.get("focus") or {}).get("choice")
-        print(f"[jev-drive] {sid} engage={e} retreat={r} focus={fc} → {act}")
-        _write_event(match, {"ev": "jev_drive", "squad": sid,
-                             "engage": None if e is None else round(e, 3),
-                             "retreat": None if r is None else round(r, 3),
-                             "focus": fc, "act": act})
+        ch = (ans.get("action") or {}).get("choice")
+        print(f"[jev-drive] {sid} 菜单={ch} → {act}")
+        _write_event(match, {"ev": "jev_drive", "squad": sid, "choice": ch, "act": act})
 
 
 # ---------- 对局装配 ----------
@@ -868,8 +836,8 @@ def run(ctx):
     link = ctx["link"]
     os.makedirs(MATCHES_DIR, exist_ok=True)
     print(f"[cliloop] 架构二期新循环启动：局文件夹 {MATCHES_DIR}")
-    print("[cliloop] 快层=确定性 2s 拍（executor 裁剪段+谓词状态机）+ Jev 事件查询；"
-          "慢层=总指挥 CLI（spawn 模式）")
+    print("[cliloop] 快层=确定性 2s 拍（executor 裁剪段+谓词状态机）+ Jev 驾驶位（菜单题）；"
+          "慢层=总指挥/中层 CLI（spawn 模式）")
     # 监控面板（cli 最小接入，cfg["dashboard"] 闸照旧）：能打开、活动流/战况/计划书可读；
     # dash_st 是轻量命名空间，换局由 _setup_match 换绑（地图/迷雾/小队/计划）
     dash_st = SimpleNamespace(

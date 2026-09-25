@@ -462,6 +462,7 @@ def _mk_match8(jev_ans):
         dir=d8, log=lambda k, t: logs8.append((k, t)), home_xy=(1500, 1000),
         squad_st=SimpleNamespace(squads={}, move_map={}, mission_stale=False),
         wiped=set(), hp_hist={}, seen_enemies=set(), jev_cd={}, cmd_dedup={},
+        drive_mem={},
         unsure_ts={}, task_chat_ts={}, defeated=False,
         jev=SimpleNamespace(enabled=True, ask=lambda s, q: jev_ans),
         ex=None, world=None, seats=[])
@@ -474,8 +475,10 @@ tks8 = [U("c_tank", 1400 + i * 30, 900, act="idle") for i in range(6)]
 ctx8 = {"link": SimpleNamespace(send=lambda c: sent8.append(c) or True),
         "log_activity": lambda k, t: None, "cfg": {}}
 
-# a. 撤退：noul=0.9 > 0.65 → move 回主基地
-m8, logs8 = _mk_match8({"retreat": {"type": "noul", "noul": 0.9}})
+# a. 撤退：菜单选中"撤退回家"且置信（顶0.6 ≥ 0.35 且 ≥1.5×次高0.2）→ move 回主基地
+m8, logs8 = _mk_match8({"action": {"type": "choice", "choice": "撤退回家",
+                                   "probabilities": {"执行任务/推进": 0.1, "原地驻守": 0.2,
+                                                     "撤退回家": 0.6}}})
 m8.squad_st.squads["L1"] = {"mission": {"任务": "attack", "目标": [300, 300]},
                             "members": {u["id"] for u in tks8}}
 sent8 = []
@@ -488,8 +491,10 @@ assert mv8 and mv8[0]["x"] == 1500.0 and mv8[0]["y"] == 1000.0, sent8
 assert str(tks8[0]["id"]) in mv8[0]["units"], mv8
 assert any(k == "alert" and "Jev 撤退" in t for k, t in logs8), logs8
 
-# b. 拿不准：noul=0.5 ∈ 置信带 → 不动 + board.md 上报中层
-m8, logs8 = _mk_match8({"retreat": {"type": "noul", "noul": 0.5}})
+# b. 拿不准：菜单顶概率 < 0.35 地板 → 不动 + board.md 上报中层
+m8, logs8 = _mk_match8({"action": {"type": "choice", "choice": "撤退回家",
+                                   "probabilities": {"执行任务/推进": 0.34, "原地驻守": 0.33,
+                                                     "撤退回家": 0.33}}})
 m8.squad_st.squads["L1"] = {"mission": None, "members": {u["id"] for u in tks8}}
 sent8 = []
 cliloop._jev_tick(ctx8, m8, mk_snap(tks8), t0)
@@ -583,8 +588,12 @@ assert eng9.tasks["op-mission-navy-1"]["_status"] == "aborted"
 assert any(e.get("ev") == "task_give_up" for e in events9), events9
 print("§9 OK")
 
-# ==================== §10 Jev 直驾循环 ====================
-print("== §10 Jev 直驾 ==")
+# ==================== §10 Jev 驾驶位（菜单题：系统出菜单 Jev 点菜） ====================
+print("== §10 Jev 驾驶位 ==")
+
+
+def _menu_ans(choice, probs):
+    return {"action": {"type": "choice", "choice": choice, "probabilities": probs}}
 
 
 class FakeJev10:
@@ -615,17 +624,24 @@ def _mk_match10(ans):
 
 
 tks10 = [U("c_tank", 1400 + i * 30, 900, act="idle") for i in range(6)]
-foe10 = U("tank", 1700, 950)   # 距队质心 ~280px（有现场）
+foe10 = U("tank", 1700, 950)   # 距队质心 ~280px（接敌）
 foe10b = U("tank", 1720, 960)
 snap10 = mk_snap(tks10, enemy=[foe10, foe10b])
+snap10_calm = mk_snap(tks10)   # 无敌=行军/驻防
 sent10 = []
 ctx10 = {"link": SimpleNamespace(send=lambda c: sent10.append(c) or True),
          "log_activity": lambda k, t: None,
-         "cfg": {"jev_drive": True, "jev_drive_interval_sec": 3.0}}
+         "cfg": {"jev_drive": True, "jev_drive_interval_sec": 3.0, "jev_drive_calm_every": 5}}
+
+ANS_PUSH = _menu_ans("执行任务/推进", {"执行任务/推进": 0.6, "原地驻守": 0.2, "撤退回家": 0.2})
+ANS_HOLD = _menu_ans("原地驻守", {"执行任务/推进": 0.2, "原地驻守": 0.6, "撤退回家": 0.2})
+ANS_RETREAT = _menu_ans("撤退回家", {"执行任务/推进": 0.2, "原地驻守": 0.2, "撤退回家": 0.6})
+ANS_UNSURE = _menu_ans("执行任务/推进", {"执行任务/推进": 0.4, "原地驻守": 0.38, "撤退回家": 0.22})  # margin 不够
 
 
 def _mk_squad10(m, mission=None):
-    m.squad_st.squads["L1"] = {"mission": mission or {"任务": "attack", "目标": [2000, 500]},
+    m.squad_st.squads["L1"] = {"mission": mission if mission is not None
+                               else {"任务": "attack", "目标": [2000, 500]},
                                "members": {u["id"] for u in tks10}}
 
 
@@ -633,78 +649,92 @@ def _evs10(m):
     return open(os.path.join(m.dir, "logs", "events.jsonl"), encoding="utf-8").read()
 
 
-# a. engage+focus 双置信 → attack 该目标（focus 键尾码 #id）
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.9},
-                   "retreat": {"type": "noul", "noul": 0.1},
-                   "focus": {"type": "choice", "choice": f"tank#{foe10['id']}",
-                             "probabilities": {f"tank#{foe10['id']}": 0.8, "原地待命": 0.2}}})
+# 1. 菜单生成：基础三项恒在（≥3 兜底）；有敌时含"集火<类型#id>"
+m10 = _mk_match10(ANS_HOLD)
 _mk_squad10(m10)
 sent10 = []
-cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
-atk10 = [c for c in sent10 if c["cmd"] == "attack"]
-assert atk10 and atk10[0]["id"] == foe10["id"] and str(tks10[0]["id"]) in atk10[0]["units"], sent10
-qs = m10.jev.calls[0][1]
-assert set(qs) == {"engage", "retreat", "focus"}, qs          # 三题齐问
-assert "原地待命" in qs["focus"]["criteria"], qs               # 待命选项在
-assert "jev_drive" in _evs10(m10) and "attack" in _evs10(m10)  # 可观测落账
-# a2. state 未变 → 不重复发问（计数断言）；去重也不重复发指令
-n0 = len(m10.jev.calls)
-cliloop._jev_drive_tick(ctx10, m10, snap10, time.time() + 4)   # 过节拍但 state 同
-assert len(m10.jev.calls) == n0, "state 未变应复用答案不重复发问"
-assert len([c for c in sent10 if c["cmd"] == "attack"]) == 1, sent10
-# b. retreat 置信 → move 回主基地
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.5},
-                   "retreat": {"type": "noul", "noul": 0.9},
-                   "focus": {"type": "choice", "choice": "原地待命",
-                             "probabilities": {"原地待命": 0.9}}})
+cliloop._jev_drive_tick(ctx10, m10, snap10_calm, time.time())  # 平静队首问也发
+q10 = m10.jev.calls[0][1]["action"]
+assert {"执行任务/推进", "原地驻守", "撤退回家"} <= set(q10["criteria"]), q10
+m10 = _mk_match10(ANS_HOLD)
 _mk_squad10(m10)
 sent10 = []
-cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
-mv10 = [c for c in sent10 if c["cmd"] == "move"]
-assert mv10 and mv10[0]["x"] == 1500.0 and mv10[0]["y"] == 1000.0, sent10
-# c. engage 拒战(≤0.35) 且 retreat 不置信 → 原地 stop
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.2},
-                   "retreat": {"type": "noul", "noul": 0.1},
-                   "focus": {"type": "choice", "choice": "原地待命",
-                             "probabilities": {"原地待命": 0.9}}})
-_mk_squad10(m10)
-sent10 = []
-cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
-assert [c["cmd"] for c in sent10] == ["stop"], sent10
-# d. 关键题 unsure → 维持上一动作（不发指令）+ 记事件
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.5},
-                   "retreat": {"type": "noul", "noul": 0.1},
-                   "focus": {"type": "choice", "choice": f"tank#{foe10['id']}",
-                             "probabilities": {f"tank#{foe10['id']}": 0.9}}})
-_mk_squad10(m10)
-sent10 = []
-cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
-assert not sent10, sent10
-assert "维持上一动作" in _evs10(m10), _evs10(m10)
-# e. engage 置信但 focus 选待命 → attackmove 任务目标点
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.9},
-                   "retreat": {"type": "noul", "noul": 0.1},
-                   "focus": {"type": "choice", "choice": "原地待命",
-                             "probabilities": {"原地待命": 0.85}}})
+cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())  # 接敌
+q10 = m10.jev.calls[0][1]["action"]
+assert f"集火tank#{foe10['id']}" in q10["criteria"], q10["criteria"]
+assert [c["cmd"] for c in sent10] == ["stop"], sent10    # 驻守→stop
+
+# 2. 推进：attack 任务→attackmove 目标点；hold 任务→move 目标点
+m10 = _mk_match10(ANS_PUSH)
 _mk_squad10(m10)
 sent10 = []
 cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
 am10 = [c for c in sent10 if c["cmd"] == "attackmove"]
 assert am10 and am10[0]["x"] == 2000.0 and am10[0]["y"] == 500.0, sent10
-# f. jev down → 本轮跳过不炸 + jev_down 节流事件
-m10 = _mk_match10(None)
+m10 = _mk_match10(ANS_PUSH)
+_mk_squad10(m10, mission={"任务": "hold", "目标": [1600, 950]})
+sent10 = []
+cliloop._jev_drive_tick(ctx10, m10, snap10_calm, time.time())
+mv10 = [c for c in sent10 if c["cmd"] == "move"]
+assert mv10 and mv10[0]["x"] == 1600.0 and mv10[0]["y"] == 950.0, sent10
+
+# 3. 集火 → attack #id
+m10 = _mk_match10(_menu_ans(f"集火tank#{foe10['id']}",
+                            {f"集火tank#{foe10['id']}": 0.5, "原地驻守": 0.2, "撤退回家": 0.3}))
+_mk_squad10(m10)
+sent10 = []
+cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
+atk10 = [c for c in sent10 if c["cmd"] == "attack"]
+assert atk10 and atk10[0]["id"] == foe10["id"] and str(tks10[0]["id"]) in atk10[0]["units"], sent10
+assert "jev_drive" in _evs10(m10) and "attack" in _evs10(m10)  # 可观测落账
+
+# 4. 撤退回家 → move 主基地
+m10 = _mk_match10(ANS_RETREAT)
+_mk_squad10(m10)
+sent10 = []
+cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
+mv10 = [c for c in sent10 if c["cmd"] == "move"]
+assert mv10 and mv10[0]["x"] == 1500.0 and mv10[0]["y"] == 1000.0, sent10
+
+# 5. 不置信（margin 不够）→ 维持上一动作：不发指令 + 记事件
+m10 = _mk_match10(ANS_UNSURE)
+_mk_squad10(m10)
+sent10 = []
+cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
+assert not sent10, sent10
+assert "维持上一动作" in _evs10(m10), _evs10(m10)
+
+# 6. 节拍：接敌=每拍问；平静=state 未变且 <15s 不问，心跳到点再问；同指令 25s 去重
+m10 = _mk_match10(ANS_PUSH)
 _mk_squad10(m10)
 sent10 = []
 t10 = time.time()
+cliloop._jev_drive_tick(ctx10, m10, snap10_calm, t10)      # 平静首问
+cliloop._jev_drive_tick(ctx10, m10, snap10_calm, t10 + 4)  # state 同+未到点 → 不问
+assert len(m10.jev.calls) == 1, "平静队 state 未变且 <15s 不应重问"
+cliloop._jev_drive_tick(ctx10, m10, snap10_calm, t10 + 16)  # 心跳到点 → 再问
+assert len(m10.jev.calls) == 2, "平静队 15s 心跳应再问"
+assert len([c for c in sent10 if c["cmd"] == "attackmove"]) == 1, sent10  # 同指令 25s 去重
+m10 = _mk_match10(ANS_PUSH)
+_mk_squad10(m10)
+cliloop._jev_drive_tick(ctx10, m10, snap10, t10)           # 接敌拍1
+cliloop._jev_drive_tick(ctx10, m10, snap10, t10 + 4)       # 接敌拍2：state 同也照问
+assert len(m10.jev.calls) == 2, "接敌队应每拍问"
+
+# 7. 没领任务的队不问
+m10 = _mk_match10(ANS_PUSH)
+m10.squad_st.squads["L1"] = {"mission": None, "members": {u["id"] for u in tks10}}
+cliloop._jev_drive_tick(ctx10, m10, snap10, time.time())
+assert not m10.jev.calls, "无任务的队不问"
+
+# 8. jev down → 本轮跳过不炸 + jev_down 节流
+m10 = _mk_match10(None)
+_mk_squad10(m10)
+sent10 = []
 cliloop._jev_drive_tick(ctx10, m10, snap10, t10)
-cliloop._jev_drive_tick(ctx10, m10, snap10, t10 + 4)   # state 未变（mem 未写）但 down 仍再问；
-assert not sent10, sent10                              # 没发任何指令
-assert _evs10(m10).count("jev_down") == 1, _evs10(m10)  # 30s 节流只记一条
-# g. 完全平静的队不问（无近敌+mission 非 attack/harass）
-m10 = _mk_match10({"engage": {"type": "noul", "noul": 0.9}})
-_mk_squad10(m10, mission={"任务": "hold", "目标": [1500, 1000]})
-cliloop._jev_drive_tick(ctx10, m10, mk_snap(tks10), time.time())  # 无敌快照
-assert not m10.jev.calls, "平静队不应发问"
+cliloop._jev_drive_tick(ctx10, m10, snap10, t10 + 4)
+assert not sent10, sent10
+assert _evs10(m10).count("jev_down") == 1, _evs10(m10)
 print("§10 OK")
 
 # ==================== §11 cli 构成消费的厂科技档过滤 ====================
@@ -770,19 +800,15 @@ assert any(c.get("who") == "Jev" for c in sent12)
 
 # 2. 直驾实际执行动作 → who="Jev" 推聊天台；unsure → 不推
 cliloop._CHAT_LAST.clear()
-m12 = _mk_match10({"engage": {"type": "noul", "noul": 0.9},
-                   "retreat": {"type": "noul", "noul": 0.1},
-                   "focus": {"type": "choice", "choice": f"tank#{foe10['id']}",
-                             "probabilities": {f"tank#{foe10['id']}": 0.8, "原地待命": 0.2}}})
+m12 = _mk_match10(_menu_ans(f"集火tank#{foe10['id']}",
+                            {f"集火tank#{foe10['id']}": 0.8, "原地驻守": 0.2}))
 _mk_squad10(m12)
 sent10 = []
 cliloop._jev_drive_tick(ctx10, m12, snap10, time.time())
 ovj = [c for c in sent10 if c["cmd"] == "overlay" and c.get("who") == "Jev"]
 assert ovj and "打" in ovj[0]["chat"] and f"#{foe10['id']}" in ovj[0]["chat"], sent10
-m12u = _mk_match10({"engage": {"type": "noul", "noul": 0.5},
-                    "retreat": {"type": "noul", "noul": 0.1},
-                    "focus": {"type": "choice", "choice": "原地待命",
-                              "probabilities": {"原地待命": 0.9}}})
+m12u = _mk_match10(_menu_ans("原地驻守", {"原地驻守": 0.4, "执行任务/推进": 0.38,
+                                         "撤退回家": 0.22}))  # margin 不够=不置信
 _mk_squad10(m12u)
 sent10 = []
 cliloop._jev_drive_tick(ctx10, m12u, snap10, time.time())
@@ -816,7 +842,7 @@ assert jev_mod.unsure_noul({"noul": 0.55}, lo=0.40, hi=0.60)
 assert jev_mod.unsure_noul({"noul": 0.5})  # 旧默认 0.35/0.65 带
 
 # 5. unsure 节流：事件流同队同结论 15s 只记一条
-m12e, _logs12e = _mk_match8({"retreat": {"type": "noul", "noul": 0.5}})
+m12e, _logs12e = _mk_match8(ANS_UNSURE)  # 菜单不置信（margin 不够）
 m12e.squad_st.squads["L1"] = {"mission": None, "members": {u["id"] for u in tks8}}
 t12 = time.time()
 cliloop._jev_tick(ctx8, m12e, mk_snap(tks8), t12)            # 建档
@@ -826,10 +852,7 @@ cliloop._jev_tick(ctx8, m12e, mk_snap([dict(u, hp=66) for u in tks8]), t12 + 10)
 ev12 = open(os.path.join(m12e.dir, "logs", "events.jsonl"), encoding="utf-8").read()
 assert ev12.count("jev_unsure") == 1, ev12  # 第二次 unsure 被 15s 节流
 # 直驾 unsure 节流：state 微变（敌移位）再触发，同结论 15s 内不重复记/不刷屏
-m12d = _mk_match10({"engage": {"type": "noul", "noul": 0.5},
-                    "retreat": {"type": "noul", "noul": 0.1},
-                    "focus": {"type": "choice", "choice": "原地待命",
-                              "probabilities": {"原地待命": 0.9}}})
+m12d = _mk_match10(ANS_UNSURE)
 _mk_squad10(m12d)
 cliloop._CHAT_LAST.clear()
 sent10 = []
