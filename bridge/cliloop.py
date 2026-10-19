@@ -15,6 +15,7 @@
 
 注意：本模块严禁 import pilot（pilot 以 __main__ 运行，import 会重执行 main）。
 """
+import collections
 import json
 import math
 import os
@@ -118,6 +119,9 @@ def post_board(match_dir, who, text):
 
 def _write_event(match, ev):
     ev.setdefault("ts", time.strftime("%H:%M:%S"))
+    tail = getattr(match, "ev_tail", None)  # 手搓 mock match 可能无此字段（test §7/§8）
+    if tail is not None:
+        tail.append(ev)  # dashboard 指挥舱直读（与 jsonl 同一份，内存环形缓冲）
     try:
         with open(os.path.join(match.dir, "logs", "events.jsonl"), "a", encoding="utf-8") as fp:
             fp.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -245,6 +249,28 @@ def _do_fn(ctx, match, task):
                              rally=rally if isinstance(rally, list) else None)
     if "mission" in d:
         return _do_mission(ctx, match, task, d["mission"], snap)
+    if "train" in d and ex is not None and snap:
+        # 骨架补员（开局建造者等）：CC 队列补到目标数，未达标留 pending 下拍重试。
+        # 2026-10-20 实锤：cli 下①建造者维持已拆归 AI 层，骨架不自带补员=经济链死锁（0 建造者）。
+        cc = next((u for u in snap.get("own", [])
+                   if u.get("t") == "commandCenter" and u.get("bld")), None)
+        if cc is None:
+            return False  # CC 未就绪，下拍重试
+        for tr in d.get("train") or []:
+            act = str(tr.get("action") or "")
+            if not act:
+                continue
+            if not act.startswith(("u_", "c_")):
+                act = "u_" + act
+            want = int(tr.get("n") or 1)
+            have = sum(1 for u in snap.get("own", []) if u.get("t") == act[2:])
+            inq = int(cc.get("q") or 0)
+            if have + inq >= want:
+                continue
+            if time.time() >= task.get("_train_cd", 0):
+                task["_train_cd"] = time.time() + 5.0
+                ctx["link"].send({"cmd": "train", "action": act, "factory": cc["id"]})
+            return False  # 未达标：留 pending（本拍只补一单，队列自然推进）
     if "board" in d:
         post_board(match.dir, f"任务单/{task.get('id')}", str(d["board"]))
     return True
@@ -611,13 +637,17 @@ def _setup_match(ctx, gen):
         drive_last=0.0, drive_mem={}, cmd_dedup={}, drive_down=0.0,
         unsure_ts={}, task_chat_ts={},
         defeated=False, defeated_since=None, home_xy=None, world=None, ex=None,
-        jev=None, seats=[], engine=None)
+        jev=None, seats=[], engine=None,
+        ev_tail=collections.deque(maxlen=80))  # 事件环形缓冲：dashboard 指挥舱直读
     match.squad_st.move_map = {u["name"]: u.get("move")
                                for u in (ctx.get("pedia") or {}).get("units", [])}
     # 出生点/威胁种子
     own_cc0 = next((u for u in snap.get("own", []) if u["t"] == "commandCenter"), None)
+    ally_ccs = [(u["x"], u["y"]) for u in snap.get("allies", [])
+                if u.get("t") == "commandCenter" and u.get("bld")]
     mine, enemies = spawns.friendly_spawns(
-        map_msg.get("path", ""), (own_cc0["x"], own_cc0["y"]) if own_cc0 else None)
+        map_msg.get("path", ""), (own_cc0["x"], own_cc0["y"]) if own_cc0 else None,
+        ally_ccs=ally_ccs)
     match.spawns = (mine, enemies or [])
     if enemies:
         match.danger_map.seed_bases(enemies)
@@ -638,9 +668,9 @@ def _setup_match(ctx, gen):
         do_fn=lambda t: _do_fn(ctx, match, t),
         event_fn=lambda ev: (_write_event(match, ev),
                              _push_task(ctx, match, ev) if ev.get("ev") == "task" else None))
-    # Jev 客户端
+    # Jev 客户端（LLM_OFF 静音时不起——Jev 也是模型调用；快层/任务机不依赖它照跑）
     cfg = ctx["cfg"]
-    if cfg.get("jev_enabled", True):
+    if cfg.get("jev_enabled", True) and not ctx.get("llm_off"):
         match.jev = jev_mod.Jev(cfg.get("jev_url", "http://127.0.0.1:8009"), enabled=True)
     # 开局任务单
     tw = (map_msg.get("tilesW", 0) or 0) * (map_msg.get("tileW", 0) or 0)
@@ -668,15 +698,22 @@ def _setup_match(ctx, gen):
             ds.plan_ts = time.time()
     chat_fn = lambda who, txt: push_chat(ctx, who, txt)  # AI 的嘴：游戏内聊天台
     ai_on = ctx.get("ai_enabled") or (lambda: True)
-    match.seats.append(cliseat.Seat("commander", mdir, cfg,
-                                    event_fn=lambda ev: _write_event(match, ev),
-                                    board_fn=lambda who, txt: post_board(mdir, who, txt),
-                                    on_plan=on_plan, ai_enabled=ai_on, chat_fn=chat_fn))
-    for br in ("land", "navy", "air", "build"):
-        match.seats.append(cliseat.Seat(br, mdir, cfg,
+    llm_off = bool(ctx.get("llm_off"))
+    if llm_off:
+        # 静音验证：不建 CLI 席位（spawn kimi 会真调 LLM），快层+任务机+开局照跑——
+        # 代理权拆除后无构成=不产兵正是"静场"待验形态（docs/decisions.md §十三.13）
+        print("[cliloop] LLM_OFF=1：席位不建/Jev 关，快层+任务单状态机照跑（静音验证）")
+        ctx["log_activity"]("status", "⚙ cli 静音模式：慢层关，快层照跑")
+    else:
+        match.seats.append(cliseat.Seat("commander", mdir, cfg,
                                         event_fn=lambda ev: _write_event(match, ev),
                                         board_fn=lambda who, txt: post_board(mdir, who, txt),
-                                        ai_enabled=ai_on, chat_fn=chat_fn))
+                                        on_plan=on_plan, ai_enabled=ai_on, chat_fn=chat_fn))
+        for br in ("land", "navy", "air", "build"):
+            match.seats.append(cliseat.Seat(br, mdir, cfg,
+                                            event_fn=lambda ev: _write_event(match, ev),
+                                            board_fn=lambda who, txt: post_board(mdir, who, txt),
+                                            ai_enabled=ai_on, chat_fn=chat_fn))
     # 面板状态同步（cli 最小接入）：地图/迷雾/小队/阵亡随局换绑
     ds = ctx.get("dash_st")
     if ds is not None:
@@ -688,6 +725,7 @@ def _setup_match(ctx, gen):
         ds.plan = ""      # 新局清旧计划书（总指挥首拍重写）
         ds.plan_params = {}
         ds.plan_ts = 0.0
+        ds.cli_match = match   # 指挥舱数据源：席位/任务机/事件流/board（dashboard._state 直读）
     print(f"[cliloop] 新对局 {mdir}（图 {tw:.0f}x{th:.0f} {size_cls}）")
     print(f"[cliloop] 手动验证路径：state.json 每 2s 覆写；tasks/opening.json 已被消费见 "
           f"logs/events.jsonl 与 executor 工单；总指挥每 {cfg.get('commander_interval_sec', 60)}s "
@@ -696,11 +734,88 @@ def _setup_match(ctx, gen):
     return match
 
 
+_UNIT_ACTIONS_PATH = os.path.join(os.path.dirname(BRIDGE_DIR), "tools", "unit_actions.json")
+
+
+def _load_unit_actions():
+    """tools/unit_actions.json（extract_unit_actions.py 从游戏 ini 提取的动作表）。
+    缺失/损坏返回 None：调用方退回旧版 units.md 格式（可制造性/动作变体列自动消失，不崩）。"""
+    try:
+        with open(_UNIT_ACTIONS_PATH, encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _write_units_ref(match_dir, pedia):
-    """局文件夹参考资料 ref/units.md：紧凑单位手册（生产者/建造者 → 可产动作清单+价格，
-    本局 pedia 快照；口径与 pilot.pedia_production_table 同源：builds 字段分组 b_/u_/升级）。
-    席位 prompt 指认它为合法 ID 唯一来源（治 LLM 编造动作 ID）。"""
+    """局文件夹参考资料 ref/units.md：席位合法 ID 词汇表（治 LLM 编造动作 ID）。
+    unit_actions.json 在场时为全量手册：
+    ① 可制造性三态——pedia 有价≠可造（实验气垫船/模块蜘蛛/飞行机甲这类无生产者单位
+    只能开局或地图刷），每个单位显式标 可造 / 变换态（不可造） / 不可造·地图物；
+    ② 动作两段：生产（b_/u_，原价目行）+ 转换/特殊（unit_actions.json 全部动作变体，
+    含价格与 convertTo 目标，如 c_turret_t2_gun_0 → c_turret_t2_gun $1000）；
+    ③ 顶部三行使用纪律。unit_actions.json 缺失则退回旧格式（仅生产段）。"""
     units = (pedia or {}).get("units", [])
+    ua = _load_unit_actions()
+    if ua is None:
+        return _write_units_ref_basic(match_dir, units)
+    price = {u["name"]: u.get("price") for u in units}
+    names = set(price)
+    produced = set()  # 有生产者的单位：谁 builds 引用 u_<name>/b_<name>/<name>
+    for u in units:
+        for b in u.get("builds", []) or []:
+            if isinstance(b, str):
+                t = b[2:] if b.startswith(("b_", "u_")) else b
+                if t in names:
+                    produced.add(t)
+    conv_targets = set()  # 变换链目标全集：任意动作 convertTo 指向它
+    for rec in ua.values():
+        for a in (rec or {}).get("actions", []) or []:
+            if isinstance(a, dict) and a.get("convertTo"):
+                conv_targets.add(a["convertTo"])
+    lines = ["# 单位手册（本局 pedia 快照）", "",
+             "用法：composition/生产用 u_ 动作 ID；work_order/建造用 b_ 动作 ID；升级动作用于对建筑 train。",
+             "只用本表列出的 ID，别发明；ID 区分大小写。",
+             "纪律：① 只下「可造」单——「变换态（不可造）」「不可造·地图物」没有生产者，给它们下生产/建造单一律失败。",
+             "纪律：② 转换/特殊段动作=对单位自己下 train（变换链的获取方式），不是生产新单位。",
+             "纪律：③ 「不可造·地图物」（实验气垫船/模块蜘蛛/飞行机甲等）只能指挥场上已有的，禁止下单制造或变换。", ""]
+    for u in units:
+        uname = u["name"]
+        builds = [b for b in dict.fromkeys(u.get("builds", []) or []) if isinstance(b, str)]
+        acts = [a for a in ((ua.get(uname) or {}).get("actions") or []) if isinstance(a, dict)]
+        if uname in produced:
+            state = "可造"
+        elif uname in conv_targets or any(a.get("convertTo") for a in acts):
+            state = "变换态（不可造）"
+        else:
+            state = "不可造·地图物"
+        lines.append(f"## {uname}（${u.get('price', '?')}）· {state}")
+        prod = [b for b in builds if b.startswith(("b_", "u_"))]
+        if prod:
+            lines.append("生产/建造（下给本单位）：")
+            for b in prod[:24]:
+                p = price.get(b[2:])
+                lines.append(f"- {b}" + (f"（${p}）" if p is not None else ""))
+        ids, rest = _ua_match_ids(acts, [b for b in builds if b not in prod])
+        conv = [_ua_conv_line(a, ids.get(i)) for i, a in enumerate(acts)]
+        if conv:
+            lines.append("转换/特殊（对己 train，非生产）：")
+            lines.extend(conv)
+        if rest:  # pedia 列出但对不上动作表的 id（_N/110/c_1 等内置位），保留原样防信息丢失
+            lines.append("其他动作（pedia 原 id，含义未标注）：")
+            lines.extend(f"- {b}" for b in rest)
+        lines.append("")
+    ref = os.path.join(match_dir, "ref")
+    os.makedirs(ref, exist_ok=True)
+    with open(os.path.join(ref, "units.md"), "w", encoding="utf-8") as fp:
+        fp.write("\n".join(lines))
+
+
+def _write_units_ref_basic(match_dir, units):
+    """旧版紧凑单位手册（unit_actions.json 缺失时的降级格式）：生产者/建造者 → 可产动作清单+价格，
+    本局 pedia 快照；口径与 pilot.pedia_production_table 同源：builds 字段分组 b_/u_/升级。
+    席位 prompt 指认它为合法 ID 唯一来源（治 LLM 编造动作 ID）。"""
     price = {u["name"]: u.get("price") for u in units}
     lines = ["# 单位手册（本局 pedia 快照）", "",
              "用法：composition/生产用 u_ 动作 ID；work_order/建造用 b_ 动作 ID；升级动作用于对建筑 train。",
@@ -721,12 +836,62 @@ def _write_units_ref(match_dir, pedia):
         fp.write("\n".join(lines))
 
 
+def _ua_sec_name(action):
+    sec = action.get("section") or ""
+    return sec[len("action_"):] if sec.startswith("action_") else sec
+
+
+def _ua_match_ids(actions, other_ids):
+    """pedia builds 里的非生产动作 id 对到 unit_actions 动作下标：
+    c<name>（如 cbuildAntiNuke）按 section 名对；<convertTo>_<N>（如 extractorT2_0 /
+    c_turret_t2_gun_0，N=ini 全局位置序，仅作显示）按 convertTo 目标对。
+    返回 ({动作下标: pedia id}, 未对上 id 列表——_N 裸形/纯数字等保留原样)。"""
+    ids, rest = {}, []
+    for b in other_ids:
+        hit = None
+        if b.startswith("c") and not b.startswith("c_"):  # c<name>
+            tgt = b[1:]
+            for i, a in enumerate(actions):
+                if i not in ids and _ua_sec_name(a) == tgt:
+                    hit = i
+                    break
+        if hit is None:
+            m = re.match(r"^(.*)_(\d+)$", b)
+            if m and m.group(1):
+                tgt = m.group(1)
+                for i, a in enumerate(actions):
+                    if i not in ids and a.get("convertTo") == tgt:
+                        hit = i
+                        break
+        if hit is None:
+            rest.append(b)
+        else:
+            ids[hit] = b
+    return ids, rest
+
+
+def _ua_conv_line(action, pid):
+    """转换/特殊动作行：`- <pedia id>：<显示名/section名> → <convertTo 目标> $<价格>`。
+    无 pedia id 的动作（unit_actions 有而本局 pedia 未列）不带 id 前缀，只作信息行。
+    显示名保留 i:gui.* 国际键原文；价格非纯数字（ammo=1/credits=250）原样括注。"""
+    disp = action.get("text") or _ua_sec_name(action) or "?"
+    line = f"- {pid}：{disp}" if pid else f"- {disp}"
+    if action.get("convertTo"):
+        line += f" → {action['convertTo']}"
+    pr = action.get("price")
+    if pr is not None and str(pr) != "":
+        line += f" ${pr}" if str(pr).isdigit() else f"（{pr}）"
+    return line
+
+
 def _write_opening(ctx, match, op, size_cls):
     """开局物化：写 tasks/opening.json + plan.md 种子 + board 首段；执行由状态机激活。"""
     tasks = [
-        {"id": "op-econ", "branch": "build", "task": "开局经济链（工单+经济目标）",
-         "do": {"work_order": op["work_order"], "plan_params": op["plan_params"]},
-         "status": "pending"},
+        {"id": "op-econ", "branch": "build", "task": "开局经济链（工单+经济目标+建造者补员）",
+         "do": {"work_order": op["work_order"], "plan_params": op["plan_params"],
+                "train": op.get("train") or []},
+         "status": "pending",
+         "give_up_sec": 600},  # 建造者队列按游戏时长个（变速局 wall 口径会虚长），给足放弃窗口
     ]
     # 构成/集结任务只在开局表显式给了构成时才挂（v2 起开局表不带兵——造什么兵归 AI 层）
     if op["composition"]:

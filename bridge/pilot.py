@@ -907,7 +907,9 @@ def main():
     # 架构二期新循环（config cli_mode=true，2026-09-27 评审定论）：总指挥 CLI 慢层 +
     # 确定性 2s 快层（executor 裁剪段+谓词任务单）+ Jev 事件查询，见 cliloop.py。
     # 旧 multiagent 三循环保留可跑（cli_mode=false 默认，行为一字不变）。
-    if cfg.get("cli_mode", False) and not llm_off:
+    # 2026-10-20 修：llm_off 不再把 cli_mode 踢回旧循环（此前静音=永远测不到 cli 快层的
+    # legacy foot-gun）；LLM_OFF 只关慢层（席位 spawn/Jev），快层+任务机照跑（cliloop 内 gate）。
+    if cfg.get("cli_mode", False):
         if executor is None:  # cliloop 依赖 executor 机械层，强制补齐（同 multiagent 分支）
             executor = exec_mod.Executor(map_msg, pedia, log_activity)
             executor.dmap = danger_map
@@ -926,7 +928,7 @@ def main():
             "exec_holder": exec_holder, "reflex": reflex,
             "danger_map": danger_map, "conn_comp": conn_comp, "conn_n": conn_n,
             "mine_spawn": mine_spawn, "enemy_spawns": enemy_spawns,
-            "log_activity": log_activity,
+            "log_activity": log_activity, "llm_off": llm_off,
             "ai_enabled": lambda: not (link.ai_control_state()
                                        and not link.ai_control_state().get("enabled", True)),
         })

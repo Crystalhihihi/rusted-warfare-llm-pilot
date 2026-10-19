@@ -161,6 +161,7 @@ class Seat:
         self.last = 0.0
         self.busy = False
         self.broken = False  # kimi 不在 PATH：记一次事件后停摆（别每拍刷屏）
+        self.last_out = ""   # 最近一拍最终文本（dashboard 指挥舱"在干什么"直读，_run 里更新）
 
     def maybe_fire(self, now):
         if not self.enabled or self.broken or self.busy:
@@ -215,6 +216,7 @@ class Seat:
             self.busy = False
         ms = int((time.time() - t0) * 1000)
         content = parse_stream_json(proc.stdout)
+        self.last_out = (content or "")[:600]  # 指挥舱席位卡直读（截断防爆面板）
         if self.name == "commander":
             self._land_commander(content, fired, ms)
         else:
