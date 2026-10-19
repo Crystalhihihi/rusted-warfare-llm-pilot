@@ -1,0 +1,1110 @@
+{
+ "aaBeamGunship": {
+  "name": "aaBeamGunship",
+  "file": "assets\\units\\aa_beam_gunship\\aa_beam_gunship.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_afterBurn",
+    "text": "i:units.aaBeamGunship.afterBurn.name",
+    "description": "i:units.aaBeamGunship.afterBurn.description",
+    "convertTo": "aaBeamGunship_afterburn",
+    "buildSpeed": "0",
+    "pos": null
+   }
+  ]
+ },
+ "aaBeamGunship_afterburn": {
+  "name": "aaBeamGunship_afterburn",
+  "file": "assets\\units\\aa_beam_gunship\\aa_beam_gunship_afterburn.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_afterBurn",
+    "pos": null
+   },
+   {
+    "section": "action_cancelBurn",
+    "text": "Cancel",
+    "description": "Cancel afterburn early",
+    "convertTo": "aaBeamGunship",
+    "buildSpeed": "0",
+    "pos": null
+   }
+  ]
+ },
+ "c_amphibiousJet": {
+  "name": "c_amphibiousJet",
+  "file": "assets\\units\\amphibious_jet\\amphibious_jet.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_dive",
+    "text": "Dive",
+    "price": "0",
+    "convertTo": "c_amphibiousJet_underwater",
+    "displayType": "action",
+    "buildSpeed": "1.5s",
+    "pos": null
+   }
+  ]
+ },
+ "c_amphibiousJet_underwater": {
+  "name": "c_amphibiousJet_underwater",
+  "file": "assets\\units\\amphibious_jet\\amphibious_jet_underwater.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_dive",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_fly",
+    "text": "Fly",
+    "price": "0",
+    "convertTo": "c_amphibiousJet",
+    "displayType": "action",
+    "buildSpeed": "1.5s",
+    "pos": null
+   }
+  ]
+ },
+ "bugBee": {
+  "name": "bugBee",
+  "file": "assets\\units\\classic_bugs\\bug_bee\\bug_bee.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_explode",
+    "text": "Explode",
+    "price": "0",
+    "displayType": "action",
+    "buildSpeed": "1s",
+    "pos": null
+   }
+  ]
+ },
+ "experiementalCarrier": {
+  "name": "experiementalCarrier",
+  "file": "assets\\units\\experimental_carrier\\Experiemental_carrier.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_buildAntiNuke",
+    "text": "i:gui.actions.buildAntiNuke",
+    "description": "i:gui.actions.buildAntiNuke.description",
+    "price": "6000",
+    "displayType": "NONE",
+    "buildSpeed": "${ 0.0005 / core.nanoFactorySpeed }",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCount",
+    "text": "i:gui.actions.antiNukeCount",
+    "description": "i:gui.actions.antiNukeCount.description",
+    "price": "ammo=1",
+    "isVisible": "if self.ammo(greaterThan=0)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountEmpty",
+    "text": "i:gui.actions.antiNukeCountEmpty",
+    "description": "i:gui.actions.antiNukeCount.descriptionEmpty",
+    "isVisible": "if self.ammo(lessThan=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   }
+  ]
+ },
+ "experimentalGunship": {
+  "name": "experimentalGunship",
+  "file": "assets\\units\\experimental_gunship\\experimental_gunship.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_1",
+    "text": "Deploy",
+    "description": "-Adds shield\\n-Longer range and faster build speed",
+    "price": "0",
+    "convertTo": "experimentalGunshipLanded",
+    "displayType": "action",
+    "buildSpeed": "3s",
+    "pos": 1
+   },
+   {
+    "section": "action_buildAntiNuke",
+    "text": "i:gui.actions.buildAntiNuke",
+    "description": "i:gui.actions.buildAntiNuke.description",
+    "price": "5000",
+    "displayType": "NONE",
+    "buildSpeed": "${ 0.0007 / core.nanoFactorySpeed }",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCount",
+    "text": "i:gui.actions.antiNukeCount",
+    "description": "i:gui.actions.antiNukeCount.description",
+    "price": "ammo=1",
+    "isVisible": "if self.ammo(greaterThan=0)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountEmpty",
+    "text": "i:gui.actions.antiNukeCountEmpty",
+    "description": "i:gui.actions.antiNukeCount.descriptionEmpty",
+    "isVisible": "if self.ammo(lessThan=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_addBlink",
+    "text": "Add blink",
+    "description": "Add blink module. Allows teleporting short distances.",
+    "price": "10000",
+    "isVisible": "if not self.hasFlag(id=1)",
+    "buildSpeed": "50s",
+    "pos": null
+   },
+   {
+    "section": "action_blink",
+    "text": "Blink",
+    "isVisible": "if self.hasFlag(id=1)",
+    "displayType": "action",
+    "buildSpeed": "3.5s",
+    "pos": null
+   }
+  ]
+ },
+ "experimentalGunshipLanded": {
+  "name": "experimentalGunshipLanded",
+  "file": "assets\\units\\experimental_gunship\\experimental_gunship_landed.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_1",
+    "text": "Undeploy",
+    "description": "",
+    "price": "0",
+    "convertTo": "experimentalGunship",
+    "buildSpeed": "3s",
+    "pos": 1
+   },
+   {
+    "section": "action_buildAntiNuke",
+    "pos": null
+   },
+   {
+    "section": "action_blink",
+    "pos": null
+   }
+  ]
+ },
+ "experimentalSpider": {
+  "name": "experimentalSpider",
+  "file": "assets\\units\\experimental_spider\\experimental_spider.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_dance",
+    "text": "Dance",
+    "price": "0",
+    "isVisible": "false",
+    "displayType": "action",
+    "buildSpeed": "5.5s",
+    "pos": null
+   },
+   {
+    "section": "action_attack_dance",
+    "text": "Attack",
+    "price": "0",
+    "isVisible": "false",
+    "displayType": "action",
+    "buildSpeed": "4.5s",
+    "pos": null
+   }
+  ]
+ },
+ "extractorT1": {
+  "name": "extractorT1",
+  "file": "assets\\units\\extractor\\extractor.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "i:gui.actions.upgradeT2",
+    "description": "i:units.extractor.upgrade.description",
+    "price": "1400",
+    "convertTo": "extractorT2",
+    "displayType": "upgrade",
+    "buildSpeed": "0.0006",
+    "pos": null
+   }
+  ]
+ },
+ "extractorT2": {
+  "name": "extractorT2",
+  "file": "assets\\units\\extractor\\extractorT2.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT3",
+    "text": "i:gui.actions.upgradeT3",
+    "description": "i:units.extractor.upgrade.descriptionT3",
+    "price": "4000",
+    "convertTo": "extractorT3",
+    "displayType": "upgrade",
+    "buildSpeed": "0.0003",
+    "pos": null
+   }
+  ]
+ },
+ "extractorT3": {
+  "name": "extractorT3",
+  "file": "assets\\units\\extractor\\extractorT3.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_overclock",
+    "text": "i:units.extractor.upgrade_overclock.text",
+    "description": "i:units.extractor.upgrade_overclock.description",
+    "price": "8000",
+    "convertTo": "extractorT3_overclocked",
+    "displayType": "upgrade",
+    "buildSpeed": "0.0002",
+    "pos": null
+   },
+   {
+    "section": "action_reinforce",
+    "text": "i:units.extractor.upgrade_reinforce.text",
+    "description": "i:units.extractor.upgrade_reinforce.description",
+    "price": "3000",
+    "convertTo": "extractorT3_reinforced",
+    "displayType": "upgrade",
+    "buildSpeed": "0.0007",
+    "pos": null
+   }
+  ]
+ },
+ "extractorT3_overclocked": {
+  "name": "extractorT3_overclocked",
+  "file": "assets\\units\\extractor\\extractorT3_overclocked.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_temp",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_refund",
+    "text": "i:units.extractor.downgrade_overclock.text",
+    "description": "i:units.extractor.downgrade_overclock.description",
+    "price": "0",
+    "convertTo": "extractorT3",
+    "displayType": "action",
+    "buildSpeed": "50s",
+    "pos": null
+   }
+  ]
+ },
+ "extractorT3_reinforced": {
+  "name": "extractorT3_reinforced",
+  "file": "assets\\units\\extractor\\extractorT3_reinforced.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_temp",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_refund",
+    "text": "i:units.extractor.downgrade_reinforce.text",
+    "description": "i:units.extractor.downgrade_reinforce.description",
+    "price": "0",
+    "convertTo": "extractorT3",
+    "displayType": "action",
+    "buildSpeed": "0.003",
+    "pos": null
+   }
+  ]
+ },
+ "fabricatorT1": {
+  "name": "fabricatorT1",
+  "file": "assets\\units\\fabricator\\fabricatorT1.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "i:gui.actions.upgradeT2",
+    "description": "i:units.fabricator.upgrade.description",
+    "price": "4400",
+    "convertTo": "fabricatorT2",
+    "displayType": "upgrade",
+    "buildSpeed": "65.6s",
+    "pos": null
+   }
+  ]
+ },
+ "fabricatorT2": {
+  "name": "fabricatorT2",
+  "file": "assets\\units\\fabricator\\fabricatorT2.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "pos": null
+   },
+   {
+    "section": "action_upgradeT3",
+    "text": "i:gui.actions.upgradeT3",
+    "description": "i:units.fabricator.upgrade.descriptionT3",
+    "price": "7500",
+    "convertTo": "fabricatorT3",
+    "displayType": "upgrade",
+    "buildSpeed": "93.3s",
+    "pos": null
+   }
+  ]
+ },
+ "fabricatorT3": {
+  "name": "fabricatorT3",
+  "file": "assets\\units\\fabricator\\fabricatorT3.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "pos": null
+   }
+  ]
+ },
+ "mechFactory": {
+  "name": "mechFactory",
+  "file": "assets\\units\\mech_factory\\mechFactory.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_upgrade",
+    "text": "i:gui.actions.upgradeT2",
+    "description": "i:units.mechFactoryT2.description",
+    "price": "4000",
+    "convertTo": "mechFactoryT2",
+    "displayType": "upgrade",
+    "buildSpeed": "0.0004",
+    "pos": null
+   }
+  ]
+ },
+ "mechFactoryT2": {
+  "name": "mechFactoryT2",
+  "file": "assets\\units\\mech_factory\\mechFactoryT2.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgrade",
+    "pos": null
+   }
+  ]
+ },
+ "mechBunker": {
+  "name": "mechBunker",
+  "file": "assets\\units\\mechs_large\\mech_bunker.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_deploy",
+    "text": "Deploy",
+    "price": "0",
+    "convertTo": "mechBunkerDeployed",
+    "isVisible": "true",
+    "displayType": "action",
+    "buildSpeed": "0.006",
+    "pos": null
+   }
+  ]
+ },
+ "mechBunkerDeployed": {
+  "name": "mechBunkerDeployed",
+  "file": "assets\\units\\mechs_large\\mech_bunker_deployed.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_deploy",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_undeploy",
+    "text": "Undeploy",
+    "price": "0",
+    "convertTo": "mechBunker",
+    "isVisible": "true",
+    "displayType": "action",
+    "buildSpeed": "0.010",
+    "pos": null
+   }
+  ]
+ },
+ "example_faction_picker": {
+  "name": "example_faction_picker",
+  "file": "assets\\units\\miscellaneous\\example_faction_picker.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_commandCenter",
+    "text": "Human",
+    "convertTo": "commandCenter",
+    "displayType": "Upgrade",
+    "buildSpeed": "1",
+    "pos": null
+   },
+   {
+    "section": "action_bugNest",
+    "text": "Bug",
+    "convertTo": "bugNestN",
+    "displayType": "Upgrade",
+    "buildSpeed": "1",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_antiair": {
+  "name": "modularSpider_antiair",
+  "file": "assets\\units\\modular_spider\\antiair.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "Upgrade",
+    "price": "16000",
+    "convertTo": "modularSpider_antiairT2",
+    "buildSpeed": "16s",
+    "pos": null
+   },
+   {
+    "section": "action_upgradeFlak",
+    "text": "Upgrade",
+    "price": "10000",
+    "convertTo": "modularSpider_antiairFlak",
+    "buildSpeed": "16s",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_antinuke": {
+  "name": "modularSpider_antinuke",
+  "file": "assets\\units\\modular_spider\\antinuke.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_buildAntiNuke",
+    "text": "i:gui.actions.buildAntiNuke",
+    "description": "i:gui.actions.buildAntiNuke.description",
+    "price": "3000",
+    "displayType": "NONE",
+    "buildSpeed": "0.0007",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCount",
+    "text": "i:gui.actions.antiNukeCount",
+    "description": "i:gui.actions.antiNukeCount.description",
+    "price": "ammo=1",
+    "isVisible": "if self.ammo(greaterThan=0) and not self.hasFlag(id=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountEmpty",
+    "text": "i:gui.actions.antiNukeCountEmpty",
+    "description": "i:gui.actions.antiNukeCount.descriptionEmpty",
+    "isVisible": "if self.ammo(lessThan=1) and not self.hasFlag(id=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountOffline",
+    "text": "i:gui.actions.antiNukeCountOffline",
+    "description": "i:gui.actions.antiNukeCount.descriptionOffline",
+    "price": "ammo=1",
+    "isVisible": "if self.hasFlag(id=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_isEnabled",
+    "text": "i:gui.actions.enabled",
+    "description": "i:gui.actions.enabled.description",
+    "isVisible": "if not self.hasFlag(id=1)",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_isDisabled",
+    "text": "i:gui.actions.disabled",
+    "description": "i:gui.actions.disabled.description",
+    "isVisible": "if self.hasFlag(id=1)",
+    "buildSpeed": "0s",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_blink": {
+  "name": "modularSpider_blink",
+  "file": "assets\\units\\modular_spider\\blink.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_blink",
+    "text": "Blink",
+    "displayType": "action",
+    "buildSpeed": "0s",
+    "pos": null
+   }
+  ]
+ },
+ "common_slot": {
+  "name": "common_slot",
+  "file": "assets\\units\\modular_spider\\common_slot.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_reclaim",
+    "text": "Reclaim Slot",
+    "description": "-Free up slot for another turret type.\\n-Returns ${core.price * 0.5} credits",
+    "convertTo": "modularSpider_emptySlot",
+    "isVisible": "if self.completed",
+    "buildSpeed": "3s",
+    "pos": null
+   },
+   {
+    "section": "action_cancel",
+    "text": "Cancel",
+    "description": "-Cancel construction\\n-Returns ${core.price} credits",
+    "isVisible": "if not self.completed",
+    "buildSpeed": "3s",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_emptySlot": {
+  "name": "modularSpider_emptySlot",
+  "file": "assets\\units\\modular_spider\\emptySlot.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_buildSmallLaser",
+    "price": "700",
+    "convertTo": "modularSpider_smallgunturret",
+    "pos": null
+   },
+   {
+    "section": "action_buildGun",
+    "price": "2000",
+    "convertTo": "modularSpider_gunturret",
+    "pos": null
+   },
+   {
+    "section": "action_buildLightning",
+    "price": "6000",
+    "convertTo": "modularSpider_lightning",
+    "pos": null
+   },
+   {
+    "section": "action_buildArtillery",
+    "price": "5000",
+    "convertTo": "modularSpider_artillery",
+    "pos": null
+   },
+   {
+    "section": "action_buildAntiair",
+    "price": "2000",
+    "convertTo": "modularSpider_antiair",
+    "pos": null
+   },
+   {
+    "section": "action_buildFabricator",
+    "price": "3000",
+    "convertTo": "modularSpider_fabricator",
+    "pos": null
+   },
+   {
+    "section": "action_buildLaserdefense",
+    "price": "3000",
+    "convertTo": "modularSpider_laserdefense",
+    "pos": null
+   },
+   {
+    "section": "action_buildShieldGen",
+    "price": "6000",
+    "convertTo": "modularSpider_shieldGen",
+    "pos": null
+   },
+   {
+    "section": "action_buildSpeed",
+    "price": "6000",
+    "convertTo": "modularSpider_speedIncomplete",
+    "pos": null
+   },
+   {
+    "section": "action_buildAntinuke",
+    "price": "7000",
+    "convertTo": "modularSpider_antinuke",
+    "pos": null
+   },
+   {
+    "section": "action_buildBlink",
+    "price": "15000",
+    "convertTo": "modularSpider_blink",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_fabricator": {
+  "name": "modularSpider_fabricator",
+  "file": "assets\\units\\modular_spider\\fabricator.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "Upgrade",
+    "price": "5000",
+    "convertTo": "modularSpider_fabricatorT2",
+    "buildSpeed": "8s",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_fabricatorT2": {
+  "name": "modularSpider_fabricatorT2",
+  "file": "assets\\units\\modular_spider\\fabricatorT2.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_gunturret": {
+  "name": "modularSpider_gunturret",
+  "file": "assets\\units\\modular_spider\\gunturret.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "Upgrade",
+    "price": "16000",
+    "convertTo": "modularSpider_gunturretT2",
+    "buildSpeed": "16s",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider": {
+  "name": "modularSpider",
+  "file": "assets\\units\\modular_spider\\modular_spider.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_blinkQueued",
+    "text": "Blink",
+    "isVisible": "if self.queueSize(withActionTag='blink')>0",
+    "buildSpeed": "3.5s",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot1",
+    "text": "[",
+    "displayType": "action",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot2",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot3",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot4",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot5",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlot6",
+    "pos": null
+   },
+   {
+    "section": "action_selectSlotBuild",
+    "text": "[ Build ]",
+    "pos": null
+   }
+  ]
+ },
+ "modularSpider_smallgunturret": {
+  "name": "modularSpider_smallgunturret",
+  "file": "assets\\units\\modular_spider\\smallgun.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "Upgrade",
+    "price": "3000",
+    "convertTo": "modularSpider_smallgunturretT2",
+    "buildSpeed": "16s",
+    "pos": null
+   }
+  ]
+ },
+ "nautilusSubmarine": {
+  "name": "nautilusSubmarine",
+  "file": "assets\\units\\nautilus\\nautilus.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_surface",
+    "text": "Surface",
+    "description": "-Surface unit",
+    "price": "0",
+    "convertTo": "nautilusSubmarineSurface",
+    "displayType": "action",
+    "buildSpeed": "1",
+    "pos": null
+   },
+   {
+    "section": "action_dive",
+    "text": "Dive",
+    "description": "-Dive unit underwater",
+    "price": "0",
+    "convertTo": "nautilusSubmarine",
+    "isVisible": "false",
+    "displayType": "action",
+    "buildSpeed": "4.5s",
+    "pos": null
+   },
+   {
+    "section": "action_launchScoutBot",
+    "text": "Launch scout bot",
+    "description": "-Launch a scout bot to the target location",
+    "price": "credits=250",
+    "isVisible": "false",
+    "displayType": "action",
+    "buildSpeed": "3.5s",
+    "pos": null
+   },
+   {
+    "section": "action_buildAntiNuke",
+    "text": "i:gui.actions.buildAntiNuke",
+    "description": "i:gui.actions.buildAntiNukeNautilus.description",
+    "price": "6000",
+    "displayType": "NONE",
+    "buildSpeed": "${ 0.0005 / core.nanoFactorySpeed }",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCount",
+    "text": "i:gui.actions.antiNukeCount",
+    "description": "i:gui.actions.antiNukeCount.description",
+    "price": "ammo=1",
+    "isVisible": "if self.ammo(greaterThan=0)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountEmpty",
+    "text": "i:gui.actions.antiNukeCountEmpty",
+    "description": "i:gui.actions.antiNukeCount.descriptionEmpty",
+    "isVisible": "if self.ammo(lessThan=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   }
+  ]
+ },
+ "nautilusSubmarineLand": {
+  "name": "nautilusSubmarineLand",
+  "file": "assets\\units\\nautilus\\nautilusLand.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_launchScoutBot",
+    "isVisible": "true",
+    "pos": null
+   },
+   {
+    "section": "action_surface",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_dive",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_trigger_onLand",
+    "pos": null
+   },
+   {
+    "section": "action_trigger_onWater",
+    "text": "TRIGGER",
+    "convertTo": "nautilusSubmarineSurface",
+    "isVisible": "false",
+    "buildSpeed": "0",
+    "pos": null
+   }
+  ]
+ },
+ "nautilusSubmarineSurface": {
+  "name": "nautilusSubmarineSurface",
+  "file": "assets\\units\\nautilus\\nautilusSurface.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_launchScoutBot",
+    "isVisible": "true",
+    "pos": null
+   },
+   {
+    "section": "action_surface",
+    "isVisible": "false",
+    "pos": null
+   },
+   {
+    "section": "action_dive",
+    "isVisible": "true",
+    "pos": null
+   }
+  ]
+ },
+ "antiNukeLauncherC": {
+  "name": "antiNukeLauncherC",
+  "file": "assets\\units\\nukes\\antinuke_launcher.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_buildAntiNuke",
+    "text": "i:gui.actions.buildAntiNuke",
+    "description": "i:gui.actions.buildAntiNuke.description",
+    "price": "4000",
+    "displayType": "NONE",
+    "buildSpeed": "0.0007",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCount",
+    "text": "i:gui.actions.antiNukeCount",
+    "description": "i:gui.actions.antiNukeCount.description",
+    "price": "ammo=1",
+    "isVisible": "if self.ammo(greaterThan=0)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   },
+   {
+    "section": "action_showAntiNukeCountEmpty",
+    "text": "i:gui.actions.antiNukeCountEmpty",
+    "description": "i:gui.actions.antiNukeCount.descriptionEmpty",
+    "isVisible": "if self.ammo(lessThan=1)",
+    "displayType": "infoOnlyStockpile",
+    "buildSpeed": "0s",
+    "pos": null
+   }
+  ]
+ },
+ "nukeLauncherC": {
+  "name": "nukeLauncherC",
+  "file": "assets\\units\\nukes\\nuke_launcher.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_buildNuke",
+    "text": "i:gui.actions.buildNuke",
+    "description": "i:gui.actions.buildNuke.description",
+    "price": "11000",
+    "displayType": "NONE",
+    "buildSpeed": "0.0003",
+    "pos": null
+   },
+   {
+    "section": "action_launchNuke",
+    "text": "i:gui.actions.launchNuke",
+    "description": "i:gui.actions.launchNuke.description",
+    "price": "ammo=1",
+    "displayType": "action",
+    "buildSpeed": "3.5s",
+    "pos": null
+   }
+  ]
+ },
+ "outpostT1": {
+  "name": "outpostT1",
+  "file": "assets\\units\\outpost\\outpost.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "i:units.outpost.upgrade.name",
+    "description": "i:units.outpost.upgrade.description",
+    "price": "2000",
+    "convertTo": "outpostT2",
+    "displayType": "upgrade",
+    "buildSpeed": "40.0s",
+    "pos": null
+   }
+  ]
+ },
+ "outpostT2": {
+  "name": "outpostT2",
+  "file": "assets\\units\\outpost\\outpostT2.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "pos": null
+   }
+  ]
+ },
+ "c_antiAirTurret": {
+  "name": "c_antiAirTurret",
+  "file": "assets\\units\\turrets\\turret_antiair.ini",
+  "class": "CustomUnitMetadata",
+  "actions": [
+   {
+    "section": "action_upgradeT2",
+    "text": "i:gui.actions.upgradeToAAT2",
+    "description": "i:gui.actions.upgradeToAAT2.description",
+    "price": "1200",
+    "convertTo": "c_antiAirTurretT2",
+    "displayType": "Upgrade",
+    "buildSpeed": "0.001",
+    "pos": null
+   },
+   {
+    "section": "action_upgradeFlak",
+    "text": "i:gui.actions.upgradeToAAFlak",
+    "description": "i:gui.actions.upgradeToAAFlak.description",
+    "price": "4000",
+    "convertTo": "antiAirTurretFlak",
+    "displayType": "Upgrade",
+    "buildSpeed": "0.0005",
+    "pos": null
+   }
+  ]
+ },
+ "c_turret_t1": {
+  "name": "c_turret_t1",
+  "file": "assets\\units\\turrets\\turret_t1.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgrade_gun",
+    "text": "i:gui.actions.upgradeToGunT2",
+    "description": "-Increases HP, attack damage, and range",
+    "price": "1000",
+    "convertTo": "c_turret_t2_gun",
+    "displayType": "Upgrade",
+    "buildSpeed": "0.001",
+    "pos": null
+   },
+   {
+    "section": "action_upgrade_artillery",
+    "text": "i:gui.actions.upgradeToArtillery",
+    "description": "-Large increase in range",
+    "price": "1600",
+    "convertTo": "c_turret_t1_artillery",
+    "displayType": "Upgrade",
+    "buildSpeed": "0.0004",
+    "pos": null
+   },
+   {
+    "section": "action_upgrade_flame",
+    "text": "i:gui.actions.upgradeToFlamethrower",
+    "description": "-Short range area affect\\n-Adds self-repair",
+    "price": "700",
+    "convertTo": "c_turret_t2_flame",
+    "displayType": "Upgrade",
+    "buildSpeed": "8.3s",
+    "pos": null
+   },
+   {
+    "section": "action_upgrade_lightning",
+    "text": "i:gui.actions.upgradeToLightning",
+    "description": "i:units.turret_lightning.description",
+    "price": "2200",
+    "convertTo": "c_turret_t1_lightning",
+    "displayType": "Upgrade",
+    "buildSpeed": "29.0s",
+    "pos": null
+   }
+  ]
+ },
+ "c_turret_t1_artillery": {
+  "name": "c_turret_t1_artillery",
+  "file": "assets\\units\\turrets\\turret_t1_artillery.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgrade_artilleryT2",
+    "text": "i:gui.actions.upgradeToArtilleryT2",
+    "description": "-Long range and extra attack speed",
+    "price": "9000",
+    "convertTo": "c_turret_t2_artillery",
+    "displayType": "Upgrade",
+    "buildSpeed": "55.6s",
+    "pos": null
+   }
+  ]
+ },
+ "c_turret_t1_lightning": {
+  "name": "c_turret_t1_lightning",
+  "file": "assets\\units\\turrets\\turret_t1_lightning.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgrade_lightningT2",
+    "text": "i:gui.actions.upgradeToLightningT2",
+    "description": "-Extra damage and attack speed",
+    "price": "8000",
+    "convertTo": "c_turret_t2_lightning",
+    "displayType": "Upgrade",
+    "buildSpeed": "30.0s",
+    "pos": null
+   }
+  ]
+ },
+ "c_turret_t2_gun": {
+  "name": "c_turret_t2_gun",
+  "file": "assets\\units\\turrets\\turret_t2_gun.ini",
+  "class": "",
+  "actions": [
+   {
+    "section": "action_upgrade_gunT3",
+    "text": "i:gui.actions.upgradeToGunT3",
+    "description": "-Extra attack damage, and range.\\n-Large amount of HP\\n-Self repair",
+    "price": "11000",
+    "convertTo": "c_turret_t3_gun",
+    "displayType": "Upgrade",
+    "buildSpeed": "0.0003",
+    "pos": null
+   }
+  ]
+ }
+}

@@ -160,8 +160,62 @@ def main():
     code, r = post("/api/squads", {"land": None})
     assert r["caps"]["land"] == 3 and "land" not in r["override"], "None=恢复跟随 config"
 
+    # 8. cli 指挥舱接线：mode 切换 + 席位/任务单/Jev 事件流/board 尾部/静音横幅
+    import collections
+    import os
+    import tempfile
+    mdir = tempfile.mkdtemp(prefix="dash-cli-")
+    with open(os.path.join(mdir, "board.md"), "w", encoding="utf-8") as fp:
+        fp.write("commander: plan.md 已更新\nland: 收到，等第一波\n\nbuild: 池三开建\n")
+
+    class FakeSeat:
+        def __init__(self, name, **kw):
+            self.name = name
+            self.enabled = True; self.busy = False; self.broken = False
+            self.last = time.time() - 10; self.interval = 60
+            self.sid = "s-1"; self.last_out = "plan.md 已更新\n【阶段】开局"
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    fake_match = type("M", (), {})()
+    fake_match.dir = mdir
+    fake_match.seats = [FakeSeat("commander"), FakeSeat("land", enabled=False)]
+    fake_match.engine = type("E", (), {"tasks": {
+        "t1": {"id": "t1", "branch": "build", "task": "开局经济", "_status": "active",
+               "squad": "", "trigger": {"when": [{"池": ">=4"}]}, "note": ""},
+        "t2": {"id": "t2", "branch": "land", "task": "集结", "_status": "pending",
+               "squad": "L1", "trigger": {}, "note": ""}}})()
+    fake_match.ev_tail = collections.deque([
+        {"ts": "01:00:01", "ev": "jev_drive", "squad": "L1", "act": "advance",
+         "probs": {"advance": 0.61}},
+        {"ts": "01:00:02", "ev": "task", "id": "t1", "status": "active"},
+        {"ts": "01:00:03", "ev": "jev_unsure", "squad": "L2", "noul": 0.31},
+    ], maxlen=10)
+    st.cli_match = fake_match
+    code, body = get("/api/state")
+    d = json.loads(body)
+    assert d["mode"] == "cli", d["mode"]
+    c = d["cli"]
+    assert len(c["seats"]) == 2 and c["seats"][0]["name"] == "commander"
+    assert c["seats"][1]["enabled"] is False and c["seats"][0]["next_in"] is not None
+    assert "plan.md" in c["seats"][0]["last_out"]
+    assert len(c["tasks"]) == 2
+    t1 = next(t for t in c["tasks"] if t["id"] == "t1")
+    assert t1["status"] == "active" and "池" in t1["when"], t1
+    assert len(c["jev"]) == 2 and c["jev"][0]["ev"] == "jev_drive", c["jev"]
+    assert "land: 收到" in c["board"]
+    assert c["muted"] is False
+    fake_match.seats = []
+    code, body = get("/api/state")
+    d = json.loads(body)
+    assert d["cli"]["muted"] is True, "无席位=静音模式横幅"
+    del st.cli_match
+    code, body = get("/api/state")
+    d = json.loads(body)
+    assert d["mode"] == "legacy" and d["cli"] is None, "拔掉 cli_match 回 legacy"
+
     srv.shutdown()
-    print("PASS test_dashboard：页面/状态/指令/开关覆盖层/地图图层全部符合预期")
+    print("PASS test_dashboard：页面/状态/指令/开关覆盖层/地图图层/CLI 指挥舱 全部符合预期")
 
 
 if __name__ == "__main__":

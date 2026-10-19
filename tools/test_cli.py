@@ -310,13 +310,41 @@ cmds_c2 = ex_old.tick(snapC)
 assert any(c["cmd"] == "train" and str(c.get("action", "")).startswith("u_")
            for c in cmds_c2), f"旧模式默认构成应补水: {cmds_c2}"
 
-# D. 保留段：①建造者 ②采集器 工单调度 抢修 在 cli 模式照跑
+# C2. 代理权拆除第一刀反例钉死（2026-10-20，docs/decisions.md §十三.14 用户拍板 GO）：
+# cli 模式构成被全过滤（此处=构成唯一动作被永久封禁）→ 静场不产——
+# DEFAULT_PROD 静态表与"百科首可用"兜底在 cli 模式全拆（"造什么"全归 LLM 构成，定案#13）；
+# 旧模式同构 setup 照走 DEFAULT_PROD 兜底（行为不变的旁证）
+_facC2 = next(u for u in snapC["own"] if u["t"] == "landFactory")
+_fkeyC2 = exec_mod.fac_key(_facC2["t"], _facC2["x"], _facC2["y"])
+ex_cli = mk_ex(True)
+ex_cli.set_economy_goal(extractors=0, builders=1)
+ex_cli.routine_defense = False
+ex_cli.set_army_goal(composition={"u_plasmaTank": 4})
+ex_cli.action_bad["u_plasmaTank"] = None  # 永久封禁→构成全灭
+cmds_c3 = ex_cli.tick(snapC)
+assert not any(c["cmd"] == "train" and str(c.get("action", "")).startswith("u_")
+               for c in cmds_c3), f"cli 构成全过滤应静场（DEFAULT_PROD 兜底已拆）: {cmds_c3}"
+ex_old = mk_ex(False)
+ex_old.set_economy_goal(extractors=0, builders=1)
+ex_old.routine_defense = False
+ex_old.fac_upgraded.add(_fkeyC2)  # T2 放行（排除科技档变量，专测兜底分支）
+ex_old.set_army_goal(composition={"u_plasmaTank": 4})
+ex_old.action_bad["u_plasmaTank"] = None
+cmds_c4 = ex_old.tick(snapC)
+assert any(c["cmd"] == "train" and c.get("action") in exec_mod.DEFAULT_PROD["landFactory"]
+           for c in cmds_c4), f"旧模式构成全过滤应回落 DEFAULT_PROD 兜底产兵: {cmds_c4}"
+
+# D. 保留段：②采集器 工单调度 在 cli 模式照跑；
+#    ①建造者维持 2026-10-19 起 cli 模式跳过、抢修兜底 2026-10-20 起 cli 模式跳过
+#    （grill-me 定案代理权拆除刀3，decisions §十三.14：修不修/补不补归任务单/中层——同口径；
+#    旧模式两者照跑）
 snapD = mk_snap([U("commandCenter", 1500, 1000, bld=True, q=0),
                  U("builder", 1500, 1000, act="idle")], funds=2000)
 ex_cli = mk_ex(True)
 ex_cli.set_economy_goal(extractors=1, builders=3)
 cmds_d = ex_cli.tick(snapD)
-assert any(c["cmd"] == "train" and c["action"] == "u_builder" for c in cmds_d), cmds_d  # ①
+assert not any(c["cmd"] == "train" and c["action"] == "u_builder" for c in cmds_d), \
+    f"cli 模式 ①建造者维持必须跳过（代理权归 LLM）: {cmds_d}"  # ① 反例钉死
 assert any(c["cmd"] == "build" and c["action"] == "b_extractorT1" for c in cmds_d), cmds_d  # ②
 ex_cli2 = mk_ex(True)
 ex_cli2.set_economy_goal(extractors=0, builders=1)
@@ -330,7 +358,76 @@ snapD2 = mk_snap([U("commandCenter", 1500, 1000, bld=True, q=0),
 ex_cli3 = mk_ex(True)
 ex_cli3.set_economy_goal(extractors=0, builders=1)
 cmds_d3 = ex_cli3.tick(snapD2)
-assert any(c["cmd"] == "resume" and c.get("target") == dmg["id"] for c in cmds_d3), cmds_d3
+assert not any(c["cmd"] == "resume" for c in cmds_d3), \
+    f"cli 模式抢修兜底已拆（代理权刀3，修不修归 LLM/任务单）: {cmds_d3}"  # 反例钉死
+ex_old3 = mk_ex(False)
+ex_old3.set_economy_goal(extractors=0, builders=1)
+cmds_d3o = ex_old3.tick(snapD2)
+assert any(c["cmd"] == "resume" and c.get("target") == dmg["id"] for c in cmds_d3o), \
+    f"旧模式抢修兜底照跑（行为不变旁证）: {cmds_d3o}"
+
+# D2. 双层闸战略闸拆除反例钉死（2026-10-20 定案#2，docs/decisions.md §十三.2）：
+# cli 模式危险点工单不再被否——照派 + note 附战略闸警告（执行结果回执教 LLM）；
+# 旧模式同构工单=failed|点位危险（原语义旁证）。取 CC 600px 内危险点（绕开实控闸先触发序）
+dmW = danger_mod.DangerMap()
+dmW.fog = SimpleNamespace(rows=[[2] * 100 for _ in range(100)], fresh=lambda: True,
+                          enabled=lambda: True, w=100, h=100, tile=20,
+                          state_at=lambda x, y: "black", ghosts=[])
+dmW._add(1200, 1000, 5.0)
+dmW.update({"enemy": []})
+snapW = mk_snap([U("commandCenter", 1500, 1000, bld=True, q=0),
+                 U("builder", 1500, 1000, act="idle")], funds=9000)
+ex_cliW = mk_ex(True)
+ex_cliW.dmap = dmW
+ex_cliW.set_economy_goal(extractors=0, builders=1)
+ex_cliW.set_work_order([{"action": "b_extractorT1", "slot": (1200, 1000)}], snapW)
+cmdsW = ex_cliW.tick(snapW)
+assert any(c["cmd"] == "build" and c["action"] == "b_extractorT1" for c in cmdsW), \
+    f"cli 战略闸不否决：危险点工单照派: {cmdsW}"
+assert "战略闸警告" in ex_cliW.work_order[0]["note"], ex_cliW.work_order[0]["note"]
+ex_oldW = mk_ex(False)
+ex_oldW.dmap = dmW
+ex_oldW.set_economy_goal(extractors=0, builders=1)
+ex_oldW.set_work_order([{"action": "b_extractorT1", "slot": (1200, 1000)}], snapW)
+cmdsWo = ex_oldW.tick(snapW)
+assert ex_oldW.work_order[0]["status"] == "failed" and "点位危险" in ex_oldW.work_order[0]["note"], \
+    f"旧模式战略闸照否决: {ex_oldW.work_order[0]}"
+assert not any(c["cmd"] == "build" for c in cmdsWo), cmdsWo
+
+# D3. pool:k 安全池空兜底（2026-10-20 实锤 10 人图开局经济链全灭；定案#2 同口径）：
+# cli 模式=安全优先：45s 宽限内 pending 重试安全池；宽限耗尽→就近全量池照派+警告 note；
+# 旧模式同构=宽限耗尽判死（无兜底）
+dmP = danger_mod.DangerMap()
+dmP.fog = SimpleNamespace(rows=[[2] * 100 for _ in range(100)], fresh=lambda: True,
+                          enabled=lambda: True, w=100, h=100, tile=20,
+                          state_at=lambda x, y: "black", ghosts=[])
+for px, py in [(1300, 1000), (1350, 1050), (700, 700)]:
+    dmP._add(px, py, 5.0)
+dmP.update({"enemy": []})
+snapP = mk_snap([U("commandCenter", 1500, 1000, bld=True, q=0),
+                 U("builder", 1500, 1000, act="idle")], funds=9000)
+ex_cliP = mk_ex(True)
+ex_cliP.dmap = dmP
+ex_cliP.set_economy_goal(extractors=0, builders=1)
+ex_cliP.set_work_order([{"action": "b_extractorT1", "slot": "pool:0"}], snapP)
+cmdsP0 = ex_cliP.tick(snapP)
+assert not any(c["cmd"] == "build" for c in cmdsP0), \
+    f"宽限内应 pending 重试（安全优先）不兜底: {cmdsP0}"
+ex_cliP.work_order[0]["_pool_fail0"] -= 60  # 模拟宽限耗尽
+cmdsP1 = ex_cliP.tick(snapP)
+assert any(c["cmd"] == "build" and c["action"] == "b_extractorT1"
+           and abs(c.get("x", 0) - 1350) < 1 for c in cmdsP1), \
+    f"cli 宽限耗尽应就近池兜底照派(CC 最近池 1350,1050): {cmdsP1}"
+assert "就近池兜底" in ex_cliP.work_order[0]["note"], ex_cliP.work_order[0]["note"]
+ex_oldP = mk_ex(False)
+ex_oldP.dmap = dmP
+ex_oldP.set_economy_goal(extractors=0, builders=1)
+ex_oldP.set_work_order([{"action": "b_extractorT1", "slot": "pool:0"}], snapP)
+ex_oldP.tick(snapP)
+ex_oldP.work_order[0]["_pool_fail0"] -= 60
+cmdsPo = ex_oldP.tick(snapP)
+assert not any(c["cmd"] == "build" for c in cmdsPo), f"旧模式无兜底应判死: {cmdsPo}"
+assert ex_oldP.work_order[0]["status"] == "failed" and "就近池兜底" not in ex_oldP.work_order[0]["note"]
 
 # E. ⑧主动侦察跳过（旧模式对照发 move）
 tkE = U("c_tank", 1400, 900, act="idle")
@@ -418,6 +515,17 @@ assert os.path.exists(os.path.join(tmp7, "board.md"))
 w7 = SimpleNamespace(snap=snap7, squads=match7.squad_st.squads, wiped=set(),
                      tasks=None, home=(1500, 1000), now=time.time())
 match7.world = w7
+match7.engine.tick(w7, time.time())
+# 骨架补员（2026-10-20）：op-econ 自带 train 3 建造者——未达标留 pending 并下发 train 指令
+assert match7.engine.tasks["op-econ"]["_status"] in ("pending", "active"), \
+    (match7.engine.tasks["op-econ"]["_status"], events7)
+tr7 = [c for c in sent7 if c["cmd"] == "train" and c.get("action") == "u_builder"]
+assert tr7 and tr7[0].get("factory"), f"骨架应下发建造者补员 train 指令: {sent7}"
+# 移交型工单照物化（train 未达标不阻塞 work_order 段）
+acts7 = [t["action"] for t in ex7.work_order]
+assert acts7.count("b_extractorT1") == 3 and "b_landFactory" in acts7, acts7
+# 建造者补到 3 → op-econ 完成
+snap7["own"] += [U("builder", 1500, 1000 + i * 20, act="idle") for i in range(3)]
 match7.engine.tick(w7, time.time())
 # 移交型任务：op-econ 激活即完成，executor 目标已消费（v2：op-army 不再挂——构成归 AI 层）
 assert set(match7.engine.tasks) == {"op-econ"}, list(match7.engine.tasks)
@@ -918,6 +1026,63 @@ utxt = open(os.path.join(tmp13u, "ref", "units.md"), encoding="utf-8").read()
 assert "u_c_tank" in utxt and "b_extractorT1" in utxt, utxt
 assert "$400" in utxt and "$700" in utxt, utxt  # c_tank/extractorT1 价格
 assert "别发明" in utxt
+
+# 3b. 升级格式（依赖 tools/unit_actions.json 真文件）：可制造性三态 + 转换/特殊动作全量
+PEDIA_UA = {"units": [
+    {"name": "commandCenter", "price": 3000, "tech": 1, "building": True, "builder": False,
+     "move": "NONE", "hp": 4000, "builds": ["u_builder"]},
+    {"name": "builder", "price": 250, "tech": 1, "building": False, "builder": True,
+     "move": "LAND", "hp": 170,
+     "builds": ["b_extractorT1", "b_landFactory", "b_seaFactory", "b_c_turret_t1"]},
+    {"name": "extractorT1", "price": 700, "tech": 1, "building": True, "builder": False,
+     "move": "NONE", "hp": 800, "builds": ["extractorT2_0"]},
+    {"name": "landFactory", "price": 700, "tech": 1, "building": True, "builder": False,
+     "move": "NONE", "hp": 2000, "builds": ["u_c_tank", "u_missileTank", "u_heavyTank", "110"]},
+    {"name": "seaFactory", "price": 1000, "tech": 2, "building": True, "builder": False,
+     "move": "NONE", "hp": 2000, "builds": ["u_nautilusSubmarine"]},
+    {"name": "c_tank", "price": 400, "tech": 1, "building": False, "builder": False,
+     "move": "LAND", "hp": 210, "builds": []},
+    {"name": "c_turret_t1", "price": 700, "tech": 1, "building": True, "builder": False,
+     "move": "NONE", "hp": 950,
+     "builds": ["c_turret_t2_gun_0", "c_turret_t1_artillery_1",
+                "c_turret_t2_flame_2", "c_turret_t1_lightning_3"]},
+    {"name": "nautilusSubmarine", "price": 18000, "tech": 2, "building": False, "builder": False,
+     "move": "WATER", "hp": 5600,
+     "builds": ["cbuildAntiNuke", "nautilusSubmarineSurface_5", "claunchScoutBot"]},
+    {"name": "experimentalGunship", "price": 140000, "tech": 3, "building": False, "builder": False,
+     "move": "AIR", "hp": 6000, "builds": ["experimentalGunshipLanded_15"]},
+    {"name": "experimentalGunshipLanded", "price": 140000, "tech": 3, "building": False,
+     "builder": False, "move": "LAND", "hp": 6000, "builds": ["experimentalGunship_15"]},
+]}
+tmp13b = tempfile.mkdtemp()
+cliloop._write_units_ref(tmp13b, PEDIA_UA)
+utxt_b = open(os.path.join(tmp13b, "ref", "units.md"), encoding="utf-8").read()
+blocks = {c.split("\n", 1)[0].split("（")[0]: c
+          for c in utxt_b.split("\n## ")[1:]}  # 单位名 → 条目块
+assert "不可造·地图物" in utxt_b and "纪律" in utxt_b, utxt_b[:300]  # 三态+纪律在顶部
+# ① 实验气垫船：无生产者 → 不可造标记（变换链一环，开局/地图刷）
+eg13 = blocks["experimentalGunship"]
+assert "不可造" in eg13 and "Deploy" in eg13, eg13
+# ② 炮塔 T1：升级动作变体全量 + 价格（id 来自 pedia builds，价/convertTo 来自 unit_actions.json）
+t113 = blocks["c_turret_t1"]
+assert "c_turret_t2_gun_0" in t113 and "c_turret_t1_artillery_1" in t113, t113
+assert "$1000" in t113 and "$1600" in t113, t113
+# ③ 鹦鹉螺：反核动作 + $6000
+ns13 = blocks["nautilusSubmarine"]
+assert ("buildAntiNuke" in ns13) and "$6000" in ns13, ns13
+# 生产段原价目行不动（b_/u_ + 目标单位价，在生产者条目下）
+assert "u_nautilusSubmarine（$18000）" in blocks["seaFactory"], blocks["seaFactory"]
+# 3c. 优雅降级：unit_actions.json 缺失 → 退回旧格式（无三态标记），不崩
+_orig_ua_path = cliloop._UNIT_ACTIONS_PATH
+cliloop._UNIT_ACTIONS_PATH = os.path.join(tmp13b, "no-such-unit_actions.json")
+try:
+    tmp13c = tempfile.mkdtemp()
+    cliloop._write_units_ref(tmp13c, PEDIA_UA)
+    ctxt13 = open(os.path.join(tmp13c, "ref", "units.md"), encoding="utf-8").read()
+    assert "别发明" in ctxt13 and "· 可造" not in ctxt13 and "转换/特殊" not in ctxt13, ctxt13[:200]
+finally:
+    cliloop._UNIT_ACTIONS_PATH = _orig_ua_path
+
 
 # 4. 中层 prompt 冒烟：通用段纪律 + 分域段
 pl13 = cliseat._middle_prompt("land")

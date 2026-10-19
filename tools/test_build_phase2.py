@@ -35,9 +35,9 @@ PEDIA = {"units": [
     {"name": "heavyTank", "price": 800, "tech": 1, "building": False, "builder": False,
      "move": "LAND", "hp": 800, "builds": []},
     {"name": "c_turret_t1", "price": 600, "tech": 1, "building": True, "builder": False,
-     "move": "NONE", "hp": 900, "builds": []},
+     "move": "NONE", "hp": 900, "builds": ["c_turret_t2_gun_0", "c_turret_t1_artillery_1"]},
     {"name": "c_antiAirTurret", "price": 800, "tech": 1, "building": True, "builder": False,
-     "move": "NONE", "hp": 900, "builds": []},
+     "move": "NONE", "hp": 900, "builds": ["c_antiAirTurret_t2_0"]},
 ]}
 
 
@@ -492,7 +492,78 @@ def main():
     assert cmd is None and "退单" in desc, f"绑不了应退单: {desc}"
     assert any("退单" in t for t in logs19), f"退单应记活动流: {logs19}"
 
-    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一/新池召唤/默认构成兜底/主动侦察/按厂科技档/升级换代继承/train厂重解析 全部符合预期")
+    # 20. 防线塔升级轨（2026-10-19 沙盒实锤：活路径 _routine_tick 的 ⑤ 升级候选只有矿/厂两轨，
+    #     炮塔/防空从未被升级（死分支 autopilot 里倒有旧轨C——生产 pilot 恒 autopilot=False，
+    #     故从未执行）；upgrade_action 映射本已含 T2 动作。全节显式 autopilot=False 走活路径
+    ex20 = make_ex()
+    ex20.autopilot = False
+    ex20.routine = True
+    snap20 = {"own": [{"id": 1, "t": "commandCenter", "bld": True, "q": 0,
+                       "x": 1500, "y": 1000, "hp": 4000, "maxHp": 4000},
+                      {"id": 30, "t": "c_turret_t1", "bld": True, "q": 0,
+                       "x": 1200, "y": 1000, "hp": 900, "maxHp": 900},
+                      {"id": 31, "t": "c_antiAirTurret", "bld": True, "q": 0,
+                       "x": 1250, "y": 1000, "hp": 900, "maxHp": 900},
+                      {"id": 40, "t": "builder", "q": 0,
+                       "x": 1400, "y": 1000, "hp": 170, "maxHp": 170}],
+              "allies": [], "enemy": [],
+              "team": {"id": 0, "funds": 99999, "ai": False}, "delegated": [1, 30, 31]}
+    cmds20 = ex20.tick(snap20)
+    ups20 = [c for c in cmds20 if c["cmd"] == "train" and c.get("action") in
+             ("c_turret_t2_gun_0", "c_antiAirTurret_t2_0")]
+    assert ups20, f"防线塔应进升级轨发 train 升级单: {cmds20}"
+    assert ups20[0]["factory"] in (30, 31), f"升级单应落在塔上: {ups20}"
+    # 已升类型（无 upgrade_action 映射）不得重复发单
+    snap20b = dict(snap20)
+    snap20b["own"] = snap20["own"] + [{"id": 32, "t": "c_turret_t2_gun", "bld": True,
+                                       "q": 0, "x": 1300, "y": 1000, "hp": 1500,
+                                       "maxHp": 1500}]
+    ex20b = make_ex()
+    ex20b.autopilot = False
+    ex20b.routine = True
+    cmds20b = ex20b.tick(snap20b)
+    assert not [c for c in cmds20b
+                if c["cmd"] == "train" and c.get("factory") == 32], "T2 塔不得再探升级"
+    # cli_mode 跳过（升级归任务单/中层；① 建造者维持同跳——不得有任何自动 train）
+    ex20c = make_ex()
+    ex20c.autopilot = False
+    ex20c.routine = True
+    ex20c.cli_mode = True
+    assert not [c for c in ex20c.tick(snap20) if c["cmd"] == "train"], \
+        "cli_mode 升级只认任务单，轨C/建造者维持不得自动发 train"
+    # 资金低于 1500 阈值不发（① 建造者维持用 econ_goal 目标=1 隔离，只验升级轨闸）
+    ex20d = make_ex()
+    ex20d.autopilot = False
+    ex20d.routine = True
+    ex20d.econ_goal["builders"] = 1
+    snap20d = dict(snap20)
+    snap20d["team"] = {"id": 0, "funds": 500, "ai": False}
+    assert not [c for c in ex20d.tick(snap20d) if c["cmd"] == "train"], \
+        "资金<1500 防线塔升级轨不得发单"
+    # 20e. 升级单 force 通道：每拍指令上限(4)被经济/生产吃光时升级照发
+    #      （2026-10-19 实根：上限饥饿致 autopilot 路三轨全哑、"炮塔压根不升级"）
+    ex20e = make_ex()
+    ex20e.autopilot = True   # autopilot 路：①②⑦ 贪心段同拍发令把上限吃满
+    ex20e.routine = True
+    own20e = [{"id": 1, "t": "commandCenter", "bld": True, "q": 0, "x": 1500, "y": 1000,
+               "hp": 4000, "maxHp": 4000},
+              {"id": 30, "t": "c_turret_t1", "bld": True, "q": 0, "x": 1200, "y": 1000,
+               "hp": 900, "maxHp": 900},
+              {"id": 50, "t": "landFactory", "bld": True, "q": 0, "x": 1400, "y": 1100,
+               "hp": 2000, "maxHp": 2000},
+              {"id": 51, "t": "landFactory", "bld": True, "q": 0, "x": 1400, "y": 900,
+               "hp": 2000, "maxHp": 2000},
+              {"id": 40, "t": "builder", "q": 0, "x": 1450, "y": 1000, "hp": 170, "maxHp": 170},
+              {"id": 41, "t": "builder", "q": 0, "x": 1460, "y": 1000, "hp": 170, "maxHp": 170}]
+    snap20e = {"own": own20e, "allies": [], "enemy": [],
+               "team": {"id": 0, "funds": 99999, "ai": False}, "delegated": [1, 30, 50]}
+    cmds20e = ex20e.tick(snap20e)
+    assert any(c["cmd"] == "train" and c.get("action") == "c_turret_t2_gun_0"
+               for c in cmds20e), f"上限吃光时升级单仍须走 force 通道: {cmds20e}"
+    assert any(c["cmd"] == "train" and c.get("action") == "110" for c in cmds20e), \
+        f"厂 T2 升级单同走 force 通道: {cmds20e}"
+
+    print("PASS test_build_phase2：补水/防撞车/在干保留/低水位/阵地展开/focus/槽位择优/阵亡判定/预算仲裁/海厂锚点/隘口/实控前沿/占位统一/新池召唤/默认构成兜底/主动侦察/按厂科技档/升级换代继承/train厂重解析/防线塔升级轨 全部符合预期")
 
 
 if __name__ == "__main__":

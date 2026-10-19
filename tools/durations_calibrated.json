@@ -1,0 +1,41 @@
+{
+ "wall_seconds": 150.1,
+ "samples": {
+  "fabricatorT1": 2,
+  "laserDefence": 2,
+  "antiNukeLauncherC": 1
+ },
+ "durations": {
+  "antiNukeLauncherC": {
+   "n": 1,
+   "median": 8.4,
+   "min": 8.4,
+   "max": 8.4
+  },
+  "fabricatorT1": {
+   "n": 2,
+   "median": 16.7,
+   "min": 16.7,
+   "max": 16.7
+  },
+  "laserDefence": {
+   "n": 2,
+   "median": 8.4,
+   "min": 8.4,
+   "max": 8.5
+  }
+ },
+ "all": {
+  "fabricatorT1": [
+   16.7,
+   16.7
+  ],
+  "laserDefence": [
+   8.5,
+   8.4
+  ],
+  "antiNukeLauncherC": [
+   8.4
+  ]
+ }
+}
