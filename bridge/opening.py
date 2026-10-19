@@ -55,5 +55,6 @@ def generate_opening(snap, pedia, spawns, is_naval, size_class, map_msg=None):
         "【布局】未定——归总指挥/中层")
 
     return {"work_order": work_order, "plan_params": plan_params,
+            "train": [{"action": "u_builder", "n": OPENING_BUILDERS}],  # 骨架自带补员（cli 下①维持已拆）
             "plan_text": plan_text, "composition": {},
             "mission_templates": []}

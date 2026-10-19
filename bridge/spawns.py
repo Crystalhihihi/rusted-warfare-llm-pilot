@@ -81,8 +81,10 @@ def parse_spawns(map_path, game_root=GAME_ROOT):
     return []
 
 
-def friendly_spawns(map_path, own_cc=None, game_root=GAME_ROOT):
-    """返回 (我方出生点, 敌方出生点列表)。own_cc=(x,y) 用于消除换队洗牌的影响。"""
+def friendly_spawns(map_path, own_cc=None, game_root=GAME_ROOT, ally_ccs=None):
+    """返回 (我方出生点, 敌方出生点列表)。own_cc=(x,y) 用于消除换队洗牌的影响。
+    ally_ccs=[(x,y),...]（可选）：盟友主基地坐标——带盟友的局（如 2v2/3v3）把盟友出生点
+    从敌情里剔除（2026-10-20 实锤：10 人图全 seed 敌情会过热；盟友可见=公平信息）。"""
     spawns = parse_spawns(map_path, game_root)
     if not spawns:
         return None, []
@@ -91,5 +93,10 @@ def friendly_spawns(map_path, own_cc=None, game_root=GAME_ROOT):
         mine = min(spawns, key=lambda s: (s[1] - own_cc[0]) ** 2 + (s[2] - own_cc[1]) ** 2)
     else:
         mine = spawns[0]
-    enemies = [s for s in spawns if s is not mine]
+    ally_ccs = ally_ccs or []
+
+    def _near_ally(s):
+        return any((s[1] - ax) ** 2 + (s[2] - ay) ** 2 < 300 ** 2 for ax, ay in ally_ccs)
+
+    enemies = [s for s in spawns if s is not mine and not _near_ally(s)]
     return (mine[1], mine[2]), [(s[1], s[2]) for s in enemies]

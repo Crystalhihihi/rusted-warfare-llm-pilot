@@ -4,6 +4,9 @@ usage: python send.py move X Y | attackmove X Y | stop | attack UNIT_ID
        python send.py build s_extractorT1 X Y
        python send.py train s_tank FACTORY_ID
        python send.py rally X Y FACTORY_ID
+       python send.py load TRANSPORT_ID UNIT_IDS_CSV
+       python send.py unload TRANSPORT_ID X Y
+       python send.py launch SILO_ID X Y
        python send.py delegate 0,3,9"""
 import json
 import socket
@@ -32,6 +35,12 @@ def main() -> int:
         msg = {"cmd": "rally", "x": float(args[1]), "y": float(args[2]), "factory": int(args[3])}
     elif c == "delegate" and len(args) == 2:
         msg = {"cmd": "delegate", "groups": args[1]}
+    elif c == "load" and len(args) == 3:
+        msg = {"cmd": "load", "target": int(args[1]), "units": args[2]}
+    elif c == "unload" and len(args) == 4:
+        msg = {"cmd": "unload", "target": int(args[1]), "x": float(args[2]), "y": float(args[3])}
+    elif c == "launch" and len(args) == 4:
+        msg = {"cmd": "launch", "id": int(args[1]), "x": float(args[2]), "y": float(args[3])}
     else:
         print(__doc__)
         return 1
