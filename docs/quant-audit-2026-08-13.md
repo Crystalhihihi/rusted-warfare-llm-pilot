@@ -2,6 +2,7 @@
 
 > 审计纪律：每个数字附证据（文件路径+行号，或实际执行命令）；无记录即写"无记录"，不推测补数。
 > 项目根目录 `D:/ttttttt`，主状态文档 `PROGRESS.md`（500 行，下称 P:<行号>），数据索引 `docs/DATASETS.md`（下称 D:<行号>）。
+> （2026-09-26 注：PROGRESS.md 已拆分，本文 P: 行号均为拆分前旧行号，仅近似对应；原文见 git 历史或 `docs/progress-archive/`、`docs/decisions.md`。）
 
 ## 一、对战成绩（vs 最高难度内置 AI）
 
