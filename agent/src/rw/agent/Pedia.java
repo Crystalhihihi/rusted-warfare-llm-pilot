@@ -44,6 +44,11 @@ public final class Pedia {
                   .append(",\"building\":").append(t.j())
                   .append(",\"builder\":").append(t.l())
                   .append(",\"move\":\"").append(t.o() == null ? "?" : t.o().name()).append('"');
+                try {
+                    // buildSpeed（单位 ini，as.D() 公开接口；时长=1/(bs×科技×建造者系数)）
+                    sb.append(",\"bs\":").append(t.D());
+                } catch (Throwable ignored) {
+                }
                 appendFootprint(sb, t);
                 try {
                     am sample = am.a(t);

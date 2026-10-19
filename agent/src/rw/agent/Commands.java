@@ -11,6 +11,7 @@ import java.util.Set;
 import android.graphics.PointF;
 
 import com.corrodinggames.rts.game.n;
+import com.corrodinggames.rts.game.units.ak;
 import com.corrodinggames.rts.game.units.am;
 import com.corrodinggames.rts.game.units.ar;
 import com.corrodinggames.rts.game.units.as;
@@ -35,7 +36,11 @@ import com.corrodinggames.rts.gameFramework.w;
  *   {"cmd":"build","action":"s_extractorT1","x":..,"y":..}
  *   {"cmd":"train","action":"s_tank","factory":unitId}
  *   {"cmd":"rally","x":..,"y":..,"factory":unitId}
+ *   {"cmd":"load","target":运输舰id,"units":"被装单位id,逗号分隔"}
+ *   {"cmd":"unload","target":运输舰id,"x":..,"y":..}
+ *   {"cmd":"launch","id":核弹井id,"x":..,"y":..}
  *   {"cmd":"overlay","text":"line1\\nline2"}   (handled by OverlayData)
+ *   {"cmd":"speed","x":8}                     游戏速度 0.1-64x（单人/沙盒上限）
  * Every handled command gets a {"type":"cmdResult",...} reply.
  */
 public final class Commands {
@@ -60,6 +65,23 @@ public final class Commands {
             return;
         }
         l engine = l.B();
+        if ("speed".equals(cmd)) {
+            // 游戏速度（单人/沙盒上限 64x，gameFramework/l.bt）；沙盒探针用
+            Float v = numVal(line, "x");
+            if (v == null) {
+                reply(false, cmd, "missing x");
+                return;
+            }
+            float f = Math.max(0.1f, Math.min(64f, v.floatValue()));
+            try {
+                java.lang.reflect.Field bt = l.class.getField("bt");
+                bt.setFloat(engine, f);
+                reply(true, cmd, "speed=" + f);
+            } catch (Throwable ex) {
+                reply(false, cmd, "speed set failed: " + ex.getMessage());
+            }
+            return;
+        }
         n team = engine.bs;
         if (team == null) {
             reply(false, cmd, "no local team");
@@ -304,6 +326,12 @@ public final class Commands {
                 handleTrain(engine, team, line, cmd);
             } else if ("rally".equals(cmd)) {
                 handleRally(engine, team, line, cmd);
+            } else if ("load".equals(cmd)) {
+                handleLoad(engine, team, line, cmd);
+            } else if ("unload".equals(cmd)) {
+                handleUnload(engine, team, line, cmd);
+            } else if ("launch".equals(cmd)) {
+                handleLaunch(engine, team, line, cmd);
             } else {
                 reply(false, cmd, "unknown cmd");
             }
@@ -578,6 +606,222 @@ public final class Commands {
         c.a((y) fac);
         c.a(new PointF(x.floatValue(), yv.floatValue()));
         reply(true, cmd, "rally @(" + x.intValue() + "," + yv.intValue() + ")");
+    }
+
+    // ---- load / unload / launch（运输与核发射，全部走 engine.cf 原生命令队列）----
+    //
+    // 引擎路径（反编译 decompiled/game-lib 核实）：
+    // 装载：玩家右键运输舰 = 选中被装单位 + 命令.e(运输舰) → av.n 路点
+    //   （gameFramework/f/g.java:3387 f()；AI 同款 game/a/n.java:239）。
+    //   被装单位自行走到运输舰旁并进入；能否装载由运输舰 d(单位,false) 判定
+    //   （units/e/i.java:299 hovercraft / units/b/d.java:344 dropship /
+    //   units/custom/j.java:287 experimentalDropship）。
+    // 卸货：运输舰的"unload"动作（ActionId("109")，units/e/i.java:22 i$1(109)）。
+    //   命令.a(动作) 特殊动作分发（gameFramework/e.java:621 k()）→ 运输舰开始卸货，
+    //   每 30 tick 放下一单位（units/e/i.java:215）。ini 系运输舰的动作表也注册了
+    //   同一动作（units/custom/l.java:707），cp() 对三类运输舰都返回它
+    //   （units/custom/j.java:3915）。
+    // 核发射：nukeLauncherC 是 ini 自定义单位，[action_launchNuke] 带坐标目标，
+    //   与 train 同一套 setAction(c, action, x, y) 通道（e.k=动作, e.l=坐标），
+    //   下发后 custom/j.java:3008 把动作+坐标入队，完成时 fireTurretXAtGround
+    //   朝坐标发射（custom/j.java:3214）。弹药=am.cE（int，ini 键 ammo；cB 是 energy 勿混）
+    //   （[action_buildNuke] addResources: ammo=1 造弹，launchNuke price: ammo=1 耗弹）。
+
+    private static void handleLoad(l engine, n team, String line, String cmd) {
+        Float tid = numVal(line, "target");
+        String csv = strVal(line, "units");
+        if (tid == null || csv == null || csv.trim().isEmpty()) {
+            reply(false, cmd, "missing target/units");
+            return;
+        }
+        am trans = w.a(tid.longValue(), false);
+        if (trans == null || trans.bV) {
+            reply(false, cmd, "运输舰不存在/已摧毁");
+            return;
+        }
+        if (trans.bX != team) {
+            reply(false, cmd, "运输舰不是我方的");
+            return;
+        }
+        if (!(trans instanceof ak) || !trans.cr()) {
+            reply(false, cmd, "target #" + trans.eh + " 不是运输单位（hovercraft/dropship/experimentalDropship 及其 ini 系）");
+            return;
+        }
+        HashSet<Long> want = new HashSet<Long>();
+        for (String s : csv.split(",")) {
+            s = s.trim();
+            if (s.isEmpty()) {
+                continue;
+            }
+            try {
+                want.add(Long.parseLong(s));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        // 被装单位沿用 group 指令口径：委托池 ∩ 指定 id，只动我方
+        ArrayList<am> cargo = new ArrayList<am>();
+        int skipped = 0;
+        StringBuilder skipWhy = new StringBuilder();
+        for (am u : delegatedUnits(team)) {
+            if (!want.contains(u.eh)) {
+                continue;
+            }
+            want.remove(u.eh);
+            if (u == trans || u.bV) {
+                skipped++;
+                continue;
+            }
+            if (!(u instanceof y)) {
+                skipped++;
+                continue;
+            }
+            if (u.cN != null) {
+                if (skipWhy.length() > 0) {
+                    skipWhy.append(',');
+                }
+                skipWhy.append("#").append(u.eh).append("已在载具中");
+                skipped++;
+                continue;
+            }
+            if (!trans.d(u, false)) {
+                if (skipWhy.length() > 0) {
+                    skipWhy.append(',');
+                }
+                skipWhy.append("#").append(u.eh).append("装不下(容量/类型/队伍不符)");
+                skipped++;
+                continue;
+            }
+            cargo.add(u);
+        }
+        if (cargo.isEmpty()) {
+            reply(false, cmd, "没有可装载的委托单位（共" + skipped + "个被跳过"
+                + (skipWhy.length() > 0 ? ": " + skipWhy : "")
+                + (want.isEmpty() ? "" : "；" + want.size() + "个id不在委托池/不存在") + "）");
+            return;
+        }
+        e c = engine.cf.b(team);
+        for (am u : cargo) {
+            c.a((y) u);
+        }
+        c.e(trans); // av.n 进入运输舰路点：与右键点运输舰完全同一条命令
+        reply(true, cmd, cargo.size() + " 单位装载 → " + trans.r().i() + "#" + trans.eh
+            + "（引擎右键装载路点，单位自行走到运输舰旁进入）"
+            + (skipped > 0 ? "（" + skipped + "个被跳过: " + skipWhy + "）" : ""));
+    }
+
+    private static void handleUnload(l engine, n team, String line, String cmd) throws Exception {
+        if (!ensureActionReflect()) {
+            reply(false, cmd, "action reflection unavailable");
+            return;
+        }
+        Float tid = numVal(line, "target");
+        Float x = numVal(line, "x");
+        Float yv = numVal(line, "y");
+        if (tid == null || x == null || yv == null) {
+            reply(false, cmd, "missing target/x/y");
+            return;
+        }
+        am trans = w.a(tid.longValue(), false);
+        if (trans == null || trans.bV) {
+            reply(false, cmd, "运输舰不存在/已摧毁");
+            return;
+        }
+        if (trans.bX != team) {
+            reply(false, cmd, "运输舰不是我方的");
+            return;
+        }
+        if (!(trans instanceof y)) {
+            reply(false, cmd, "运输舰不可指挥");
+            return;
+        }
+        ak t = (trans instanceof ak && trans.cr()) ? (ak) trans : null;
+        if (t == null) {
+            reply(false, cmd, "target #" + trans.eh + " 不是运输单位");
+            return;
+        }
+        if (t.bB() <= 0) {
+            reply(false, cmd, trans.r().i() + "#" + trans.eh + " 空仓，没有可卸单位");
+            return;
+        }
+        // ① 先移动到卸货点；② 再下 unload 动作（am.cp() → ActionId("109")，
+        // 引擎每 30 tick 放下一单位，停下即卸）。与 AI 卸货流程同两条命令
+        // （game/a/n.java:297 move + :320 unload）。
+        e c1 = engine.cf.b(team);
+        c1.a((y) trans);
+        c1.a(x.floatValue(), yv.floatValue());
+        e c2 = engine.cf.b(team);
+        c2.a((y) trans);
+        Object unloadAct = invokePub(trans, "cp", new Class<?>[0]);
+        eSetAction.invoke(c2, unloadAct);
+        reply(true, cmd, trans.r().i() + "#" + trans.eh + " 前往(" + x.intValue() + "," + yv.intValue()
+            + ")卸货，载员 " + t.bB() + (t.bA() ? "（已在卸货中，命令会续上）" : ""));
+    }
+
+    private static void handleLaunch(l engine, n team, String line, String cmd) throws Exception {
+        if (!ensureActionReflect()) {
+            reply(false, cmd, "action reflection unavailable");
+            return;
+        }
+        Float id = numVal(line, "id");
+        Float x = numVal(line, "x");
+        Float yv = numVal(line, "y");
+        if (id == null || x == null || yv == null) {
+            reply(false, cmd, "missing id/x/y");
+            return;
+        }
+        am silo = w.a(id.longValue(), false);
+        if (silo == null || silo.bV) {
+            reply(false, cmd, "发射井不存在/已摧毁");
+            return;
+        }
+        if (silo.bX != team) {
+            reply(false, cmd, "发射井不是我方的");
+            return;
+        }
+        if (!(silo instanceof y)) {
+            reply(false, cmd, "发射井不可指挥");
+            return;
+        }
+        if (silo.cm < 1.0f) {
+            reply(false, cmd, "发射井尚未完工（" + (int) (silo.cm * 100) + "%）");
+            return;
+        }
+        String action = resolveActionOn(silo, "action_launchNuke");
+        if (action == null) {
+            // 引擎动作表用位置 id（实机回执"可用: _1,_0"）；unit_actions.json ini 序实据
+            // launchNuke 是第 2 个动作 = _1。仅服务核弹井族，换单位变体需复测。
+            action = resolveActionOn(silo, "_1");
+        }
+        if (action == null) {
+            reply(false, cmd, "单位#" + silo.eh + " 没有 launchNuke 动作（不是核弹井）");
+            dumpActions(silo, "launch");
+            return;
+        }
+        Object actOnSilo = lookupAction(silo, action);
+        Boolean avail = (Boolean) invokePub(actOnSilo, "b", new Class<?>[]{am.class}, silo);
+        if (avail != null && !avail) {
+            reply(false, cmd, "发射动作当前不可用（科技/条件不满足）");
+            return;
+        }
+        // 反编译实据 custom/d/b.java:444-478——ini 资源键映射：energy→am.cB（浮点能量）、
+        // ammo→am.cE（整型弹药）。buildNuke addResources ammo=1 写 cE，launchNuke price ammo=1 扣 cE。
+        // 旧版误读 cB（能量）致"没有核弹"恒假阴。2026-10-20 实弹修。
+        float ammo = silo.cE;
+        if (ammo < 1.0f) {
+            reply(false, cmd, "没有核弹（ammo=0）：先 train 造弹 action_buildNuke（$11000）");
+            return;
+        }
+        double dist = Math.hypot(x.doubleValue() - silo.eo, yv.doubleValue() - silo.ep);
+        if (dist < 260.0) {
+            reply(false, cmd, "目标点离发射井太近（" + (int) dist + "<260）：核弹最小射程 260"
+                + "（stock ini turret_siloTop limitingMinRange），游戏会静默拒绝");
+            return;
+        }
+        e c = engine.cf.b(team);
+        c.a((y) silo);
+        setAction(c, action, x, yv); // e.k=动作id, e.l=坐标 → 与 train 同一通道，带坐标目标
+        reply(true, cmd, "nuke launch @(" + x.intValue() + "," + yv.intValue() + ")，剩余弹药 "
+            + (int) ammo + "（飞行约数秒，落点范围伤害）");
     }
 
     /** "s_extractorT1"/"b_extractorT1"/"u_tank" -> 类型名；纯数字 id（升级动作）返回 null。 */

@@ -25,5 +25,7 @@ if [ -f "$ASM_JAR" ]; then
   (cd classes && jar xf "../$ASM_JAR")   # shade org/objectweb/asm/** 进 agent
 fi
 printf 'Premain-Class: rw.agent.Agent\nCan-Redefine-Classes: false\nCan-Retransform-Classes: false\n' > manifest.txt
-jar cfm dist/rw-agent.jar manifest.txt -C classes .
-echo "OK: dist/rw-agent.jar"
+# OUT_JAR 可覆盖输出名：游戏运行期间 rw-agent.jar 被锁，用 OUT_JAR=dist/rw-agent-new.jar 打包新副本
+OUT_JAR="${OUT_JAR:-dist/rw-agent.jar}"
+jar cfm "$OUT_JAR" manifest.txt -C classes .
+echo "OK: $OUT_JAR"
